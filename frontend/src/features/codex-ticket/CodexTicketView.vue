@@ -83,15 +83,27 @@
                       <option value="direct">direct（服务器本机 IP）</option>
                       <option value="proxy">proxy（指定代理）</option>
                     </select>
-                    <input
+                    <!-- 原生 select 而不是 ProxySelector：本页表格外层是 overflow-x-auto，
+                         按 CSS 规范另一轴的 visible 会被算成 auto，绝对定位的下拉会被裁切。 -->
+                    <select
                       v-if="draftOf(row).egress === 'proxy'"
                       v-model="draftOf(row).proxyIDText"
-                      type="text"
-                      inputmode="numeric"
                       class="input mt-1 w-40"
-                      placeholder="代理 ID（见代理管理）"
                       :disabled="readOnly || loading"
-                    />
+                    >
+                      <option value="">选择代理…</option>
+                      <option v-for="p in proxies" :key="p.id" :value="String(p.id)">
+                        {{ proxyLabel(p) }}
+                      </option>
+                      <!-- 配置指向的代理不在列表里（已删除，或列表没加载成功）时仍要显示出来，
+                           否则下拉是空白，看不出原本配的是哪一个。 -->
+                      <option v-if="orphanProxyID(row)" :value="orphanProxyID(row)">
+                        id {{ orphanProxyID(row) }}（不在代理列表中）
+                      </option>
+                    </select>
+                    <p v-if="proxiesError" class="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                      代理列表加载失败：{{ proxiesError }}
+                    </p>
                   </td>
                   <td class="px-3 py-3">
                     <span v-if="row.mode === 'off'" class="text-xs text-gray-500 dark:text-dark-400">—</span>
@@ -283,6 +295,8 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import { extractApiErrorMessage } from '@/utils/apiError'
+import { adminAPI } from '@/api/admin'
+import type { Proxy } from '@/types'
 import codexTicketAPI from './api'
 import type {
   FingerprintProbe,
@@ -304,6 +318,10 @@ interface ConfigDraft {
 }
 
 const overview = ref<TicketOverview | null>(null)
+// 代理列表只用于把票据出口的选择做成下拉。它加载失败不该拖垮整页——票据状态与它无关，
+// 所以单独记错误，那一格退化成「只剩已配的那一项可选」。
+const proxies = ref<Proxy[]>([])
+const proxiesError = ref('')
 const loading = ref(false)
 const loadError = ref('')
 const savingID = ref<number | null>(null)
@@ -559,6 +577,32 @@ async function loadOverview(): Promise<void> {
   }
 }
 
+// proxyLabel 与代理管理页同口径：名字 + 连接串；非 active 的标出来但**不过滤掉**——
+// 已配置的代理若被停用，隐藏它会让这一行的下拉变空白，反而看不出配的是哪个。
+function proxyLabel(p: Proxy): string {
+  const base = `${p.name}（${p.protocol}://${p.host}:${p.port}）`
+  return p.status === 'active' ? base : `${base} [${p.status}]`
+}
+
+// orphanProxyID 返回「草稿里配着、但代理列表里没有」的那个 id，没有则返回空串。
+function orphanProxyID(row: TicketAccountStatus): string {
+  const raw = draftOf(row).proxyIDText.trim()
+  if (!raw) return ''
+  return proxies.value.some((p) => String(p.id) === raw) ? '' : raw
+}
+
+async function loadProxies(): Promise<void> {
+  proxiesError.value = ''
+  try {
+    // 代理是运维级的量（十几个），一次取完；用分页默认的 20 会让靠后的代理选不到。
+    const page = await adminAPI.proxies.list(1, 200)
+    proxies.value = page.items ?? []
+  } catch (error) {
+    proxies.value = []
+    proxiesError.value = extractApiErrorMessage(error, '加载失败')
+  }
+}
+
 async function loadEvents(offset: number): Promise<void> {
   eventsLoading.value = true
   eventsError.value = ''
@@ -624,6 +668,7 @@ function formatTime(value: string): string {
 
 onMounted(() => {
   void loadOverview()
+  void loadProxies()
   void loadEvents(0)
   tickTimer = setInterval(() => {
     nowTick.value = Date.now()
