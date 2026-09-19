@@ -77,7 +77,10 @@ the CAS`）。**它在纯上游基线 tag 上同样失败**，与本 fork 的定
 `-kong.<n>` 后缀参与版本比较（见 `update_service.go` 的 `parseVersion`），所以序号必须是
 数字；精确的上游基线 SHA 记在 tag message、release body 与镜像 OCI label 里。
 
-镜像发布到 GHCR：`ghcr.io/someonekong/sub2api-kong`。推 `v*` tag 即触发
+镜像发布到 GHCR：**`ghcr.io/someonekong/sub2api`**。注意**不是** `sub2api-kong`——镜像名写死在
+`.goreleaser.yaml` 的 `image_templates` 里（`<owner>/sub2api`），只有 owner 取自环境变量，与仓库名
+无关。改名要动那个上游文件，多一处 rebase 冲突面，而 namespace 已经足够区分，所以保持现名。
+推 `v*` tag 即触发
 `.github/workflows/release.yml` 构建发布，镜像名由 `github.repository` 推导，无需配置。
 
 发布行为由**仓库变量 `SIMPLE_RELEASE=true`** 控制：只出 x86_64 的 GHCR 镜像，跳过多架构
