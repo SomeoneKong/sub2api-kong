@@ -142,25 +142,25 @@ type KongTicketAccountStatus struct {
 
 // KongTicketAdminService 支撑管理页面的三个操作。
 type KongTicketAdminService struct {
-	// targetModel / confidence 与编排服务用的是同一对值。
+	// accept / confidence 与编排服务用的是同一对值。
 	//
 	// 管理面显示的「当前票」必须与业务实际能用的那张是同一张：口径不一致时页面会显示一张业务其实
 	// 不会注入的票（目标改过之后留下的旧 verified 票），运维据此判断「有票可用」就错了。
-	targetModel string
-	confidence  float64
-	repo        KongTicketRepository
-	accounts    KongAccountAccess
-	params      KongTicketParams
+	accept     KongTicketAccept
+	confidence float64
+	repo       KongTicketRepository
+	accounts   KongAccountAccess
+	params     KongTicketParams
 	// gatedModels 是门控模型集合。按**最终上游模型**判定，不按客户端传来的别名——
 	// 否则换个别名就绕过了整套保护。
 	gatedModels []string
 }
 
 // NewKongTicketAdminService 创建管理面服务。
-func NewKongTicketAdminService(repo KongTicketRepository, accounts KongAccountAccess, params KongTicketParams, gatedModels []string, targetModel string, confidence float64) *KongTicketAdminService {
+func NewKongTicketAdminService(repo KongTicketRepository, accounts KongAccountAccess, params KongTicketParams, gatedModels []string, accept KongTicketAccept, confidence float64) *KongTicketAdminService {
 	return &KongTicketAdminService{
 		repo: repo, accounts: accounts, params: params, gatedModels: gatedModels,
-		targetModel: targetModel, confidence: confidence,
+		accept: accept, confidence: confidence,
 	}
 }
 
@@ -247,7 +247,7 @@ func (s *KongTicketAdminService) statusOf(ctx context.Context, account *KongAcco
 	// 逐个门控模型输出：票与结论是 (account, model) 绑定的，混成一个就看不出哪个模型没票。
 	for _, model := range s.gatedModels {
 		modelStatus := KongTicketModelStatus{Model: model}
-		ticket, err := s.repo.CurrentTicket(ctx, account.ID, model, s.targetModel, s.confidence)
+		ticket, err := kongPickCurrent(ctx, s.repo, s.accept, s.confidence, account.ID, model)
 		if err != nil {
 			return nil, fmt.Errorf("查当前票: %w", err)
 		}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -26,43 +27,88 @@ func NewKongTicketRepository(db *sql.DB) service.KongTicketRepository {
 }
 
 const kongTicketColumns = `id, account_id, model, state, state_len, source, status,
-fingerprint_model, fingerprint_p, skip_until_new, captured_at, expires_at, expires_at_source,
-coalesce(capture_egress,''), capture_idle_seconds`
+fingerprint_model, fingerprint_p, fingerprint_probs, skip_until_new, captured_at, expires_at,
+expires_at_source, coalesce(capture_egress,''), capture_idle_seconds`
+
+// kongMarshalProbs 把归因分布编成 JSONB 入参。
+//
+// 两个要点：
+//   - 空分布写 NULL 而不是 `{}`。两者在采纳判据下同样是拒绝，但只有 NULL 能看出这张票根本没落过
+//     分布，而不是落了一个空分布。
+//   - **传 string 而不是 []byte**。lib/pq 对 []byte 参数的编码取决于推断出的类型 OID，写进 jsonb
+//     列能不能成立要靠推断碰对；本仓库其余 jsonb 入参（事件 detail、探测的 digits / scores）一律
+//     转成字符串，这里照同一口径。
+func kongMarshalProbs(probs map[string]float64) (any, error) {
+	if len(probs) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(probs)
+	if err != nil {
+		return nil, fmt.Errorf("encode fingerprint probs: %w", err)
+	}
+	return string(encoded), nil
+}
 
 func scanKongTicket(row interface{ Scan(...any) error }) (*service.KongTicket, error) {
 	var t service.KongTicket
+	var probs []byte
 	err := row.Scan(&t.ID, &t.AccountID, &t.Model, &t.State, &t.StateLen, &t.Source, &t.Status,
-		&t.FingerprintModel, &t.FingerprintP, &t.SkipUntilNew, &t.CapturedAt, &t.ExpiresAt, &t.ExpiresAtSource,
-		&t.CaptureEgress, &t.CaptureIdleSeconds)
+		&t.FingerprintModel, &t.FingerprintP, &probs, &t.SkipUntilNew, &t.CapturedAt, &t.ExpiresAt,
+		&t.ExpiresAtSource, &t.CaptureEgress, &t.CaptureIdleSeconds)
 	if err != nil {
 		return nil, err
+	}
+	// 分布解不开时当作「没有分布」而不是报错：那张票因此不会被采纳（求和恒为 0），调用方继续看
+	// 下一张。让整条读取路径失败的代价大得多——一张坏行会把该账号该模型的每个请求都打掉。
+	//
+	// **但必须留下诊断**：这张票已经是 verified，而 OldestCandidate 只选 unverified，所以它不会
+	// 被重新验证，只会静躺到过期。没有这条日志，「有票却一直判无票」就只能靠翻库排查。NULL 是
+	// 正常的缺分布（未验证的票），不进这一支。
+	if len(probs) > 0 {
+		if err := json.Unmarshal(probs, &t.FingerprintProbs); err != nil {
+			t.FingerprintProbs = nil
+			slog.Warn("kong ticket fingerprint_probs 解码失败，该票按无分布处理",
+				"ticket_id", t.ID, "account_id", t.AccountID, "model", t.Model, "error", err)
+		}
 	}
 	return &t, nil
 }
 
-// CurrentTicket 返回可支持业务的票：verified 且未过期。
-func (r *kongTicketRepository) CurrentTicket(ctx context.Context, accountID int64, model string, targetModel string, minProbability float64) (*service.KongTicket, error) {
-	// 归因结果也必须满足**当前**的目标与阈值，不能只看 `status = verified`。
-	//
-	// verified 是「按当时的目标与阈值判过」，那两个值来自环境变量、可以改：目标从 sol 换成 astra
-	// 之后，一张判为 sol 的旧票仍然满足 verified + 未过期，于是被注入——而上游接受它、不重发
-	// state，后置守卫也就永远不报错，直接交付了当前目标之外的输出。
-	//
-	// 条件放在查询里而不是只在授予时检查：调度也读这张票来决定要不要提前续期，两边口径必须一致。
-	// 排序仍按 expires_at DESC，所以一张较新但不合格的票不会挡住较旧而合格的那张。
+// VerifiedTickets 返回 verified 且未过期的票，按 expires_at 降序。
+//
+// **归因判据不在这里**——它在 service 侧的 KongTicketAccept 里，只有一份。原先这条 SQL 自带
+// `fingerprint_model = $4 AND fingerprint_p >= $5`，而落结论时又在 Go 里判一次；采纳规则变成
+// 「白名单内概率求和」之后，两处各写一遍就是两套规则，出入了也不会报错。
+//
+// verified + 未过期仍然要筛：verified 只代表「按当时的白名单与阈值判过」，那两个值来自环境
+// 变量、可以改，所以调用方必须按当前配置重判。返回多张则让「较新但按当前白名单不合格的票」
+// 不至于挡住较旧而合格的那张。
+//
+// **不能加 LIMIT**。截断发生在归因判定之前，于是「最新的 N 张都按当前白名单不合格、更早的一张
+// 合格」这个合法状态会被读成无票：那张合格的票更早过期，等下去也永远进不了前 N 名。白名单收紧
+// 之后就能构造出这个状态，后果是业务与管理面一致地误报无票，且不报错。行数由票表自身的清理与
+// 留存上限约束，不该在这条查询里再截一刀。
+func (r *kongTicketRepository) VerifiedTickets(ctx context.Context, accountID int64, model string) ([]*service.KongTicket, error) {
 	query := `SELECT ` + kongTicketColumns + ` FROM kong_ticket_cache
 		WHERE account_id = $1 AND model = $2 AND status = $3 AND expires_at > now()
-		  AND fingerprint_model = $4 AND fingerprint_p >= $5
-		ORDER BY expires_at DESC LIMIT 1`
-	t, err := scanKongTicket(r.db.QueryRowContext(ctx, query, accountID, model, service.KongTicketStatusVerified,
-		targetModel, minProbability))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
+		ORDER BY expires_at DESC`
+	rows, err := r.db.QueryContext(ctx, query, accountID, model, service.KongTicketStatusVerified)
 	if err != nil {
-		return nil, fmt.Errorf("query current ticket: %w", err)
+		return nil, fmt.Errorf("query verified tickets: %w", err)
 	}
-	return t, nil
+	defer func() { _ = rows.Close() }()
+	var out []*service.KongTicket
+	for rows.Next() {
+		t, scanErr := scanKongTicket(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan verified ticket: %w", scanErr)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate verified tickets: %w", err)
+	}
+	return out, nil
 }
 
 // OldestCandidate 返回最早的一张可验证候选。
@@ -140,10 +186,13 @@ func (r *kongTicketRepository) CommitVerification(
 	ctx context.Context,
 	id int64,
 	status string,
-	fingerprintModel string,
-	p float64,
+	attr service.KongAttribution,
 	event *service.KongTicketEvent,
 ) (bool, error) {
+	probs, err := kongMarshalProbs(attr.Probs)
+	if err != nil {
+		return false, err
+	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin verification tx: %w", err)
@@ -154,9 +203,9 @@ func (r *kongTicketRepository) CommitVerification(
 	// 只比 status 兑现不了它。
 	res, err := tx.ExecContext(ctx,
 		`UPDATE kong_ticket_cache
-		 SET status = $1, fingerprint_model = $2, fingerprint_p = $3
-		 WHERE id = $4 AND status = $5 AND skip_until_new = FALSE AND expires_at > now()`,
-		status, fingerprintModel, p, id, service.KongTicketStatusUnverified)
+		 SET status = $1, fingerprint_model = $2, fingerprint_p = $3, fingerprint_probs = $4
+		 WHERE id = $5 AND status = $6 AND skip_until_new = FALSE AND expires_at > now()`,
+		status, attr.Model, attr.P, probs, id, service.KongTicketStatusUnverified)
 	if err != nil {
 		return false, fmt.Errorf("commit verification status: %w", err)
 	}
@@ -176,11 +225,15 @@ func (r *kongTicketRepository) CommitVerification(
 	return true, nil
 }
 
-func (r *kongTicketRepository) SetTicketStatus(ctx context.Context, id int64, status string, fingerprintModel string, p float64) (bool, error) {
+func (r *kongTicketRepository) SetTicketStatus(ctx context.Context, id int64, status string, attr service.KongAttribution) (bool, error) {
+	probs, err := kongMarshalProbs(attr.Probs)
+	if err != nil {
+		return false, err
+	}
 	query := `UPDATE kong_ticket_cache
-		SET status = $1, fingerprint_model = $2, fingerprint_p = $3
-		WHERE id = $4 AND status = $5`
-	res, err := r.db.ExecContext(ctx, query, status, fingerprintModel, p, id, service.KongTicketStatusUnverified)
+		SET status = $1, fingerprint_model = $2, fingerprint_p = $3, fingerprint_probs = $4
+		WHERE id = $5 AND status = $6`
+	res, err := r.db.ExecContext(ctx, query, status, attr.Model, attr.P, probs, id, service.KongTicketStatusUnverified)
 	if err != nil {
 		return false, fmt.Errorf("set ticket status: %w", err)
 	}

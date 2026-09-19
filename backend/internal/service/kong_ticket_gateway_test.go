@@ -217,12 +217,14 @@ func TestKongPrepareWSTurnInjectsClientMetadata(t *testing.T) {
 	accounts.set(account)
 	// 预置一张可用的当前票，让准入直接走 inject 分支。
 	state := strings.Repeat("a", 292)
-	repo.current[kongStubKey(1, "gpt-6-astra")] = &KongTicket{
+	repo.setCurrent(1, "gpt-6-astra", &KongTicket{
 		ID: 7, AccountID: 1, Model: "gpt-6-astra", State: state,
 		Status: KongTicketStatusVerified, ExpiresAt: time.Now().Add(time.Hour),
-		// 归因结果要齐：当前票的查询条件里带着当前目标与阈值，缺了它就不是一张可用的票。
+		// 归因结果要齐，**分布也要**：采纳判据按白名单对分布求和，只给 argmax 的票会被判无分布
+		// 而拒掉，于是准入停在拒服、根本走不到这里要验的注入逻辑。
 		FingerprintModel: kongStrPtr("gpt-6-astra"), FingerprintP: kongFloatPtr(0.99),
-	}
+		FingerprintProbs: kongTestAttr(0.99).Probs,
+	})
 	svc := kongTestService(t, repo, &kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}}, accounts)
 	g := NewKongTicketGateway(svc, []string{"gpt-6-astra"})
 

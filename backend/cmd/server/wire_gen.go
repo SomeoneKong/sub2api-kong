@@ -294,7 +294,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	// 空操作），但 Admin 仍装配——管理面只读状态，让页面能显示「未启用」而不是服务故障。
 	kongTicketRepository := repository.NewKongTicketRepository(db)
 	kongTicketUpstream := service.NewKongTicketUpstream(httpUpstream, openAITokenProvider, proxyRepository, tlsFingerprintProfileService)
-	kongTicketComponents, kongTicketErr := service.NewKongTicketComponents(kongTicketRepository, kongTicketUpstream, accountRepository, proxyRepository)
+	kongTicketComponents, kongTicketErr := service.NewKongTicketComponents(kongTicketRepository, kongTicketUpstream, accountRepository, proxyRepository, configConfig.Gateway.KongCodexTicket)
 	if kongTicketErr != nil {
 		// fail-closed：启用了却装配不起来，等于放行降智请求，那比启动失败糟得多。
 		return nil, kongTicketErr

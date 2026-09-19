@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -15,7 +16,7 @@ import (
 type kongStubRepo struct {
 	mu sync.Mutex
 
-	current      map[string]*KongTicket
+	current      map[string][]*KongTicket
 	candidate    map[string]*KongTicket
 	nextID       int64
 	inserted     []*KongTicket
@@ -64,11 +65,12 @@ type kongStubStatusSet struct {
 	Status           string
 	FingerprintModel string
 	Probability      float64
+	Probs            map[string]float64
 }
 
 func newKongStubRepo() *kongStubRepo {
 	return &kongStubRepo{
-		current:     map[string]*KongTicket{},
+		current:     map[string][]*KongTicket{},
 		candidate:   map[string]*KongTicket{},
 		lastEventAt: map[string]*time.Time{},
 		byState:     map[string]int64{},
@@ -80,31 +82,57 @@ func kongStubKey(accountID int64, model string) string {
 	return fmt.Sprintf("%d\x00%s", accountID, model)
 }
 
-// CurrentTicket 必须照生产 SQL 的条件过滤，包括**当前**的目标模型与置信度。
+// VerifiedTickets 必须照生产 SQL 的条件过滤：verified、未过期，**按 expires_at 降序返回全部**。
 //
-// 桩少一个条件，就等于那个条件的错误测不出来：一张判为旧目标的 verified 票在生产里不会被选中，
-// 桩若照旧返回它，「配置改了旧票还能用」这类问题全绿通过。
-func (r *kongStubRepo) CurrentTicket(_ context.Context, accountID int64, model string, targetModel string, minProbability float64) (*KongTicket, error) {
+// **归因判据不在这里**——它由 KongTicketAccept 在 Go 侧判，桩若替它判一遍就成了第二套规则，
+// 真实实现改了规则而桩没改时测试仍然全绿。但另外三条必须照做：status 与期限（撤销与过期要真的
+// 影响读取），以及**返回多张并排好序**——只回一张的桩测不出「较新的票按当前白名单不合格、较旧
+// 那张合格」这个场景，而那正是不能在 SQL 里截断的理由。
+func (r *kongStubRepo) VerifiedTickets(_ context.Context, accountID int64, model string) ([]*KongTicket, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	t := r.current[kongStubKey(accountID, model)]
-	if t == nil {
-		return nil, nil
+	now := time.Now()
+	var out []*KongTicket
+	for _, t := range r.current[kongStubKey(accountID, model)] {
+		if t == nil {
+			continue
+		}
+		// 状态与期限优先看桩登记的状态（撤销等改动只改那里），没登记的用票行自身的字段。
+		status, expires := t.Status, t.ExpiresAt
+		if st := r.stateOf(t); st != nil {
+			status, expires = st.Status, st.ExpiresAt
+		}
+		if status != KongTicketStatusVerified || !expires.After(now) {
+			continue
+		}
+		out = append(out, t)
 	}
-	if t.FingerprintModel == nil || *t.FingerprintModel != targetModel {
-		return nil, nil
-	}
-	if t.FingerprintP == nil || *t.FingerprintP < minProbability {
-		return nil, nil
-	}
-	// 生产 SQL 还有 `status = verified AND expires_at > now()`。撤销与过期必须真的影响读取，
-	// 否则「撤销后仍被当成当前票」这类问题测不出来。
-	if st := r.stateOf(t); st != nil {
-		if st.Status != KongTicketStatusVerified || !st.ExpiresAt.After(time.Now()) {
-			return nil, nil
+	sort.SliceStable(out, func(i, j int) bool { return out[i].ExpiresAt.After(out[j].ExpiresAt) })
+	return out, nil
+}
+
+// setCurrent 预置该 (账号, 模型) 下的 verified 票，可以给多张。
+func (r *kongStubRepo) setCurrent(accountID int64, model string, tickets ...*KongTicket) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.current[kongStubKey(accountID, model)] = tickets
+}
+
+// ticketByID 在预置的票里按 id 找，供落结论时把归因写回可被后续查询读到的那个对象。
+func (r *kongStubRepo) ticketByID(id int64) *KongTicket {
+	for _, list := range r.current {
+		for _, t := range list {
+			if t != nil && t.ID == id {
+				return t
+			}
 		}
 	}
-	return t, nil
+	for _, t := range r.candidate {
+		if t != nil && t.ID == id {
+			return t
+		}
+	}
+	return nil
 }
 
 // stateOf 取一张票在桩里的状态；没登记过的票（用例直接塞进 current/candidate 的）返回 nil，
@@ -183,10 +211,10 @@ func (r *kongStubRepo) SkipCandidatesFor(_ context.Context, accountID int64, mod
 	return nil
 }
 
-func (r *kongStubRepo) SetTicketStatus(_ context.Context, id int64, status string, fingerprintModel string, p float64) (bool, error) {
+func (r *kongStubRepo) SetTicketStatus(_ context.Context, id int64, status string, attr KongAttribution) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.statusSets = append(r.statusSets, kongStubStatusSet{ID: id, Status: status, FingerprintModel: fingerprintModel, Probability: p})
+	r.statusSets = append(r.statusSets, kongStubStatusSet{ID: id, Status: status, FingerprintModel: attr.Model, Probability: attr.P, Probs: attr.Probs})
 	if r.setStatusOK != nil {
 		return *r.setStatusOK, nil
 	}
@@ -196,11 +224,19 @@ func (r *kongStubRepo) SetTicketStatus(_ context.Context, id int64, status strin
 		}
 		st.Status = status
 	}
+	// 归因要写回票对象本身，否则「提交完整分布 → 重新读票 → 按当前白名单授予资格」这条链路
+	// 在测试里断开：读回来的票永远没有分布，于是永远判不合格。
+	if t := r.ticketByID(id); t != nil {
+		t.Status = status
+		t.FingerprintModel = kongStrPtr(attr.Model)
+		t.FingerprintP = kongFloatPtr(attr.P)
+		t.FingerprintProbs = attr.Probs
+	}
 	return true, nil
 }
 
 // CommitVerification 在 stub 里按「条件更新 + 写事件」的同一语义记账：更新不成立时事件也不写。
-func (r *kongStubRepo) CommitVerification(ctx context.Context, id int64, status string, fingerprintModel string, p float64, event *KongTicketEvent) (bool, error) {
+func (r *kongStubRepo) CommitVerification(ctx context.Context, id int64, status string, attr KongAttribution, event *KongTicketEvent) (bool, error) {
 	if r.commitErr != nil {
 		return false, r.commitErr
 	}
@@ -213,7 +249,7 @@ func (r *kongStubRepo) CommitVerification(ctx context.Context, id int64, status 
 	if blocked {
 		return false, nil
 	}
-	updated, err := r.SetTicketStatus(ctx, id, status, fingerprintModel, p)
+	updated, err := r.SetTicketStatus(ctx, id, status, attr)
 	if err != nil || !updated {
 		return updated, err
 	}
@@ -349,4 +385,12 @@ func (r *kongStubRepo) countEvents(eventType string) int {
 		}
 	}
 	return n
+}
+
+// kongTestAttr 造一个归因结论：argmax 是 astra、概率为 p，其余质量落到 sol。
+func kongTestAttr(p float64) KongAttribution {
+	return KongAttribution{
+		Model: "gpt-6-astra", P: p,
+		Probs: map[string]float64{"gpt-6-astra": p, "gpt-5.6-sol": 1 - p},
+	}
 }

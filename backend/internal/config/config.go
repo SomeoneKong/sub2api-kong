@@ -946,6 +946,8 @@ const (
 
 // GatewayConfig API网关相关配置
 type GatewayConfig struct {
+	// KongCodexTicket 是本 fork 的 Codex 票据配置，字段定义在 kong_ticket_config.go。
+	KongCodexTicket KongCodexTicketConfig `mapstructure:"kong_codex_ticket"`
 	// 等待上游响应头的超时时间（秒），0表示无超时
 	// 注意：这不影响流式数据传输，只控制等待响应头的时间
 	ResponseHeaderTimeout int `mapstructure:"response_header_timeout"`
@@ -2248,6 +2250,9 @@ func setDefaults() {
 	viper.SetDefault("image_storage.access_key_id", "")
 	viper.SetDefault("image_storage.secret_access_key", "")
 	viper.SetDefault("image_storage.public_base_url", "")
+	// 同一个理由（viper 只解码 AllKeys() 里的键）：本 fork 的票据配置没有 config 文件可依，
+	// 现网全靠 GATEWAY_KONG_CODEX_TICKET_* 环境变量，不注册空默认值就永远读不到。
+	viper.SetDefault("gateway.kong_codex_ticket.accept_extra", "")
 
 	// Ops (vNext)
 	viper.SetDefault("ops.enabled", true)

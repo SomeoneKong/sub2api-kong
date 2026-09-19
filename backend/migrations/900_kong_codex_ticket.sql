@@ -23,9 +23,16 @@ CREATE TABLE IF NOT EXISTS kong_ticket_cache (
     -- observed = 业务响应头带回；fetch = 经票据出口主动取
     source            TEXT        NOT NULL CHECK (source IN ('observed', 'fetch')),
     status            TEXT        NOT NULL CHECK (status IN ('unverified', 'verified', 'rejected')),
-    -- 归因结果与概率；unverified 时为 NULL
+    -- 归因结果与概率；unverified 时为 NULL。fingerprint_model 是最像的那一个，
+    -- fingerprint_p 是它的概率——两者是**证据**，不是采纳结论。
     fingerprint_model TEXT,
     fingerprint_p     DOUBLE PRECISION,
+    -- 归因的完整分布（模型 → 概率）。
+    --
+    -- 采纳判据是「白名单内各归因结果的概率之和 ≥ 置信度」，白名单来自环境变量、可以改。只存
+    -- argmax 的话，改了白名单就没法重判存量票：要么拿旧结论放行（可能放行白名单外的档位），
+    -- 要么一律作废（把合格票也丢掉）。存下整个分布，任何时候都能按**当前**白名单重判。
+    fingerprint_probs JSONB,
     -- 本段无票期内是否已被跳过（候选未被上游接受后留存但不再选中）
     skip_until_new    BOOLEAN     NOT NULL DEFAULT FALSE,
     captured_at       TIMESTAMPTZ NOT NULL DEFAULT now(),

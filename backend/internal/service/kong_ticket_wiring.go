@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/config"
 )
 
 // 票据功能的装配。设计见 DESIGN-codex-ticket.md §6 / §7。
@@ -18,8 +20,8 @@ import (
 const (
 	// KongTicketGatedModelsEnv 是门控模型集合（逗号分隔）。**留空即整个功能不生效**。
 	KongTicketGatedModelsEnv = "KONG_TICKET_GATED_MODELS"
-	// KongTicketTargetModelEnv 是归因要认的那个模型 id，只有判为它才放行。
-	KongTicketTargetModelEnv = "KONG_TICKET_TARGET_MODEL"
+	// 归因的接受关系走 config.Gateway.KongCodexTicket.AcceptExtra，不在这里列。默认每个门控
+	// 模型只接受自己的归因，额外关系（例如 sol 接受 astra）显式配置。
 	// KongTicketConfidenceEnv 是采纳归因结论所需的概率，不够就再加一份挑战。
 	KongTicketConfidenceEnv = "KONG_TICKET_CONFIDENCE"
 
@@ -29,9 +31,6 @@ const (
 	KongTicketMinAgeEnv        = "KONG_TICKET_MIN_TICKET_AGE_SECONDS"
 	KongTicketObserveEnv       = "KONG_TICKET_OBSERVE_PROBE_INTERVAL_SECONDS"
 )
-
-// kongTicketDefaultTargetModel 是校准库里那个满血档位的模型 id。
-const kongTicketDefaultTargetModel = "gpt-6-astra"
 
 // KongTicketComponents 打包本功能对外暴露的部件。
 //
@@ -139,7 +138,7 @@ func kongNotReadyReason(account *Account) string {
 //
 // 一旦启用，校准资料加载失败必须让启动失败（fail-closed）：启用了却验证不了，等于放行降智
 // 请求，那比启动失败糟得多。
-func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstream, accountRepo AccountRepository, proxyRepo ProxyRepository) (*KongTicketComponents, error) {
+func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstream, accountRepo AccountRepository, proxyRepo ProxyRepository, ticketCfg config.KongCodexTicketConfig) (*KongTicketComponents, error) {
 	gated := kongSplitModels(os.Getenv(KongTicketGatedModelsEnv))
 	if len(gated) == 0 {
 		// 功能不生效，但管理面照常装配：它只读状态，不需要校准资料。页面因此能明确显示
@@ -147,8 +146,8 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 		// （端点 503 → 页面只能显示加载失败）。
 		return &KongTicketComponents{
 			Enabled: false,
-			// 未启用时目标与阈值取不到也无所谓：没有门控模型，就不会查任何「当前票」。
-			Admin: NewKongTicketAdminService(repo, NewKongAccountAccess(accountRepo, proxyRepo), KongDefaultTicketParams(), nil, "", 0),
+			// 未启用时接受关系与阈值取不到也无所谓：没有门控模型，就不会查任何「当前票」。
+			Admin: NewKongTicketAdminService(repo, NewKongAccountAccess(accountRepo, proxyRepo), KongDefaultTicketParams(), nil, nil, 0),
 		}, nil
 	}
 
@@ -157,14 +156,16 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 		return nil, fmt.Errorf("codex 票据功能已启用（%s 非空）但校准资料加载失败: %w", KongTicketGatedModelsEnv, err)
 	}
 
-	target := strings.TrimSpace(os.Getenv(KongTicketTargetModelEnv))
-	if target == "" {
-		target = kongTicketDefaultTargetModel
+	// 门控模型自己必须在校准资料里：闭集归因下库外模型会被归到最相似的现有候选，那时
+	// 「判为它」根本不成立，表现却只是一直拿不到合格票。
+	for _, model := range gated {
+		if !bank.HasModel(model) {
+			return nil, fmt.Errorf("门控模型 %q 不在校准资料里，准入判定不成立", model)
+		}
 	}
-	if !bank.HasModel(target) {
-		// 闭集归因下库外模型会被归到最相似的现有候选，所以目标模型必须确实在库中，
-		// 否则「判为它」这件事根本不成立。
-		return nil, fmt.Errorf("目标模型 %q 不在校准资料里，准入判定不成立", target)
+	accept, err := KongParseTicketAccept(gated, ticketCfg.AcceptExtra, bank)
+	if err != nil {
+		return nil, err
 	}
 
 	params := KongDefaultTicketParams()
@@ -200,12 +201,12 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 	}
 
 	access := NewKongAccountAccess(accountRepo, proxyRepo)
-	ticketService := NewKongTicketService(repo, upstream, accountRepo, bank, params, target, confidence)
+	ticketService := NewKongTicketService(repo, upstream, accountRepo, bank, params, accept, confidence)
 	return &KongTicketComponents{
 		Enabled: true,
 		Service: ticketService,
-		// 目标与阈值必须与编排服务同源：管理面显示的「当前票」要和业务实际会注入的那张一致。
-		Admin:   NewKongTicketAdminService(repo, access, params, gated, target, confidence),
+		// 接受关系与阈值必须与编排服务同源：管理面显示的「当前票」要和业务实际会注入的那张一致。
+		Admin:   NewKongTicketAdminService(repo, access, params, gated, accept, confidence),
 		Gateway: NewKongTicketGateway(ticketService, gated),
 	}, nil
 }

@@ -112,7 +112,8 @@ func kongTestService(t *testing.T, repo *kongStubRepo, up *kongStubUpstream, acc
 		t.Fatalf("加载校准资料: %v", err)
 	}
 	params := KongDefaultTicketParams()
-	return NewKongTicketService(repo, up, accounts, bank, params, "gpt-6-astra", 0.9)
+	return NewKongTicketService(repo, up, accounts, bank, params,
+		KongTicketAccept{"gpt-6-astra": []string{"gpt-6-astra"}}, 0.9)
 }
 
 // 两个账号共用同一个票据出口时不得并发取票：每次取票都是该出口上的一次活动，并发会互相把

@@ -28,8 +28,8 @@ type KongTicketService struct {
 	bank     *KongFingerprintBank
 	params   KongTicketParams
 
-	// targetModel 是归因要认的那个模型 id。只有判为它才放行。
-	targetModel string
+	// accept 记录每个门控模型接受哪些归因结果（永远含自己）。采纳判据只此一份。
+	accept KongTicketAccept
 	// confidence 是采纳归因结论所需的概率；不够就再加一份挑战。
 	confidence float64
 
@@ -63,7 +63,7 @@ type kongTicketTask struct {
 }
 
 // NewKongTicketService 创建编排服务。
-func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream, accounts KongAccountLoader, bank *KongFingerprintBank, params KongTicketParams, targetModel string, confidence float64) *KongTicketService {
+func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream, accounts KongAccountLoader, bank *KongFingerprintBank, params KongTicketParams, accept KongTicketAccept, confidence float64) *KongTicketService {
 	if confidence <= 0 || confidence >= 1 {
 		confidence = 0.9
 	}
@@ -73,7 +73,7 @@ func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream
 		accounts:         accounts,
 		bank:             bank,
 		params:           params,
-		targetModel:      targetModel,
+		accept:           accept,
 		confidence:       confidence,
 		inflight:         make(map[int64]*kongTicketTask),
 		inflightEgress:   make(map[string]*kongTicketTask),
@@ -187,7 +187,7 @@ func (s *KongTicketService) buildScheduleInput(ctx context.Context, account *Acc
 		})
 	}
 
-	current, err := s.repo.CurrentTicket(ctx, account.ID, model, s.targetModel, s.confidence)
+	current, err := s.currentTicket(ctx, account.ID, model)
 	if err != nil {
 		return nil, fmt.Errorf("查当前票: %w", err)
 	}
@@ -234,7 +234,7 @@ func (s *KongTicketService) buildScheduleInput(ctx context.Context, account *Acc
 // 撤销针对的是**本次实际注入的那个 id**（见 KongUpstreamAttempt.Grant.TicketID），所以换票不会
 // 让撤销打到无辜的票上。
 func (s *KongTicketService) currentGrant(ctx context.Context, accountID int64, model string) (*KongTicketGrant, error) {
-	ticket, err := s.repo.CurrentTicket(ctx, accountID, model, s.targetModel, s.confidence)
+	ticket, err := s.currentTicket(ctx, accountID, model)
 	if err != nil {
 		return nil, fmt.Errorf("读当前票: %w", err)
 	}
@@ -950,7 +950,9 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 		probe.TemperatureTier = kongIntPtr(kongTierToInt(result.CalibrationTier))
 		probes = append(probes, probe)
 
-		if result.Probability >= s.confidence {
+		// 停止条件用**白名单内的概率之和**，与最终采纳判据同一个量。用 argmax 会在证据分散于
+		// 两个都接受的归因之间时白加挑战，加满还是拒——每一份挑战都是一次上游请求。
+		if s.accept.Accepts(model, kongProbsOf(result), s.confidence) {
 			break
 		}
 	}
@@ -990,7 +992,8 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 			fmt.Errorf("结论作废，前提已失效: %w", lost))
 	}
 
-	accepted := result.Prediction == s.targetModel && result.Probability >= s.confidence
+	probs := kongProbsOf(result)
+	accepted := s.accept.Accepts(model, probs, s.confidence)
 	status := KongTicketStatusRejected
 	if accepted {
 		status = KongTicketStatusVerified
@@ -1000,20 +1003,27 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 		"used_answers":     result.UsedAnswers,
 		"calibration_tier": result.CalibrationTier,
 		"fingerprint":      result.Prediction,
+		// 采纳看的是白名单内的概率之和，不是 probability。两个都记：只记前者看不出最像哪个，
+		// 只记后者解释不了「argmax 概率不够却仍然放行」。
+		"accept_models": s.accept.Of(model),
+		"accept_mass":   s.accept.Mass(model, probs),
 	}
 	outcome := KongOutcomeSuccess
 	var retErr error
 	grantedID := ticketID
 	if !accepted {
 		outcome = KongOutcomeFailure
-		retErr = fmt.Errorf("归因为 %s，不是 %s", result.Prediction, s.targetModel)
+		retErr = fmt.Errorf("归因为 %s（%.4f），%s 可接受的归因 %v 合计只有 %.4f，不足 %.4f",
+			result.Prediction, result.Probability, model, s.accept.Of(model),
+			s.accept.Mass(model, probs), s.confidence)
 		grantedID = 0
 		failCooldown("not_target_model")
 	}
 
 	// 资格与最终事件同一个事务。事件写失败时资格不得对任何请求可见。
 	pctx, cancelCommit := persistCtx()
-	committed, commitErr := s.repo.CommitVerification(pctx, ticketID, status, result.Prediction, result.Probability,
+	committed, commitErr := s.repo.CommitVerification(pctx, ticketID, status,
+		KongAttribution{Model: result.Prediction, P: result.Probability, Probs: probs},
 		buildFinalEvent(outcome, detail))
 	cancelCommit()
 	if commitErr != nil {
@@ -1118,6 +1128,11 @@ func (s *KongTicketService) storeTicket(ctx context.Context, accountID int64, mo
 
 // kongTicketTTL 是票的可用寿命。
 const kongTicketTTL = 3600 * time.Second
+
+// currentTicket 取一张能支持该模型请求的票，与管理面共用同一份挑选逻辑。
+func (s *KongTicketService) currentTicket(ctx context.Context, accountID int64, model string) (*KongTicket, error) {
+	return kongPickCurrent(ctx, s.repo, s.accept, s.confidence, accountID, model)
+}
 
 // idleSeconds 是采样时刻该出口的静默时长，随探测记录长期留存。
 //

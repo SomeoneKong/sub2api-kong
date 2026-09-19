@@ -69,8 +69,8 @@ func TestKongVerifyConsumesCandidateBudgetOnNonTargetModel(t *testing.T) {
 		answers:    kongVerifyAnswers(),
 	}
 	svc := kongTestService(t, repo, up, accounts)
-	// 把目标模型换成一个归因绝不会命中的值，逼出「非目标」这个终点。
-	svc.targetModel = "no-such-model"
+	// 把白名单换成一个归因绝不会命中的值，逼出「不在白名单内」这个终点。
+	svc.accept = KongTicketAccept{"gpt-6-astra": []string{"no-such-model"}}
 	cfg, _ := ParseKongTicketConfig(account.Extra)
 
 	id, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
@@ -186,15 +186,15 @@ func TestKongStubRepoHonorsProductionConditions(t *testing.T) {
 
 	// 撤销必须影响读取。
 	verified := mk(1, "gpt-6-astra", "S-V", KongTicketSourceFetch, KongTicketStatusVerified, now.Add(time.Hour), now)
-	repo.current[kongStubKey(1, "gpt-6-astra")] = repo.inserted[0]
-	if got, _ := repo.CurrentTicket(ctx, 1, "gpt-6-astra", "gpt-6-astra", 0.9); got == nil {
+	repo.setCurrent(1, "gpt-6-astra", repo.inserted[0])
+	if got, _ := repo.VerifiedTickets(ctx, 1, "gpt-6-astra"); len(got) == 0 {
 		t.Fatal("verified 且未过期的票应当读得到")
 	}
 	if err := repo.RevokeTicket(ctx, verified); err != nil {
 		t.Fatalf("撤销: %v", err)
 	}
-	if got, _ := repo.CurrentTicket(ctx, 1, "gpt-6-astra", "gpt-6-astra", 0.9); got != nil {
-		t.Error("撤销后不该再作为当前票")
+	if got, _ := repo.VerifiedTickets(ctx, 1, "gpt-6-astra"); len(got) != 0 {
+		t.Error("撤销后不该再读到")
 	}
 
 	// 批量 skip 只影响同一 (账号, 模型)，且 clear 必须真的解除。
@@ -203,22 +203,22 @@ func TestKongStubRepoHonorsProductionConditions(t *testing.T) {
 	if err := repo.SkipCandidatesFor(ctx, 2, "gpt-6-astra", now); err != nil {
 		t.Fatalf("批量跳过: %v", err)
 	}
-	if ok, _ := repo.CommitVerification(ctx, a, KongTicketStatusRejected, "gpt-6-astra", 0.5, &KongTicketEvent{AccountID: 2}); ok {
+	if ok, _ := repo.CommitVerification(ctx, a, KongTicketStatusRejected, kongTestAttr(0.5), &KongTicketEvent{AccountID: 2}); ok {
 		t.Error("被跳过的票不得提交成功")
 	}
-	if ok, _ := repo.CommitVerification(ctx, b, KongTicketStatusRejected, "gpt-6-astra", 0.5, &KongTicketEvent{AccountID: 3}); !ok {
+	if ok, _ := repo.CommitVerification(ctx, b, KongTicketStatusRejected, kongTestAttr(0.5), &KongTicketEvent{AccountID: 3}); !ok {
 		t.Error("别的账号不该受影响——跨账号一起标是桩自己的 bug")
 	}
 	if err := repo.ClearSkipMarks(ctx, 2, "gpt-6-astra"); err != nil {
 		t.Fatalf("解除标记: %v", err)
 	}
-	if ok, _ := repo.CommitVerification(ctx, a, KongTicketStatusRejected, "gpt-6-astra", 0.5, &KongTicketEvent{AccountID: 2}); !ok {
+	if ok, _ := repo.CommitVerification(ctx, a, KongTicketStatusRejected, kongTestAttr(0.5), &KongTicketEvent{AccountID: 2}); !ok {
 		t.Error("解除标记后应当可以提交")
 	}
 
 	// 过期票不得提交。
 	expired := mk(4, "gpt-6-astra", "S-E", KongTicketSourceFetch, KongTicketStatusUnverified, now.Add(-time.Second), now.Add(-time.Hour))
-	if ok, _ := repo.CommitVerification(ctx, expired, KongTicketStatusVerified, "gpt-6-astra", 0.99, &KongTicketEvent{AccountID: 4}); ok {
+	if ok, _ := repo.CommitVerification(ctx, expired, KongTicketStatusVerified, kongTestAttr(0.99), &KongTicketEvent{AccountID: 4}); ok {
 		t.Error("过期票不得提交成功")
 	}
 

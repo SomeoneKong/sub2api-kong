@@ -161,15 +161,19 @@ const (
 
 // KongTicket 是一张票。model 用最终上游模型名——票与验证结论按 (account, model) 绑定。
 type KongTicket struct {
-	ID               int64
-	AccountID        int64
-	Model            string
-	State            string
-	StateLen         int
-	Source           string
-	Status           string
+	ID        int64
+	AccountID int64
+	Model     string
+	State     string
+	StateLen  int
+	Source    string
+	Status    string
+	// FingerprintModel / FingerprintP 是最像的那个模型与它的概率——证据，不是采纳结论。
 	FingerprintModel *string
 	FingerprintP     *float64
+	// FingerprintProbs 是归因的完整分布。采纳判据按它与**当前**白名单求和，所以白名单改了
+	// 存量票仍能重判；只留 argmax 的话就只剩「照旧放行」与「全部作废」两个都不对的选项。
+	FingerprintProbs map[string]float64
 	// SkipUntilNew 为真时本段无票期内不再选它。用于「候选未被上游接受」这个终点：
 	// 档位没有被证伪，但重选同一张只会重复同一个无效尝试。
 	SkipUntilNew    bool
@@ -306,14 +310,28 @@ type KongTicketEventFilter struct {
 	Offset    int
 }
 
+// KongAttribution 是一次归因的可持久化结论。
+//
+// 三个字段的分工是刻意的：Model / P 是**证据**（最像哪个、有多像），Probs 是重判所需的完整
+// 分布。采纳与否不在这里——它由 KongTicketAccept 按当前白名单求和得出，所以不该被固化进票行。
+type KongAttribution struct {
+	Model string
+	P     float64
+	Probs map[string]float64
+}
+
 // KongTicketRepository 是票据子系统的持久化边界。
 type KongTicketRepository interface {
-	// CurrentTicket 返回可支持业务的票：verified、未过期，且归因结果满足**当前**的目标模型与
-	// 置信度阈值。没有则返回 nil。
+	// VerifiedTickets 返回该账号该模型下所有 verified 且未过期的票，按 expires_at 降序。
 	//
-	// 后两个条件不能省：verified 只代表「按当时的目标与阈值判过」，而那两个值来自环境变量、
-	// 可以改——目标换掉之后，一张判为旧目标的票仍然是 verified。
-	CurrentTicket(ctx context.Context, accountID int64, model string, targetModel string, minProbability float64) (*KongTicket, error)
+	// **归因判据不在这里**：采纳与否由 KongTicketAccept 在 Go 侧统一判定。judge 放在 SQL 里
+	// 就成了第二套规则——白名单求和这件事 SQL 也能写，但两处写法只要有一点出入，同一张票在
+	// 「读当前票」与「落结论」两条路径上就会得出不同答案，而不一致的那一侧不会报错。
+	//
+	// 只筛 verified + 未过期仍是必要的：verified 只代表「按当时的白名单与阈值判过」，那两个
+	// 值来自环境变量、可以改，所以调用方必须按当前配置重判一次。返回多张而不是一张，是为了
+	// 让「较新但按当前白名单不合格的票」不挡住较旧而合格的那张。
+	VerifiedTickets(ctx context.Context, accountID int64, model string) ([]*KongTicket, error)
 	// OldestCandidate 返回最早的一张可验证候选：unverified、未过期、未被本段无票期跳过，
 	// 且 observed 来源需满足 minAge。fetch 票不受 minAge 限制（立即验证）。
 	OldestCandidate(ctx context.Context, accountID int64, model string, minAge time.Duration, now time.Time) (*KongTicket, error)
@@ -322,7 +340,7 @@ type KongTicketRepository interface {
 	InsertTicket(ctx context.Context, t *KongTicket) (int64, bool, error)
 	// SetTicketStatus 落指纹结论。仅在票仍为 unverified 时生效，返回是否更新——
 	// 晚到的结果不能覆盖已被改写的状态。
-	SetTicketStatus(ctx context.Context, id int64, status string, fingerprintModel string, p float64) (bool, error)
+	SetTicketStatus(ctx context.Context, id int64, status string, attr KongAttribution) (bool, error)
 	// SkipCandidate 标记该候选在本段无票期内不再被选中。
 	SkipCandidate(ctx context.Context, id int64) error
 	// CommitVerification 在同一个事务里落「资格 + 最终事件」。返回假表示条件不满足
@@ -330,7 +348,7 @@ type KongTicketRepository interface {
 	//
 	// 不能拆成「先改状态、再写事件」：事件写失败时资格已经对所有并发请求可见，而库里没有任何
 	// 记录解释这张票为什么可用。
-	CommitVerification(ctx context.Context, id int64, status string, fingerprintModel string, p float64, event *KongTicketEvent) (bool, error)
+	CommitVerification(ctx context.Context, id int64, status string, attr KongAttribution, event *KongTicketEvent) (bool, error)
 	// SkipCandidatesFor 标记该账号该模型下当前所有未验证候选。用于「本段无票期的候选机会已用掉」
 	// 这个终点——只标一张会让缓存里的其它旧候选被逐张验证，而候选验证不经过取票冷却。
 	// capturedBefore 之后收到的票不受影响——验证期间新到的票属于新信息。
