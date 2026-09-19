@@ -36,7 +36,7 @@ func TestKongParseFingerprintBankRejectsBrokenDimensions(t *testing.T) {
 			name: "hellinger 中心行宽不对",
 			break_: func(m map[string]any) {
 				h := kongDigInto(m, "robust", "hellinger")
-				rows := h["centroids"].([]any)
+				rows, _ := h["centroids"].([]any)
 				rows[0] = []any{1.0}
 			},
 		},
@@ -44,7 +44,7 @@ func TestKongParseFingerprintBankRejectsBrokenDimensions(t *testing.T) {
 			name: "有序块中心行宽不对",
 			break_: func(m map[string]any) {
 				ob := kongDigInto(m, "robust", "ordered_blocks")
-				rows := ob["centroids"].([]any)
+				rows, _ := ob["centroids"].([]any)
 				rows[0] = []any{1.0}
 			},
 		},
@@ -59,8 +59,8 @@ func TestKongParseFingerprintBankRejectsBrokenDimensions(t *testing.T) {
 			name: "环境中心行宽不对",
 			break_: func(m map[string]any) {
 				ob := kongDigInto(m, "robust", "ordered_blocks")
-				envs := ob["environment_centroids"].([]any)
-				first := envs[0].([]any)
+				envs, _ := ob["environment_centroids"].([]any)
+				first, _ := envs[0].([]any)
 				first[0] = []any{1.0}
 			},
 		},
@@ -81,7 +81,8 @@ func TestKongParseFingerprintBankRejectsBrokenDimensions(t *testing.T) {
 		{
 			name: "缺校准档",
 			break_: func(m map[string]any) {
-				delete(m["calibration"].(map[string]any), "2")
+				calibration, _ := m["calibration"].(map[string]any)
+				delete(calibration, "2")
 			},
 		},
 		{
@@ -113,7 +114,7 @@ func TestKongParseFingerprintBankRejectsBrokenDimensions(t *testing.T) {
 func kongDigInto(m map[string]any, path ...string) map[string]any {
 	cur := m
 	for _, key := range path {
-		cur = cur[key].(map[string]any)
+		cur, _ = cur[key].(map[string]any)
 	}
 	return cur
 }
@@ -137,7 +138,7 @@ func TestKongParseFingerprintBankRejectsBrokenScale(t *testing.T) {
 				t.Fatalf("解析内置资料: %v", err)
 			}
 			h := kongDigInto(m, "robust", "hellinger")
-			scale := h["feature_scale"].([]any)
+			scale, _ := h["feature_scale"].([]any)
 			for i := range scale {
 				scale[i] = c.value
 			}
@@ -160,7 +161,7 @@ func TestKongSubnormalScaleFailsLoudlyInsteadOfNaN(t *testing.T) {
 	if err := json.Unmarshal(kongFingerprintBankJSON, &m); err != nil {
 		t.Fatalf("解析内置资料: %v", err)
 	}
-	scale := kongDigInto(m, "robust", "hellinger")["feature_scale"].([]any)
+	scale, _ := kongDigInto(m, "robust", "hellinger")["feature_scale"].([]any)
 	for i := range scale {
 		scale[i] = 1e-320
 	}

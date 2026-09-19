@@ -292,7 +292,8 @@ func (s *KongTicketAdminService) latestDiagnosis(ctx context.Context, accountID 
 	if err != nil {
 		return nil, fmt.Errorf("查诊断事件: %w", err)
 	}
-	for _, event := range events {
+	if len(events) > 0 {
+		event := events[0]
 		age := time.Since(event.CreatedAt)
 		diagnosis := &KongTicketDiagnosis{
 			At:      event.CreatedAt,

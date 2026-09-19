@@ -322,7 +322,8 @@ func kongReadCodexSSEText(body io.Reader) (string, *int, error) {
 			if !ok {
 				return fmt.Errorf("SSE 事件的 delta 不是字符串")
 			}
-			text.WriteString(str)
+			// strings.Builder.WriteString 的错误恒为 nil，但 errcheck 要求显式忽略。
+			_, _ = text.WriteString(str)
 		case "response.completed", "response.done":
 			completed = true
 			if n, ok := kongExtractOutputTokens(event); ok {

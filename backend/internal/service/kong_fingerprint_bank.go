@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -354,7 +355,9 @@ var (
 func KongFingerprintBankLoad() (*KongFingerprintBank, error) {
 	kongFingerprintBankOnce.Do(func() {
 		if path := strings.TrimSpace(os.Getenv(KongFingerprintBankPathEnv)); path != "" {
-			data, err := os.ReadFile(path)
+			// 路径来自**服务端环境变量**，由运维自己设置，不是请求可控的输入；能设这个变量的人本来
+			// 就能读服务进程可读的任何文件。Clean 只为规范化，真正的边界是「谁能设环境变量」。
+			data, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // G703：路径源自部署环境的配置，不含用户输入
 			if err != nil {
 				kongFingerprintBankErr = fmt.Errorf("读取外部校准资料 %s: %w", path, err)
 				return

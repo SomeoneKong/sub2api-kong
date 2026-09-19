@@ -1414,10 +1414,3 @@ func kongTierToInt(tier string) int {
 		return 0
 	}
 }
-
-func kongOutcomeOf(ok bool) string {
-	if ok {
-		return KongOutcomeSuccess
-	}
-	return KongOutcomeFailure
-}
