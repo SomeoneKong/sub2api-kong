@@ -1,0 +1,590 @@
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/service"
+)
+
+// kongTicketRepository 是 Codex 票据子系统的仓储（raw SQL）。
+//
+// 刻意不走 ent：上游把 ent 生成代码全部入库，新增 schema 会重新生成 ent/migrate/schema.go、
+// ent/mutation.go 等上游每周改动数次的文件。表定义见 migrations/900_kong_codex_ticket.sql。
+type kongTicketRepository struct {
+	db *sql.DB
+}
+
+// NewKongTicketRepository 创建票据仓储。
+func NewKongTicketRepository(db *sql.DB) service.KongTicketRepository {
+	return &kongTicketRepository{db: db}
+}
+
+const kongTicketColumns = `id, account_id, model, state, state_len, source, status,
+fingerprint_model, fingerprint_p, skip_until_new, captured_at, expires_at, expires_at_source,
+coalesce(capture_egress,''), capture_idle_seconds`
+
+func scanKongTicket(row interface{ Scan(...any) error }) (*service.KongTicket, error) {
+	var t service.KongTicket
+	err := row.Scan(&t.ID, &t.AccountID, &t.Model, &t.State, &t.StateLen, &t.Source, &t.Status,
+		&t.FingerprintModel, &t.FingerprintP, &t.SkipUntilNew, &t.CapturedAt, &t.ExpiresAt, &t.ExpiresAtSource,
+		&t.CaptureEgress, &t.CaptureIdleSeconds)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// CurrentTicket 返回可支持业务的票：verified 且未过期。
+func (r *kongTicketRepository) CurrentTicket(ctx context.Context, accountID int64, model string, targetModel string, minProbability float64) (*service.KongTicket, error) {
+	// 归因结果也必须满足**当前**的目标与阈值，不能只看 `status = verified`。
+	//
+	// verified 是「按当时的目标与阈值判过」，那两个值来自环境变量、可以改：目标从 sol 换成 astra
+	// 之后，一张判为 sol 的旧票仍然满足 verified + 未过期，于是被注入——而上游接受它、不重发
+	// state，后置守卫也就永远不报错，直接交付了当前目标之外的输出。
+	//
+	// 条件放在查询里而不是只在授予时检查：调度也读这张票来决定要不要提前续期，两边口径必须一致。
+	// 排序仍按 expires_at DESC，所以一张较新但不合格的票不会挡住较旧而合格的那张。
+	query := `SELECT ` + kongTicketColumns + ` FROM kong_ticket_cache
+		WHERE account_id = $1 AND model = $2 AND status = $3 AND expires_at > now()
+		  AND fingerprint_model = $4 AND fingerprint_p >= $5
+		ORDER BY expires_at DESC LIMIT 1`
+	t, err := scanKongTicket(r.db.QueryRowContext(ctx, query, accountID, model, service.KongTicketStatusVerified,
+		targetModel, minProbability))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query current ticket: %w", err)
+	}
+	return t, nil
+}
+
+// OldestCandidate 返回最早的一张可验证候选。
+//
+// minAge 只作用于 observed 票——fetch 票是我们自己刚要来的唯一一张，等待毫无意义，否则冷启动
+// 要凭空多阻塞一个 minAge。skip_until_new 为真的候选不参与选择：它们是「未被上游接受」这个
+// 终点留下的，档位没被证伪，但重选只会重复同一个无效尝试。
+func (r *kongTicketRepository) OldestCandidate(ctx context.Context, accountID int64, model string, minAge time.Duration, now time.Time) (*service.KongTicket, error) {
+	query := `SELECT ` + kongTicketColumns + ` FROM kong_ticket_cache
+		WHERE account_id = $1 AND model = $2 AND status = $3
+		  AND expires_at > $4 AND NOT skip_until_new
+		  AND (source = $5 OR captured_at <= $6)
+		ORDER BY captured_at ASC LIMIT 1`
+	t, err := scanKongTicket(r.db.QueryRowContext(ctx, query,
+		accountID, model, service.KongTicketStatusUnverified, now,
+		service.KongTicketSourceFetch, now.Add(-minAge)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query oldest candidate: %w", err)
+	}
+	return t, nil
+}
+
+func (r *kongTicketRepository) InsertTicket(ctx context.Context, t *service.KongTicket) (int64, bool, error) {
+	// ON CONFLICT DO NOTHING + 回查：靠唯一约束原子地区分「新票」与「重复票」。
+	//
+	// 先查再插会在并发下双双判为新票（两个事务都看不到对方未提交的行），于是重复票照样入库、
+	// 期限被重算、跳过标记被当成新信息解除。
+	var id int64
+	err := r.db.QueryRowContext(ctx,
+		`INSERT INTO kong_ticket_cache
+			(account_id, model, state, state_len, source, status,
+			 fingerprint_model, fingerprint_p, skip_until_new,
+			 captured_at, expires_at, expires_at_source,
+			 capture_egress, capture_idle_seconds)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		 ON CONFLICT (account_id, model, state) DO NOTHING
+		 RETURNING id`,
+		t.AccountID, kongNullString(t.Model), t.State, t.StateLen, t.Source, t.Status,
+		t.FingerprintModel, t.FingerprintP, t.SkipUntilNew,
+		t.CapturedAt.UTC(), t.ExpiresAt.UTC(), t.ExpiresAtSource,
+		kongNullString(t.CaptureEgress), t.CaptureIdleSeconds).Scan(&id)
+	if err == nil {
+		t.ID = id
+		return id, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, fmt.Errorf("insert ticket: %w", err)
+	}
+
+	// 冲突：已经有这张票。返回既有行，**不动**它的期限与状态——重复出现不该延长寿命，
+	// 也不该把一张已被 rejected / skip 的票重新变成候选。
+	err = r.db.QueryRowContext(ctx,
+		`SELECT id FROM kong_ticket_cache WHERE account_id = $1 AND model = $2 AND state = $3`,
+		t.AccountID, kongNullString(t.Model), t.State).Scan(&id)
+	if err != nil {
+		// 唯一约束刚刚拒绝了插入，这里却查不到——除了并发删除（过期清理）没有别的解释。
+		return 0, false, fmt.Errorf("lookup existing ticket after conflict: %w", err)
+	}
+	t.ID = id
+	return id, false, nil
+}
+
+// CommitVerification 在**同一个事务**里落「资格 + 最终事件」。
+//
+// 两件事必须同时可见。分两步写的话，状态先落库、事件写失败时资格已经露出去了：并发请求与下一个
+// 请求都能从 CurrentTicket 取到这张票，而库里没有任何记录解释它为什么可用。事后补偿撤销也不行
+// ——那期间的窗口正好是业务在用它。
+//
+// 返回值为假表示条件不满足（票已过期、已被改写或已被跳过），此时事务回滚、事件也不写，由调用方
+// 另记一条作废事件。
+func (r *kongTicketRepository) CommitVerification(
+	ctx context.Context,
+	id int64,
+	status string,
+	fingerprintModel string,
+	p float64,
+	event *service.KongTicketEvent,
+) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin verification tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 条件里除了 unverified 还要有未过期与未被跳过：注释一直写着「被跳过时不更新」，
+	// 只比 status 兑现不了它。
+	res, err := tx.ExecContext(ctx,
+		`UPDATE kong_ticket_cache
+		 SET status = $1, fingerprint_model = $2, fingerprint_p = $3
+		 WHERE id = $4 AND status = $5 AND skip_until_new = FALSE AND expires_at > now()`,
+		status, fingerprintModel, p, id, service.KongTicketStatusUnverified)
+	if err != nil {
+		return false, fmt.Errorf("commit verification status: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("commit verification rows: %w", err)
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := insertTicketEventTx(ctx, tx, event); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit verification: %w", err)
+	}
+	return true, nil
+}
+
+func (r *kongTicketRepository) SetTicketStatus(ctx context.Context, id int64, status string, fingerprintModel string, p float64) (bool, error) {
+	query := `UPDATE kong_ticket_cache
+		SET status = $1, fingerprint_model = $2, fingerprint_p = $3
+		WHERE id = $4 AND status = $5`
+	res, err := r.db.ExecContext(ctx, query, status, fingerprintModel, p, id, service.KongTicketStatusUnverified)
+	if err != nil {
+		return false, fmt.Errorf("set ticket status: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("set ticket status rows: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// SkipCandidatesFor 把该账号该模型下**当前所有**未验证候选标为跳过。
+//
+// 用于「这一段无票期里的 observed 候选机会已经用掉」这个终点：只标一张的话，缓存里还有第二张旧
+// 候选时，下一个请求会接着验证它——而候选验证不经过取票冷却，于是一张张烧额度。之后真正新到的票
+// 不带这个标记，仍然算新信息。
+func (r *kongTicketRepository) SkipCandidatesFor(ctx context.Context, accountID int64, model string, capturedBefore time.Time) error {
+	// 只淘汰 capturedBefore 之前收到的候选：验证期间新到的票属于新信息，误标它会封掉唯一的
+	// 恢复机会。
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE kong_ticket_cache SET skip_until_new = TRUE
+		 WHERE account_id = $1 AND model = $2 AND status = $3 AND skip_until_new = FALSE
+		   AND captured_at <= $4`,
+		accountID, model, service.KongTicketStatusUnverified, capturedBefore.UTC())
+	if err != nil {
+		return fmt.Errorf("skip candidates: %w", err)
+	}
+	return nil
+}
+
+func (r *kongTicketRepository) SkipCandidate(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE kong_ticket_cache SET skip_until_new = TRUE WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("skip candidate: %w", err)
+	}
+	return nil
+}
+
+// ClearSkipMarks 在出现「新信息」时解除跳过标记：新到的 observed 票，或一次成功的主动取票。
+// 新的业务请求本身不算新信息——否则每个请求都会重新试一遍同一批坏票。
+func (r *kongTicketRepository) ClearSkipMarks(ctx context.Context, accountID int64, model string) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE kong_ticket_cache SET skip_until_new = FALSE
+		 WHERE account_id = $1 AND model = $2 AND skip_until_new`, accountID, model)
+	if err != nil {
+		return fmt.Errorf("clear skip marks: %w", err)
+	}
+	return nil
+}
+
+// RevokeTicket 撤销一张票的服务资格。
+//
+// 调用方必须传入**本次实际使用的票**的 id，不是「当前票」：并发下请求用 K1 发出、预取的 K2
+// 可能已验证通过并接替成当前票，按当前票撤销会作废无辜的 K2，还白搭一段拒服。
+func (r *kongTicketRepository) RevokeTicket(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE kong_ticket_cache SET status = $1 WHERE id = $2 AND status = $3`,
+		service.KongTicketStatusRejected, id, service.KongTicketStatusVerified)
+	if err != nil {
+		return fmt.Errorf("revoke ticket: %w", err)
+	}
+	return nil
+}
+
+func (r *kongTicketRepository) CountTickets(ctx context.Context, accountID int64, model string, status string) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM kong_ticket_cache
+		 WHERE account_id = $1 AND model = $2 AND status = $3 AND expires_at > now()`,
+		accountID, model, status).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count tickets: %w", err)
+	}
+	return n, nil
+}
+
+// DeleteExpiredTickets 按批删除过期票。票过期即无用，state 原值不长期留存。
+func (r *kongTicketRepository) DeleteExpiredTickets(ctx context.Context, cutoff time.Time, batchSize int) (int64, error) {
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	res, err := r.db.ExecContext(ctx,
+		`DELETE FROM kong_ticket_cache WHERE id IN (
+			SELECT id FROM kong_ticket_cache WHERE expires_at < $1 ORDER BY expires_at LIMIT $2
+		)`, cutoff.UTC(), batchSize)
+	if err != nil {
+		return 0, fmt.Errorf("delete expired tickets: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete expired tickets rows: %w", err)
+	}
+	return affected, nil
+}
+
+func (r *kongTicketRepository) InsertEvent(ctx context.Context, e *service.KongTicketEvent) error {
+	return insertTicketEventTx(ctx, r.db, e)
+}
+
+// kongExecer 抽掉「直连还是事务内」的差别，让事件插入在两种场合共用一份。
+type kongExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func insertTicketEventTx(ctx context.Context, db kongExecer, e *service.KongTicketEvent) error {
+	if e == nil {
+		return errors.New("nil event")
+	}
+	createdAt := e.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	outcome := e.Outcome
+	if outcome == "" {
+		outcome = service.KongOutcomeInfo
+	}
+	detail := "{}"
+	if len(e.Detail) > 0 {
+		encoded, err := json.Marshal(e.Detail)
+		if err != nil {
+			return fmt.Errorf("marshal event detail: %w", err)
+		}
+		detail = string(encoded)
+	}
+	query := `INSERT INTO kong_ticket_events
+		(created_at, account_id, model, event_type, outcome, status_code,
+		 traffic_egress, ticket_egress, state_len, ticket_id, fingerprint_model, idle_seconds, detail)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`
+	_, err := db.ExecContext(ctx, query, createdAt.UTC(), e.AccountID, kongNullString(e.Model),
+		e.EventType, outcome, e.StatusCode, kongNullString(e.TrafficEgress), kongNullString(e.TicketEgress),
+		e.StateLen, e.TicketID, e.FingerprintModel, e.IdleSeconds, detail)
+	if err != nil {
+		return fmt.Errorf("insert ticket event: %w", err)
+	}
+	return nil
+}
+
+func (r *kongTicketRepository) ListEvents(ctx context.Context, filter *service.KongTicketEventFilter) ([]*service.KongTicketEvent, int, error) {
+	if filter == nil {
+		filter = &service.KongTicketEventFilter{}
+	}
+	var conds []string
+	var args []any
+	add := func(cond string, val any) {
+		args = append(args, val)
+		conds = append(conds, fmt.Sprintf(cond, len(args)))
+	}
+	if filter.AccountID != nil {
+		add("account_id = $%d", *filter.AccountID)
+	}
+	if strings.TrimSpace(filter.Model) != "" {
+		add("model = $%d", strings.TrimSpace(filter.Model))
+	}
+	if strings.TrimSpace(filter.EventType) != "" {
+		add("event_type = $%d", strings.TrimSpace(filter.EventType))
+	}
+	if filter.FinalOnly {
+		// 只认显式为真的 `final`。缺这个键的历史事件一律不算最终事件——把它们当成最终结论，
+		// 等于让一条单份失败事件冒充本次验证的结论。
+		conds = append(conds, "detail->>'final' = 'true'")
+	}
+	if filter.Since != nil {
+		add("created_at >= $%d", filter.Since.UTC())
+	}
+	if filter.Until != nil {
+		add("created_at <= $%d", filter.Until.UTC())
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
+
+	var total int
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM kong_ticket_events`+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count ticket events: %w", err)
+	}
+
+	limit := service.KongNormalizeEventLimit(filter.Limit)
+	offset := filter.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	query := `SELECT id, created_at, account_id, coalesce(model,''), event_type, outcome, status_code,
+		coalesce(traffic_egress,''), coalesce(ticket_egress,''), state_len, ticket_id,
+		fingerprint_model, idle_seconds, detail
+		FROM kong_ticket_events` + where +
+		fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list ticket events: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []*service.KongTicketEvent
+	for rows.Next() {
+		var e service.KongTicketEvent
+		var detail []byte
+		if err := rows.Scan(&e.ID, &e.CreatedAt, &e.AccountID, &e.Model, &e.EventType, &e.Outcome,
+			&e.StatusCode, &e.TrafficEgress, &e.TicketEgress, &e.StateLen, &e.TicketID,
+			&e.FingerprintModel, &e.IdleSeconds, &detail); err != nil {
+			return nil, 0, fmt.Errorf("scan ticket event: %w", err)
+		}
+		if len(detail) > 0 {
+			if err := json.Unmarshal(detail, &e.Detail); err != nil {
+				return nil, 0, fmt.Errorf("decode event detail (id=%d): %w", e.ID, err)
+			}
+		}
+		out = append(out, &e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate ticket events: %w", err)
+	}
+	return out, total, nil
+}
+
+// LastEgressActivity 返回该票据出口最后一次被本系统使用的时刻，即调度公式里的 A。
+//
+// 取票无论成败都算活动——失败的取票同样在出口上留下了痕迹，这正是「预取失败后不能立即重来」
+// 的原因。返回 nil 表示本系统从未用过该出口。
+func (r *kongTicketRepository) LastEgressActivity(ctx context.Context, ticketEgress string) (*time.Time, error) {
+	var at sql.NullTime
+	err := r.db.QueryRowContext(ctx,
+		`SELECT max(created_at) FROM kong_ticket_events
+		 WHERE ticket_egress = $1 AND event_type = $2`,
+		ticketEgress, service.KongEventFetch).Scan(&at)
+	if err != nil {
+		return nil, fmt.Errorf("query last egress activity: %w", err)
+	}
+	if !at.Valid {
+		return nil, nil
+	}
+	t := at.Time
+	return &t, nil
+}
+
+// LastFailure 返回该账号在该票据出口上最近一次**进入冷却**的时刻，即调度公式里的 F。
+//
+// 冷却从 F 起算，而静默从 A 起算，两者通常不同（取票有耗时、验证更慢），所以下一次尝试的
+// 期限是 max(A+M, F+C)——把 C 取成与 M 相同的值并不等于「不额外加时」。
+//
+// 只看 cooldown 事件，不看所有 failure：observed 候选验证失败应当立即升级为主动取票，若把
+// 那种失败也算进 F，升级会白等一个冷却期。denylist 命中、候选未被上游接受同理都不推进 F。
+// 「是否进冷却」由写入方判断并落一条 cooldown 事件。
+func (r *kongTicketRepository) LastFailure(ctx context.Context, accountID int64, ticketEgress string) (*time.Time, error) {
+	var at sql.NullTime
+	err := r.db.QueryRowContext(ctx,
+		`SELECT max(created_at) FROM kong_ticket_events
+		 WHERE account_id = $1 AND ticket_egress = $2 AND event_type = $3`,
+		accountID, ticketEgress, service.KongEventCooldown).Scan(&at)
+	if err != nil {
+		return nil, fmt.Errorf("query last failure: %w", err)
+	}
+	if !at.Valid {
+		return nil, nil
+	}
+	t := at.Time
+	return &t, nil
+}
+
+// LastEventAt 返回该账号该模型最近一次指定类型事件的时刻。
+//
+// observe 的探测间隔靠它推进：这套设计刻意没有定时器，「上次探测是什么时候」只能从事件里读。
+func (r *kongTicketRepository) LastEventAt(ctx context.Context, accountID int64, model, eventType string) (*time.Time, error) {
+	var at sql.NullTime
+	err := r.db.QueryRowContext(ctx,
+		`SELECT max(created_at) FROM kong_ticket_events
+		 WHERE account_id = $1 AND model = $2 AND event_type = $3`,
+		accountID, model, eventType).Scan(&at)
+	if err != nil {
+		return nil, fmt.Errorf("query last event at: %w", err)
+	}
+	if !at.Valid {
+		return nil, nil
+	}
+	t := at.Time
+	return &t, nil
+}
+
+// InsertProbes 写入一次验证的全部探测记录（1~3 份）。
+//
+// 作废的那几份同样要写：作废率本身是信号，它上升可能意味着上游改了行为或触发了风控，而不只是
+// 运气不好。不写就只能看到「没拿到结论」，看不到为什么。
+func (r *kongTicketRepository) InsertProbes(ctx context.Context, probes []*service.KongFingerprintProbe) error {
+	if len(probes) == 0 {
+		return nil
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin probes tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	query := `INSERT INTO kong_fingerprint_probes
+		(created_at, verification_id, part_index, account_id, target_model, ticket_id,
+		 ticket_fingerprint, ticket_source, verify_egress, capture_egress, idle_seconds, challenge_id,
+		 digits, digit_count, scores, part_attribution, cum_probability, temperature_tier,
+		 library_version, parse_valid, counted_in_average, invalid_reason, latency_ms, output_tokens)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("prepare probes insert: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for _, p := range probes {
+		if p == nil {
+			continue
+		}
+		createdAt := p.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = time.Now().UTC()
+		}
+		digits, err := json.Marshal(p.Digits)
+		if err != nil {
+			return fmt.Errorf("marshal digits: %w", err)
+		}
+		// 编码失败必须让整批回滚，不能写入残缺证据：这些记录的唯一用途是将来离线重算，
+		// 少了分数或版本标识就再也解释不了（例如 Scores 含 NaN 时 json.Marshal 必然失败）。
+		scores := []byte("null")
+		if len(p.Scores) > 0 {
+			encoded, err := json.Marshal(p.Scores)
+			if err != nil {
+				return fmt.Errorf("marshal probe scores (part %d): %w", p.PartIndex, err)
+			}
+			scores = encoded
+		}
+		library := []byte("{}")
+		if len(p.LibraryVersion) > 0 {
+			encoded, err := json.Marshal(p.LibraryVersion)
+			if err != nil {
+				return fmt.Errorf("marshal probe library version (part %d): %w", p.PartIndex, err)
+			}
+			library = encoded
+		}
+		if _, err := stmt.ExecContext(ctx, createdAt.UTC(), p.VerificationID, p.PartIndex,
+			p.AccountID, p.TargetModel, p.TicketID, kongNullString(p.TicketFingerprint),
+			kongNullString(p.TicketSource), kongNullString(p.VerifyEgress),
+			kongNullString(p.CaptureEgress), p.IdleSeconds, p.ChallengeID,
+			string(digits), p.DigitCount, string(scores), p.PartAttribution, p.CumProbability,
+			p.TemperatureTier, string(library), p.ParseValid, p.CountedInAverage,
+			p.InvalidReason, p.LatencyMs, p.OutputTokens); err != nil {
+			return fmt.Errorf("insert probe part %d: %w", p.PartIndex, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit probes: %w", err)
+	}
+	return nil
+}
+
+func (r *kongTicketRepository) ListProbesByVerification(ctx context.Context, verificationID string) ([]*service.KongFingerprintProbe, error) {
+	query := `SELECT id, created_at, verification_id, part_index, account_id, target_model,
+		ticket_id, coalesce(ticket_fingerprint,''), coalesce(ticket_source,''),
+		coalesce(verify_egress,''), coalesce(capture_egress,''), idle_seconds, challenge_id, digits, digit_count, scores,
+		part_attribution, cum_probability, temperature_tier, library_version,
+		parse_valid, counted_in_average, invalid_reason, latency_ms, output_tokens
+		FROM kong_fingerprint_probes WHERE verification_id = $1 ORDER BY part_index ASC`
+	rows, err := r.db.QueryContext(ctx, query, verificationID)
+	if err != nil {
+		return nil, fmt.Errorf("list probes: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []*service.KongFingerprintProbe
+	for rows.Next() {
+		var p service.KongFingerprintProbe
+		var digits, scores, library []byte
+		if err := rows.Scan(&p.ID, &p.CreatedAt, &p.VerificationID, &p.PartIndex, &p.AccountID,
+			&p.TargetModel, &p.TicketID, &p.TicketFingerprint, &p.TicketSource, &p.VerifyEgress,
+			&p.CaptureEgress,
+			&p.IdleSeconds, &p.ChallengeID, &digits, &p.DigitCount, &scores, &p.PartAttribution,
+			&p.CumProbability, &p.TemperatureTier, &library, &p.ParseValid, &p.CountedInAverage,
+			&p.InvalidReason, &p.LatencyMs, &p.OutputTokens); err != nil {
+			return nil, fmt.Errorf("scan probe: %w", err)
+		}
+		// jsonb 保证内容是合法 JSON，不保证它能装进目标 Go 类型。装不进就是证据已经损坏，
+		// 必须报出来而不是返回一份看起来正常、实际少了字段的记录。
+		if len(digits) > 0 {
+			if err := json.Unmarshal(digits, &p.Digits); err != nil {
+				return nil, fmt.Errorf("decode probe digits (id=%d): %w", p.ID, err)
+			}
+		}
+		if len(scores) > 0 {
+			if err := json.Unmarshal(scores, &p.Scores); err != nil {
+				return nil, fmt.Errorf("decode probe scores (id=%d): %w", p.ID, err)
+			}
+		}
+		if len(library) > 0 {
+			if err := json.Unmarshal(library, &p.LibraryVersion); err != nil {
+				return nil, fmt.Errorf("decode probe library version (id=%d): %w", p.ID, err)
+			}
+		}
+		out = append(out, &p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate probes: %w", err)
+	}
+	return out, nil
+}
+
+func kongNullString(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return s
+}
