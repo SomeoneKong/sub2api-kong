@@ -58,6 +58,17 @@ the CAS`）。**它在纯上游基线 tag 上同样失败**，与本 fork 的定
 属平台或时序相关。遇到时不要顺着它排查，先在 `git worktree add <tmp> <base tag>` 的纯上游树上
 复现一次，确认是上游自带的再放过。
 
+**`-race` 下上游测试套整体不干净**，这不是本 fork 的问题。`kong-race.yml`（只手动触发，见下节）
+在 `./internal/service/` 上跑 `-race` 时**必然红**：2026-09-19 实测本分支 81 个用例失败、
+纯上游基线 `base/v0.2.7-aea725f2` 100 个失败，竞态点完全相同——`ratelimit_service.go:540`、
+`openai_ws_forwarder_logutil.go:515`、`openai_gateway_forward.go` 里调 `forwardOpenAIWSV2` 那一处
+（行号差的正是本 fork 插入的注释），另有 `logger.go` / `slog_handler.go` / `scheduler_snapshot_service.go`。
+
+所以**判读方式不是看红绿，而是看竞态报告里有没有 `kong_*.go` 帧、以及有没有 Kong 用例失败**。
+那次实测两者都是 0。要在纯上游基线上复现作对照：从 `base/*` tag 建临时分支、只把
+`.github/workflows/kong-race.yml` 加进去、push 后 `gh workflow run kong-race.yml --ref <该分支>`，
+比完删分支（`workflow_dispatch` 要求 workflow 文件存在于被指定的 ref 上，所以必须建分支）。
+
 ## 版本号与发布
 
 发布 tag 形如 `v<上游基线版本>-kong.<n>`。序号在同一上游基线内递增，跟进新基线时归 1
