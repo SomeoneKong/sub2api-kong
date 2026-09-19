@@ -624,6 +624,17 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/admin/kong-ticket',
+    name: 'AdminKongTicket',
+    component: () => import('@/features/codex-ticket/CodexTicketView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Codex Ticket',
+      titleKey: 'nav.kongTicket'
+    }
+  },
+  {
     path: '/admin/usage',
     name: 'AdminUsage',
     component: () => import('@/views/admin/UsageView.vue'),

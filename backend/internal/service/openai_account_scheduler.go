@@ -2431,6 +2431,18 @@ func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(account *Accoun
 	if account == nil {
 		return false
 	}
+	// [kong] codex 票据：本地拒服与交付拦截**不是上游健康失败**，不能计入账号故障。
+	//
+	// 排除放在这个共同入口，而不是三十来个调用点上：漏一个就会让「本机拒绝发送」抬高该账号的
+	// 错误率 EWMA，进而影响选号与粘性逃逸——票越缺、账号越被判坏，与事实相反。传输层的早退只
+	// 拦住了传输副作用，上报这一路是另一条。
+	if !success {
+		for _, observed := range observedErr {
+			if KongIsTicketDenied(observed) || KongIsDeliveryBlocked(observed) {
+				return false
+			}
+		}
+	}
 	accountID := account.ID
 	healthTripped := false
 	if s != nil && s.rateLimitService != nil {

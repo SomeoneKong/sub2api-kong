@@ -11,10 +11,15 @@
 只碰两类东西：**codex ticket 相关的功能**，以及**fork 自身必须适配的部分**（版本检查、
 发布标识）。上游其余部分一律不动——定制面越窄，越能持续跟上上游的 bug 修复。
 
-有两处是**结构性的、不随上游版本变化的约束**，值得写在这里而不是只留在 commit 里：
+有三处是**结构性的、不随上游版本变化的约束**，值得写在这里而不是只留在 commit 里：
 
 - **版本检查必须指向本 fork。** 否则上游每发一个新版就提示一次更新，点下去会把定制覆盖成
   官方版。这是 `githubRepo` 那处改动存在的全部理由。
+- **新增数据结构不走 ent。** 上游把 ent 生成代码全部入库（三百多个文件），加一个 schema 就会重新
+  生成 `ent/migrate/schema.go`、`ent/mutation.go` 等上游每周改动数次的文件——生成代码的 rebase
+  冲突是最难手工解决的那一类。所以：账号级配置存进已有的 `accounts.extra`（jsonb），新表用
+  `migrations/9xx_kong_*.sql` 加手写 `*sql.DB` repository。上游自己就有这个形态可照抄
+  （`audit_log_repo.go`、`auth_cache_invalidation_outbox_repo.go`）。
 - **容器部署下不要用面板上的就地升级/回滚。** 它替换的是容器可写层里的二进制，重启即回到
   镜像版本，"升级成功"是假的。代码层面**故意不加门控**——上游对这几个函数有测试，禁用等于
   连带改上游测试文件，白白扩大 rebase 冲突面；而改了 `githubRepo` 之后最坏结果只是"重启后
@@ -27,11 +32,31 @@
 |---|---|
 | 定制提交以 `[kong]` 开头 | rebase 到新基线时用 `--grep='^\[kong\]'` 筛出待重放的提交；也是定制清单的来源 |
 | 定制测试用 `*_kong_test.go` | 独立文件名，不与上游测试文件冲突 |
+| **包级标识符也加 `kong` 前缀**，不只是文件名 | 通用辅助函数名在上游的大包里很可能已经存在——实测 `asString`、`nullString`、`ptrInt64` 三次都撞了。更麻烦的是反向：上游将来新增一个同名函数，会让我们的文件直接编译失败 |
+| **本地验证必须带 `-tags=unit`**（CI 的口径是 `make test-unit`） | 上游有大量测试文件带 `//go:build unit`。不带标签跑，那些文件根本不参与编译——`ptrInt64` 重名就是这样躲过本地验证、直到 CI 才暴露的 |
+| 我们自己的新文件用 `kong_*.go`，其测试用 `kong_*_test.go` | `*_kong_test.go` 那条约定针对的是**给上游文件加测试**（避免与上游的同名测试文件冲突）。自建文件不存在这个风险，测试名跟着源文件更好找 |
 | **不改 Go module path** | 仍是 `github.com/Wei-Shaw/sub2api`。改它要动几百处 import、制造巨大 rebase 冲突面；本 fork 只构建镜像、不作为库被引用 |
 | **不改 `backend/cmd/server/VERSION`** | 版本优先级是 `--build-arg VERSION` > git tag > 该文件，走 build-arg 即可 |
 | CI / Security Scan 只在 `main` 与 PR 上触发 | 上游的 `on: push` 无分支过滤。本 fork 会持续 push `base/*` tag 归档上游基线，不限制就每个 tag 都跑一遍全量 CI——跑的还是纯上游代码 |
+| **不要跑 `wire generate`** | codex 票据的装配是手工写在 `cmd/server/wire_gen.go` 里的（直接给 `AdminHandlers` 赋字段、调 `SetKongTicketGateway`），wire 生成不出这几行。重新生成会把它们抹掉，而编译不会报错——只会让功能静默失效 |
+| **HTTP 的票据闸门挂在 `doOpenAIUpstream`，不挂在各业务分支** | 那是全部 OpenAI **HTTP** 上游发送的汇聚点（二十来个调用点；原生 WS 的帧不经过它，见下一行）。逐个分支去插必漏——Responses 透传、chat-completions 转 Responses、messages 转 Responses、WS-HTTP bridge、alpha-search、images 桥接各自构造请求与处理响应，而漏没漏不会报错，只会安静地交付降智输出。交付判定放在拿到响应头之后：正文还没到调用方手里，丢弃即「零业务正文交付」，流式/非流式/SSE 转 JSON 一并覆盖 |
+| **原生 WS 自己接入同一套判定** | 帧不流经 `doOpenAIUpstream`，所以 ctx_pool 与 passthrough 两条路各自在「客户端→上游」的帧出口做准入（`GuardWSFrame` 挡歧义帧 + `PrepareWSTurn` 注入）、在「上游→客户端」的帧写点做交付判定（`GuardWSDownstream`）。**两个易漏点**：passthrough 的首帧不走逐帧过滤器（它在 relay 启动前单独写上游），必须单独准入；下行判定不能按帧类型提前 return，`response.metadata` 用 Binary 帧一样发得出来 |
+| WS 的票走 payload 的 `client_metadata`，不是握手头 | codex 客户端在 WS 上把 `x-codex-turn-state` 放进每个 `response.create` 帧的 `client_metadata`（`codex-rs/core/src/client.rs`），上游则用带内 `response.metadata` 事件回送（`codex-api/src/sse/responses.rs`）。两边都是逐轮的，所以连接复用不妨碍本轮判定。**不要把受保护账号改投 HTTP bridge**：bridge 适配层会删 `previous_response_id`、丢 `generate:false`、只收 `response.create`，不是原生 WS 的等价替代 |
+| 门控判定只能用 JSON 解码，且要拒绝重复 `model` 键 | 转义写法（`a` 之类）的原始字节里找不到模型名，解码后却正是它——字节子串匹配等于留一个一行转义就能绕开的后门。重复键更麻烦：gjson 取第一个而 `encoding/json` 取最后一个，上游按哪个解释我们不知道，所以判为「不可判定」。判不出时受保护账号拒服、其余照常 |
+| 票据拒服要在 `handleOpenAIUpstreamTransportError` **最前面**早退 | 否则会被当成传输故障：记一条假的 `request_error`、可能把健康账号临时停掉调度、还包装成 502 去换号——等于把「拒服」悄悄变成「换个号照发」。早退必须在任何 ops 写入之前，放在后面只避免了换号、仍然污染了故障记录 |
+| 接转发链路用「可选依赖 + setter」 | `OpenAIGatewayService` 的构造函数参数表很长且是上游高频改动面。加字段 + `SetKongTicketGateway` 能把改动收在一处，未注入时所有接入点退化为空操作 |
+| 前端定制放 `frontend/src/features/codex-ticket/`，上游文件只做单行追加 | 页面自包含（自己的 `api.ts` / `types.ts`），碰上游的只有四处各一行：`router/index.ts` 一个路由对象、`AppSidebar.vue` 的 `baseItems` 一项、`i18n/locales/{en,zh}/common.ts` 各一个 `nav.kongTicket`。rebase 时要复核的就是这四处 |
+| 后端响应结构要显式写 `json` tag | 本功能的 handler 直接序列化 service 层结构体。上游那些结构多数也没 tag，但我们的响应里混着 `gin.H` 的 snake_case 字段——不写 tag 会让同一个响应里两种命名风格并存，前端类型也跟着别扭 |
 | `upstream` remote 禁止 push | `git remote set-url --push upstream DISABLED` |
 | `base/*` tag 必须 push 到 origin | push 后该 commit object 即归本仓库。上游会 force push、删 tag、撤 release，不这么做就得靠运气 |
+
+## 本地验证的已知差异
+
+`go test -tags=unit ./internal/service/` 在 Windows 上会有一个上游测试失败：
+`TestOllamaProbeCallback_StaleLongDoesNotOverrideNewShort`（`stale long callback must not pass
+the CAS`）。**它在纯上游基线 tag 上同样失败**，与本 fork 的定制无关，CI（Linux）也是绿的——
+属平台或时序相关。遇到时不要顺着它排查，先在 `git worktree add <tmp> <base tag>` 的纯上游树上
+复现一次，确认是上游自带的再放过。
 
 ## 版本号与发布
 

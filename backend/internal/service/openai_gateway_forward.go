@@ -883,6 +883,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			)
 			return true
 		}
+		// [kong] 门控请求**照常**走 WebSocket 上游，保护由原生 WS 路径自己实现：票在 WS 上不是
+		// 握手头而是每帧 payload 的 client_metadata，上游回送走带内 response.metadata 事件，
+		// 两者都是逐轮的，所以连接池复用不妨碍本轮判定。接入点见 kong_ticket_gateway.go 的 WS 段。
 		retryBudget := s.openAIWSRetryTotalBudget()
 		retryStartedAt := time.Now()
 	wsRetryLoop:

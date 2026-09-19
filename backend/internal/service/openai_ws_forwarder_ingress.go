@@ -228,6 +228,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return rebuilt, nil
 	}
 
+	// [kong] codex 票据：本轮的票据上下文。注入在 parseClientPayload 里写入，交付判定在
+	// writeClientMessage 里读取。
+	//
+	// 这里用普通指针是因为本路径**串行**：读客户端帧、转发、排空上游事件都在同一个 goroutine
+	// 里顺序发生，不存在下一轮的写与本轮的读并发。passthrough 那条是双向 relay 两个 goroutine，
+	// 同样的变量在那边必须是 atomic。
+	var kongTurnAttempt *KongUpstreamAttempt
+	// kongReleasedTurnIDs 记下已经释放过的响应 id，挡住迟到或重复的旧轮终端事件。
+	kongReleasedTurnIDs := make(map[string]bool, 4)
+
 	parseClientPayload := func(turn int, raw []byte) (openAIWSClientPayload, error) {
 		trimmed := bytes.TrimSpace(raw)
 		if len(trimmed) == 0 {
@@ -235,6 +245,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		if !gjson.ValidBytes(trimmed) {
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", errors.New("invalid json"))
+		}
+		// [kong] codex 票据：歧义帧在读 `type` / `model` 之前挡住。下面全程按 gjson 的首键语义
+		// 解读并用 sjson 改写（改的也是首处），重复键会让上游读到另一个值。
+		if ticketErr := s.kongTicket.GuardWSFrame(account, trimmed); ticketErr != nil {
+			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"codex ticket unavailable for this model",
+				ticketErr,
+			)
 		}
 
 		values := gjson.GetManyBytes(trimmed, "type", "model", "prompt_cache_key", "previous_response_id")
@@ -397,6 +416,27 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			normalized = next
 		}
 		SetOpsUpstreamModel(c, upstreamModel)
+		// [kong] codex 票据：把票写进本帧的 client_metadata。
+		//
+		// WS 上票不是头而是 payload 字段，且逐轮上送（口径见 kong_ticket_gateway.go 的 WS 段）。
+		// 放在每一帧的模型解析之后，会话中途用 response.create 换成门控模型同样受保护。
+		if next, attempt, err := s.kongTicket.PrepareWSTurn(ctx, account, upstreamModel, normalized); err != nil {
+			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"codex ticket unavailable for this model",
+				err,
+			)
+		} else {
+			if handoffErr := s.kongTicket.GuardWSTurnHandoff(kongTurnAttempt, attempt); handoffErr != nil {
+				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
+					coderws.StatusPolicyViolation,
+					"codex ticket unavailable for this model",
+					handoffErr,
+				)
+			}
+			normalized = next
+			kongTurnAttempt = attempt
+		}
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
 			if stripped, changed, stripErr := stripOpenAIImageGenerationToolsFromRawPayload(normalized); stripErr != nil {
 				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", stripErr)
@@ -484,6 +524,28 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	writeClientMessage := func(message []byte) error {
+		// [kong] codex 票据的交付边界：response.metadata 带回 state 说明上游没接受本轮注入，
+		// 这一轮的输出不受合格票保障，必须在任何内容分片离开之前停下。该事件在 turn start 就到，
+		// 所以此处拦住即「零业务正文交付」。
+		if err := s.kongTicket.GuardWSDownstream(ctx, account, kongTurnAttempt, message); err != nil {
+			// 映射成明确的策略关闭（1008 + 原因）。裸返回会落到上层通用的
+			// 1011「upstream websocket proxy failed」——那是上游故障的说法，而这是本机的决定。
+			return wrapOpenAIWSKongTicketError(err)
+		}
+		// 票据上下文的释放只认正面归属（口径见 kongWSTurnEventAction）。本路径串行，直接改指针。
+		if eventType, _, _ := parseOpenAIWSEventEnvelope(message); kongTurnAttempt != nil {
+			responseID := kongWSResponseIDOf(message)
+			switch kongWSTurnEventAction(kongTurnAttempt, eventType, responseID, kongReleasedTurnIDs) {
+			case kongWSTurnBind:
+				kongTurnAttempt.ResponseID = responseID
+			case kongWSTurnClear:
+				kongTurnAttempt = nil
+				if responseID != "" {
+					kongReleasedTurnIDs[responseID] = true
+				}
+			case kongWSTurnKeep:
+			}
+		}
 		writeCtx, cancel := newOpenAIWSDownstreamWriteContext(ctx, hooks, s.openAIWSWriteTimeout())
 		defer cancel()
 		message = restoreCodexToolNamesFromContext(c, message)

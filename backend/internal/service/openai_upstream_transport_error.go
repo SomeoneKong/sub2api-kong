@@ -106,6 +106,13 @@ func classifyUpstreamTransportError(err error) upstreamTransportErrorClass {
 //
 // passthrough tags the Ops error event for the OpenAI passthrough forward path.
 func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Context, c *gin.Context, account *Account, err error, passthrough bool) error {
+	// [kong] codex 票据的拒服与交付拦截不是传输故障：账号本身是好的，是我们主动不发或不交付。
+	// 必须在任何 ops 传输错误写入**之前**判掉，否则即使不停调度、不换号，也已经污染了上游故障
+	// 记录——那些记录会被当成账号健康度的证据。
+	if KongIsTicketDenied(err) || KongIsDeliveryBlocked(err) {
+		return err
+	}
+
 	safeErr := sanitizeUpstreamErrorMessage(err.Error())
 	setOpsUpstreamError(c, 0, safeErr, "")
 	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{

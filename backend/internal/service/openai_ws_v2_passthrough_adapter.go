@@ -701,6 +701,15 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	} else {
 		firstClientMessage = next
 	}
+	// [kong] codex 票据：首帧的准入（第一段，歧义判定）。
+	//
+	// 必须在**任何字段解析、模型映射与规范化之前**：那些步骤会重建 JSON（合并重复键、改写字段），
+	// 之后再判看到的已经是一份「干净」的 payload，而模型早就按重复键里的第一个值算完了——
+	// `{"model":"gpt-5.1","model":"gpt-6-astra"}` 于是被判成非门控放行，整轮无票交付。
+	// 注入与最终模型核对在写上游之前另有一段。
+	if ticketErr := s.kongTicket.GuardWSFrame(account, firstClientMessage); ticketErr != nil {
+		return wrapOpenAIWSKongTicketError(ticketErr)
+	}
 	requestModel := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "model").String())
 	requestPreviousResponseID := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "previous_response_id").String())
 	promptCacheKey := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "prompt_cache_key").String())
@@ -741,6 +750,16 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			firstClientMessage = s.ReplaceModelInBody(firstClientMessage, mappedModel)
 		}
 	}
+	// [kong] codex 票据：本轮的票据上下文。
+	//
+	// 必须是 atomic：写它的是 `runClientToUpstream` 里的逐帧过滤器，读它的是
+	// `runUpstreamToClient` 里的 BeforeWriteClient——两个 goroutine。同在一个函数作用域只保证
+	// 引用得到，不提供任何同步；用普通指针就是数据竞争，读到的可能不是完整的本轮快照。
+	var kongTurnAttempt atomic.Pointer[KongUpstreamAttempt]
+	// kongReleasedTurnIDs 记下已经释放过的响应 id，用来挡住迟到或重复的旧轮终端事件——它们不该再
+	// 影响当前轮。只在下行 goroutine 里读写（BeforeWriteClient 是它唯一的访问点），不需要同步。
+	kongReleasedTurnIDs := make(map[string]bool, 4)
+
 	capturedSessionModel := openAIWSPassthroughPolicyModelForFrame(account, firstClientMessage)
 	if capturedSessionModel != "" && capturedSessionModel != strings.TrimSpace(gjson.GetBytes(firstClientMessage, "model").String()) {
 		firstClientMessage = s.ReplaceModelInBody(firstClientMessage, capturedSessionModel)
@@ -980,6 +999,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
 				return payload, nil, nil
 			}
+			// [kong] codex 票据：歧义帧必须在帧分类之前挡住——分类本身就读 `type`，
+			// 被读成别的事件类型就绕过了下面整条准入。
+			if ticketErr := s.kongTicket.GuardWSFrame(account, payload); ticketErr != nil {
+				return nil, nil, wrapOpenAIWSKongTicketError(ticketErr)
+			}
 			eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 			isResponseCreate := eventType == "response.create"
 			responseCreateAt := time.Time{}
@@ -1095,6 +1119,24 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if isResponseCreate && model != "" && model != strings.TrimSpace(gjson.GetBytes(payload, "model").String()) {
 				payload = s.ReplaceModelInBody(payload, model)
 			}
+			// [kong] codex 票据：把票写进本帧的 client_metadata。
+			//
+			// 放在模型解析与改写之后：判定必须用**实际上送的那个模型**。WS 上票是 payload 字段而
+			// 不是头，且逐轮上送（口径见 kong_ticket_gateway.go 的 WS 段），所以每个
+			// response.create 帧都要单独准入——会话中途换成门控模型同样受保护。
+			if isResponseCreate {
+				next, attempt, ticketErr := s.kongTicket.PrepareWSTurn(ctx, account, model, payload)
+				if ticketErr != nil {
+					return nil, nil, wrapOpenAIWSKongTicketError(ticketErr)
+				}
+				// 上一轮受保护且还没落定时不允许交接：那一轮迟到的 metadata 会被拿去跟新轮的
+				// 上下文比对，用 nil 覆盖就等于放过它。
+				if handoffErr := s.kongTicket.GuardWSTurnHandoff(kongTurnAttempt.Load(), attempt); handoffErr != nil {
+					return nil, nil, wrapOpenAIWSKongTicketError(handoffErr)
+				}
+				payload = next
+				kongTurnAttempt.Store(attempt)
+			}
 			out, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, model, payload)
 			// 多轮 passthrough usage：仅在成功（non-block / non-err）
 			// 的 response.create 帧上更新 usageMeta，使用
@@ -1133,6 +1175,24 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			_ = clientConn.Write(writeCtx, coderws.MessageText, eventBytes)
 			cancel()
 		},
+	}
+	// [kong] codex 票据：首帧的准入（第二段，注入）。
+	//
+	// 首帧不经过上面的逐帧过滤器——它在这里直接写上游（过滤器包的是客户端连接的 ReadFrame，
+	// 而首帧早已被读出来单独处理，过滤器里的 turnNo 也因此从 2 起算）。少了这一段，
+	// **每条 passthrough 连接的第一轮都无票交付**，而第一轮往往就是全部。
+	//
+	// 只做准入，不套用整个过滤器：那会把 BeforeRequest / BeforeTurn / 占槽与计费初始化重跑一遍。
+	// 歧义判定在本函数更靠前的位置已经做过（见那里的注释），这里判的是最终出站 payload。
+	firstTurnModel := capturedSessionModel
+	if firstTurnModel == "" {
+		firstTurnModel = initialRequestModel
+	}
+	if next, attempt, ticketErr := s.kongTicket.PrepareWSTurn(ctx, account, firstTurnModel, firstClientMessage); ticketErr != nil {
+		return wrapOpenAIWSKongTicketError(ticketErr)
+	} else {
+		firstClientMessage = next
+		kongTurnAttempt.Store(attempt)
 	}
 	upstreamFirstMessageSent := false
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
@@ -1275,10 +1335,42 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				_ = clientConn.CloseNow()
 			},
 			BeforeWriteClient: func(msgType coderws.MessageType, payload []byte, wroteDownstream bool) error {
+				// [kong] codex 票据的交付边界：response.metadata 带回 state 说明上游没接受本轮
+				// 注入，这一轮输出不受合格票保障。该事件在 turn start 就到，此处拦住即零业务
+				// 正文交付。
+				//
+				// 判定放在 Text 判断**之前**：passthrough 双向都允许二进制帧，而
+				// `response.metadata` 只要是一份 JSON 就能用 Binary 帧发出来——按帧类型提前
+				// return 等于留了一个「换个帧类型就绕过」的出口。非 JSON 的二进制帧取不出
+				// state，守卫对它们是透明的。
+				if err := s.kongTicket.GuardWSDownstream(ctx, account, kongTurnAttempt.Load(), payload); err != nil {
+					return wrapOpenAIWSKongTicketError(err)
+				}
 				if msgType != coderws.MessageText {
 					return nil
 				}
 				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
+				// 票据上下文的释放只认**正面归属**：把任意 error 都当成本轮结束，会让一个针对上一轮
+				// 的控制帧错误回包摘掉新一轮的保护（口径见 kongWSTurnEventAction 的注释）。
+				//
+				// 响应 id 专门取 `response.id` / `response_id`，不用信封里那个会回落到顶层 `id` 的值
+				// ——后者常常是条目 id，拿它绑定会让本轮永不释放。
+				kongEventResponseID := kongWSResponseIDOf(payload)
+				if current := kongTurnAttempt.Load(); current != nil {
+					switch kongWSTurnEventAction(current, eventType, kongEventResponseID, kongReleasedTurnIDs) {
+					case kongWSTurnBind:
+						bound := *current
+						bound.ResponseID = kongEventResponseID
+						// CAS 而不是直接 Store：这一轮可能已经被客户端侧的新准入换掉了，
+						// 那时不该把旧轮的 id 写回去。
+						kongTurnAttempt.CompareAndSwap(current, &bound)
+					case kongWSTurnClear:
+						if kongTurnAttempt.CompareAndSwap(current, nil) && kongEventResponseID != "" {
+							kongReleasedTurnIDs[kongEventResponseID] = true
+						}
+					case kongWSTurnKeep:
+					}
+				}
 				if eventType == "response.created" {
 					failureAccountSideEffectsApplied = false
 				}

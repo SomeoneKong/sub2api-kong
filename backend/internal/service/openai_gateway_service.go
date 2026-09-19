@@ -507,6 +507,17 @@ type OpenAIGatewayService struct {
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
 	openaiCodexTurnStateOrigins sync.Map
 	openaiCodexTurnStateWrites  atomic.Uint64
+
+	// [kong] codex 票据守卫。可选依赖：未启用时为 nil，所有接入点都是空操作。
+	// 用 setter 注入而不是加进构造函数参数表，是为了不动上游那个很长的签名。
+	kongTicket *KongTicketGateway
+}
+
+// SetKongTicketGateway 注入 codex 票据守卫（可选依赖）。
+//
+// 装配后调用一次；传 nil 等于不启用，转发链路上的接入点全部退化为空操作。
+func (s *OpenAIGatewayService) SetKongTicketGateway(g *KongTicketGateway) {
+	s.kongTicket = g
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

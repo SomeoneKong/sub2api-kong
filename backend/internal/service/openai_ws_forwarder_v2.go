@@ -328,6 +328,16 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 	}
 
+	// [kong] codex 票据：这条 HTTP→WS 通路的准入。
+	//
+	// 它是第三条独立通路——客户端 HTTP 进来、上游却是 WebSocket，既不过 doOpenAIUpstream 也不过
+	// 两条原生 WS 适配器。放在预热之前：预热帧与正式帧共用同一个 payload map，注入一次两者都带
+	// （codex 客户端也是每个 response.create 都带）。判定用 mappedModel——那是实际上送的模型。
+	kongTicketAttempt, kongTicketErr := s.kongTicket.PrepareWSMapPayload(ctx, account, mappedModel, payload)
+	if kongTicketErr != nil {
+		return nil, kongTicketErr
+	}
+
 	if err := s.performOpenAIWSGeneratePrewarm(
 		ctx,
 		lease,
@@ -612,6 +622,12 @@ readLoop:
 		eventType, eventResponseID, responseField := parseOpenAIWSEventEnvelope(message)
 		if eventType == "" {
 			continue
+		}
+		// [kong] codex 票据的交付边界：response.metadata 带回 state 说明上游没接受本轮注入。
+		// 该事件在 turn start 就到，先于任何内容分片，所以此处拦住即「零业务正文交付」。
+		if kongTicketGuardErr := s.kongTicket.GuardWSDownstream(ctx, account, kongTicketAttempt, message); kongTicketGuardErr != nil {
+			lease.MarkBroken()
+			return nil, kongTicketGuardErr
 		}
 		responseModelObserver.ObserveOpenAI(message, eventType)
 		eventCount++
