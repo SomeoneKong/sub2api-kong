@@ -306,7 +306,7 @@
                           <td class="py-1 pr-4">{{ probe.part_attribution ?? '—' }}</td>
                           <td class="py-1 pr-4">{{ probe.cum_probability === null ? '—' : probe.cum_probability.toFixed(3) }}</td>
                           <td class="py-1 pr-4">{{ probe.counted_in_average ? '是' : '否' }}</td>
-                          <td class="py-1 pr-4">{{ probe.invalid_reason ? invalidReasonText(probe.invalid_reason) : '—' }}</td>
+                          <td class="py-1 pr-4">{{ probe.invalid_reason ? reasonText(probe.invalid_reason) : '—' }}</td>
                           <td class="py-1">{{ probe.latency_ms === null ? '—' : `${probe.latency_ms}ms` }}</td>
                         </tr>
                       </tbody>
@@ -435,17 +435,36 @@ const eventTypeOptions = [
   { value: 'fetch_skipped', label: 'fetch_skipped 取票未发出' },
 ]
 
-const invalidReasons: Record<string, string> = {
+// 三条展示路径共用这张表：单份挑战的作废原因、验证未得出结论的原因、取样的处置原因。键取自后端
+// 写进 detail 的 reason 与 probe.invalid_reason，缺键会原样显示英文串。
+//
+// 只收会流到这三处的键。取票与出口类事件的 reason（no_state_returned、
+// egress_busy_other_account、upstream_reissued_state）不经这里——它们在事件明细列按原始 JSON 显示。
+const reasonTexts: Record<string, string> = {
+  // 单份挑战作废（探测明细的「作废原因」列）
   refusal: '拒答',
   truncated: '截断或请求失败',
   insufficient_digits: '数字个数不足',
+  non_ascii_digits: '数字不是 ASCII 数字',
+  score_failed: '打分失败',
   candidate_not_accepted: '上游未接受这张候选票',
-  stale_result: '前提已失效，结论作废',
   ticket_expired: '票已过期',
+  // 验证未得出结论
+  precondition_lost: '开始前前提已失效',
+  no_valid_answer: '没有一份有效回答',
+  stale_result: '前提已失效，结论作废',
+  probe_persist_failed: '探测证据入库失败',
+  stale_after_probe_persist: '证据落库后前提已失效',
+  ticket_changed_during_verify: '验证期间票已过期或被撤销',
+  // 取样处置（observe 与 probe_skipped 事件）
+  duplicate_state: '票与上次相同，无新样本',
+  state_len_denylisted: '长度在黑名单内，不验证',
+  interval_not_elapsed: '未到探测间隔',
+  account_unready: '账号不可调度',
 }
 
-function invalidReasonText(reason: string): string {
-  return invalidReasons[reason] ?? reason
+function reasonText(reason: string): string {
+  return reasonTexts[reason] ?? reason
 }
 
 /** 事件的 detail 里带 verification_id 时才有探测明细可看。 */
@@ -504,12 +523,12 @@ function diagnosisText(d: TicketDiagnosis): string {
   if (d.fingerprint_model) {
     return `${d.fingerprint_model}（p=${d.probability.toFixed(3)}）`
   }
-  return d.reason ? `未得出结论：${invalidReasonText(d.reason)}` : '未得出结论'
+  return d.reason ? `未得出结论：${reasonText(d.reason)}` : '未得出结论'
 }
 
 function sampleText(n: TicketSampleNote): string {
   const parts: string[] = []
-  if (n.reason) parts.push(invalidReasonText(n.reason))
+  if (n.reason) parts.push(reasonText(n.reason))
   else parts.push(n.outcome)
   if (n.state_len !== null) parts.push(`长度 ${n.state_len}`)
   return parts.join('，')
