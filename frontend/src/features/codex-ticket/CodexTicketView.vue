@@ -568,6 +568,7 @@ function sampleText(n: TicketSampleNote): string {
 
 function diagnosisClass(d: TicketDiagnosis): string {
   if (d.outcome === 'success') return 'text-gray-500 dark:text-dark-400'
+  // 只有"测出不合格"用红色。inconclusive 与其余都归到警示色——需要注意但不是定论。
   if (d.outcome === 'failure') return 'text-red-600 dark:text-red-400'
   return 'text-amber-700 dark:text-amber-300'
 }
@@ -932,7 +933,9 @@ function denyReasonText(reason: string | null | undefined): string {
 function outcomeClass(outcome: string): string {
   if (outcome === 'success') return 'badge-success'
   if (outcome === 'failure') return 'badge-danger'
-  if (outcome === 'skipped') return 'badge-warning'
+  // inconclusive 不用危险色：它对票什么都没说（没测出来），与"测出不合格"是两件事。
+  if (outcome === 'inconclusive') return 'badge-warning'
+  if (outcome === 'skipped') return 'badge-gray'
   return 'badge-gray'
 }
 

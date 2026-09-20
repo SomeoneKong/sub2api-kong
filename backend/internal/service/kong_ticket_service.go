@@ -1153,7 +1153,7 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 			probe := newProbe(i+1, challenge.ID)
 			probe.InvalidReason = kongStrPtr(KongProbeInvalidStaleResult)
 			probes = append(probes, probe)
-			return failBeforeConclusion(KongOutcomeSkipped,
+			return failBeforeConclusion(KongOutcomeInconclusive,
 				map[string]any{"reason": "precondition_lost", "detail": lost.Error()},
 				fmt.Errorf("验证前提已失效: %w", lost))
 		}
@@ -1242,13 +1242,14 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 		// 只有主动取来的票才进冷却：observed 候选失败应当立即升级为主动取票，把那种失败也算进
 		// F 会让升级白等一个冷却期。
 		failCooldown("no_valid_answer")
-		return failBeforeConclusion(KongOutcomeFailure, map[string]any{"reason": "no_valid_answer"},
+		// 没有有效回答是"没测出来"，不是"票不合格"——票留在候选池等下一次机会。
+		return failBeforeConclusion(KongOutcomeInconclusive, map[string]any{"reason": "no_valid_answer"},
 			fmt.Errorf("没有可用回答，无法判定"))
 	}
 
 	// 落结论之前再复核一次：晚到的结果不能授予服务资格。
 	if lost := s.recheckVerify(ctx, snap, time.Now()); lost != nil {
-		return failBeforeConclusion(KongOutcomeSkipped,
+		return failBeforeConclusion(KongOutcomeInconclusive,
 			map[string]any{"reason": "stale_result", "detail": lost.Error()},
 			fmt.Errorf("结论作废，前提已失效: %w", lost))
 	}
@@ -1256,7 +1257,8 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	// 证据必须先落库再授予资格：反过来的话，探测写失败会留下一张 verified 票（下一个请求照样
 	// 用它），而支撑那个结论的原始观测已经永久丢失。
 	if insErr := saveProbes(); insErr != nil {
-		return finish(0, KongOutcomeFailure,
+		// 写库失败是基础设施故障，对票本身什么都没说。
+		return finish(0, KongOutcomeInconclusive,
 			map[string]any{"reason": "probe_persist_failed", "detail": insErr.Error()},
 			fmt.Errorf("记录探测: %w", insErr))
 	}
@@ -1264,7 +1266,7 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	// 证据落库可能耗上一段时间，期间前提照样会变（模式被切走、出口被改、票过期）。资格提交
 	// 之前必须再复核一次——只在保存之前复核，等于拿一个「保存开始时成立」的前提去提交。
 	if lost := s.recheckVerify(ctx, snap, time.Now()); lost != nil {
-		return finish(0, KongOutcomeSkipped,
+		return finish(0, KongOutcomeInconclusive,
 			map[string]any{"reason": "stale_after_probe_persist", "detail": lost.Error()},
 			fmt.Errorf("结论作废，前提已失效: %w", lost))
 	}
@@ -1278,7 +1280,7 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	// 候选的首次验证不适用这条：那时不提交只是让候选留在 unverified、下次再验，而提交 rejected
 	// 才是把它排除掉——两种处置都不会让降智输出流出去。
 	if reverify && !accepted && result.UsedAnswers < len(KongFingerprintChallenges()) {
-		return failBeforeConclusion(KongOutcomeSkipped,
+		return failBeforeConclusion(KongOutcomeInconclusive,
 			map[string]any{"reason": "incomplete_evidence", "used_answers": result.UsedAnswers,
 				"challenges": len(KongFingerprintChallenges())},
 			fmt.Errorf("只有 %d/%d 份有效回答，证据不足以推翻既有结论",
@@ -1330,7 +1332,7 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	}
 	if !committed {
 		// 票在验证期间已过期、被撤销或被跳过。不能凭一个过时的结论把它重新当成可用。
-		return finish(0, KongOutcomeSkipped, map[string]any{"reason": "ticket_changed_during_verify"},
+		return finish(0, KongOutcomeInconclusive, map[string]any{"reason": "ticket_changed_during_verify"},
 			fmt.Errorf("票在验证期间已被改写，结论作废"))
 	}
 	if !accepted {

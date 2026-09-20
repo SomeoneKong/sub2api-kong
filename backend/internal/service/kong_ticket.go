@@ -208,8 +208,15 @@ const (
 const (
 	KongOutcomeSuccess = "success"
 	KongOutcomeFailure = "failure"
-	KongOutcomeSkipped = "skipped"
-	KongOutcomeInfo    = "info"
+	// KongOutcomeInconclusive 表示**验证跑了、但证据不足以判定**：前提中途失效、没有有效回答、
+	// 证据写不进库、融合样本未达标。
+	//
+	// 与 failure 分开，因为两者对"下一步该做什么"给出相反答案：failure 是关于票的结论（它不合格
+	// 或已不作数），inconclusive 什么都没说，票该留在候选池等下一次机会。与 skipped 也分开——
+	// 那个是压根没开始验（模式不符、被跳过、前提一开始就不成立），混在一起看不出"到底测没测"。
+	KongOutcomeInconclusive = "inconclusive"
+	KongOutcomeSkipped      = "skipped"
+	KongOutcomeInfo         = "info"
 )
 
 // KongTicketEvent 是一条事件。两个出口都要记：出口合并只表现为「一直拿不到合格票」，
