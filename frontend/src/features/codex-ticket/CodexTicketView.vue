@@ -68,6 +68,13 @@
                       <span :title="egressTitle(row.traffic_egress)">{{ egressLabel(row.traffic_egress) }}</span>
                     </p>
                     <p v-if="!row.ready" class="mt-1 text-xs text-amber-700 dark:text-amber-300">诊断暂停：{{ row.not_ready }}</p>
+                    <!-- 下一层：这个账号名下的全部票（含已过期与已拒的），每张都能单独验。 -->
+                    <RouterLink
+                      :to="`/admin/kong-ticket/accounts/${row.account_id}`"
+                      class="mt-1 inline-block text-xs text-primary-600 hover:underline dark:text-primary-400"
+                    >
+                      查看全部票 →
+                    </RouterLink>
                     <!-- 被拒的配置键必须露出来：静默纠正会让「为什么这个账号不取票」无从排查。 -->
                     <p v-if="row.config_rejected?.length" class="mt-1 text-xs text-red-600 dark:text-red-400">
                       配置被拒：{{ row.config_rejected.join('、') }}（已按保守方向取值）
@@ -359,6 +366,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { adminAPI } from '@/api/admin'

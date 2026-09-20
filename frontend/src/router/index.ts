@@ -635,6 +635,18 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    // 某个账号名下的全部票。不进导航栏：它是从总览页某一行点进来的下一层。
+    path: '/admin/kong-ticket/accounts/:id',
+    name: 'AdminKongTicketDetail',
+    component: () => import('@/features/codex-ticket/CodexTicketDetailView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Codex Ticket Detail',
+      titleKey: 'nav.kongTicket'
+    }
+  },
+  {
     path: '/admin/usage',
     name: 'AdminUsage',
     component: () => import('@/views/admin/UsageView.vue'),

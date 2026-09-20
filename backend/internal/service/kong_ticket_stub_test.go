@@ -80,6 +80,10 @@ func newKongStubRepo() *kongStubRepo {
 	}
 }
 
+// kongStubTicketListMax 必须与仓储的 kongTicketListMax 同值（那个在别的包里、不可见）。两处
+// 分叉就会让列表的边界行为在测试里与生产不一致。
+const kongStubTicketListMax = 200
+
 func kongStubKey(accountID int64, model string) string {
 	return fmt.Sprintf("%d\x00%s", accountID, model)
 }
@@ -191,6 +195,96 @@ func (r *kongStubRepo) stateOf(t *KongTicket) *kongStubTicketState {
 		return nil
 	}
 	return r.tickets[t.ID]
+}
+
+// snapshotOf 按票 id 生成一份返回快照：**所有字段都以权威状态为准**。
+//
+// 生产的 `SELECT` / `UPDATE ... RETURNING` 返回的是库里那一行，不可能出现"用 A 行判断条件、返回
+// B 行字段"。桩若只覆盖 status/skip 而让 expires_at、captured_at、source 沿用预置对象，就会在
+// 那几个字段上与生产分叉——而调用方正是据它们判期限与来源的。
+func (r *kongStubRepo) snapshotOf(id int64) *KongTicket {
+	t := r.ticketByID(id)
+	if t == nil {
+		return nil
+	}
+	clone := *t
+	if st := r.tickets[id]; st != nil {
+		clone.AccountID, clone.Model = st.AccountID, st.Model
+		clone.Status, clone.ExpiresAt, clone.SkipUntilNew = st.Status, st.ExpiresAt, st.SkipUntilNew
+		clone.CapturedAt, clone.Source = st.CapturedAt, st.Source
+	}
+	return &clone
+}
+
+// TicketByID 按 (账号, id) 找。**account_id 参与匹配**是生产侧的权限边界，桩不照做就测不出
+// "换个 id 去验别人的票"这条。
+func (r *kongStubRepo) TicketByID(_ context.Context, accountID, id int64) (*KongTicket, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t := r.snapshotOf(id)
+	if t == nil || t.AccountID != accountID {
+		return nil, nil
+	}
+	return t, nil
+}
+
+// PrepareTicketForManualVerify 按 id 准备重验。生产条件：**只看期限**（过期即不动，返回零行）；
+// rejected 复位成 unverified，别的状态不动；跳过标记一律清掉。
+func (r *kongStubRepo) PrepareTicketForManualVerify(_ context.Context, id int64) (*KongTicket, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.tickets[id]
+	if st == nil || !st.ExpiresAt.After(time.Now()) {
+		return nil, nil
+	}
+	if st.Status == KongTicketStatusRejected {
+		st.Status = KongTicketStatusUnverified
+		r.revived = append(r.revived, id)
+	}
+	st.SkipUntilNew = false
+	return r.snapshotOf(id), nil
+}
+
+// ListTickets 列一个账号名下的票，最近采集的在前——含已过期与已拒的，同生产。
+func (r *kongStubRepo) ListTickets(_ context.Context, accountID int64, limit int) ([]*KongTicket, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// 生产侧把 0、负数与超上限都归一化到同一个上限（见仓储的 ListTickets）。桩不照做，边界上的
+	// 行数差异就测不出来。
+	if limit <= 0 || limit > kongStubTicketListMax {
+		limit = kongStubTicketListMax
+	}
+	seen := map[int64]bool{}
+	var out []*KongTicket
+	collect := func(t *KongTicket) {
+		if t == nil || seen[t.ID] {
+			return
+		}
+		snap := r.snapshotOf(t.ID)
+		if snap == nil || snap.AccountID != accountID {
+			return
+		}
+		seen[t.ID] = true
+		out = append(out, snap)
+	}
+	for _, list := range r.current {
+		for _, t := range list {
+			collect(t)
+		}
+	}
+	for _, list := range r.candidates {
+		for _, t := range list {
+			collect(t)
+		}
+	}
+	for _, t := range r.inserted {
+		collect(t)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CapturedAt.After(out[j].CapturedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (r *kongStubRepo) NewestCandidate(_ context.Context, accountID int64, model string, now time.Time) (*KongTicket, error) {

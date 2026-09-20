@@ -196,6 +196,49 @@ export interface TicketRefreshResult {
   retry_after: string | null
 }
 
+// 票据详情页上的一行。**不含票原值**——那是可注入的凭据，服务端只给派生信息。
+export interface TicketDetailRow {
+  id: number
+  model: string
+  status: string
+  source: string
+  state_len: number
+  /** 已被排除出候选池（注入未被上游接受，或本段无票期机会用完）。 */
+  skip_until_new: boolean
+  captured_at: string
+  expires_at: string
+  expires_at_source: string
+  remaining_seconds: number
+  fingerprint_model: string
+  fingerprint_p: number
+  /** 各模型的归因概率，用来解释"为什么这张判不合格"。 */
+  fingerprint_probs: Record<string, number> | null
+  /**
+   * 此刻业务注入的就是它：按当前白名单与阈值是首选票，**且这个账号真的会注入**（mode=full）。
+   * 由服务端算，前端不能按 status 自己猜。
+   */
+  is_current: boolean
+  /** 按当前判据它是该模型的首选票。与 is_current 的差别只在模式——off / observe 并不注入。 */
+  preferred: boolean
+  /** 现在可以手工验。已拒的与被跳过的都可以（服务端会先准备）；已过期、off、不可调度的不行。 */
+  verifiable: boolean
+  /** 为什么不能验。空串表示可以验——「已过期」与「该账号已退出保护」是不同的两件事。 */
+  not_verifiable_reason: string
+}
+
+// 某个账号的票据详情。
+export interface TicketDetailPage {
+  account: TicketAccountStatus
+  tickets: TicketDetailRow[] | null
+  /** 还有更早的票没列出来（撞到行数上限）。 */
+  truncated: boolean
+}
+
+export interface TicketVerifyTicketResponse {
+  result: TicketVerifyResult
+  detail: TicketDetailPage | null
+}
+
 // 立即验票序列里的一张。
 export interface TicketManualVerifyStep {
   ticket_id: number

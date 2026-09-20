@@ -15,6 +15,10 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
+// kongTicketListMax 是票据列表的行数上限。票的 TTL 是一小时、且有留存清理，正常账号远到不了；
+// 这个值只为挡住"清理停摆后一次查出几万行"。
+const kongTicketListMax = 200
+
 // kongNonEmpty 去掉空白项。空切片与「只含空串的切片」都表示该维度不过滤——否则
 // `model = ANY('{""}')` 会筛成只剩空模型的事件，看起来像「一条都没有」。
 func kongNonEmpty(in []string) []string {
@@ -218,6 +222,72 @@ func (r *kongTicketRepository) InsertTicket(ctx context.Context, t *service.Kong
 //
 // 返回值为假表示条件不满足（票已过期、已被改写或已被跳过），此时事务回滚、事件也不写，由调用方
 // 另记一条作废事件。
+// TicketByID 按 (账号, 票 id) 读一张票。account_id 进 WHERE 是**权限边界**，不是优化。
+func (r *kongTicketRepository) TicketByID(ctx context.Context, accountID, id int64) (*service.KongTicket, error) {
+	query := `SELECT ` + kongTicketColumns + ` FROM kong_ticket_cache WHERE id = $1 AND account_id = $2`
+	t, err := scanKongTicket(r.db.QueryRowContext(ctx, query, id, accountID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query ticket by id: %w", err)
+	}
+	return t, nil
+}
+
+// PrepareTicketForManualVerify 把一张票准备成可重验状态：已拒的复位成候选，并清掉跳过标记。
+//
+// **期限条件必须留在 WHERE 里**：过期的票不该被复活。status 用 CASE 而不是无条件写 unverified
+// ——一张 verified 的票（比如注入被拒后被标了 skip 的那张）不能被打回 unverified，那会撤掉它已经
+// 生效的服务资格。
+func (r *kongTicketRepository) PrepareTicketForManualVerify(ctx context.Context, id int64) (*service.KongTicket, error) {
+	query := `UPDATE kong_ticket_cache
+		  SET status = CASE WHEN status = $1 THEN $2 ELSE status END,
+		      skip_until_new = FALSE
+		  WHERE id = $3 AND expires_at > now()
+		  RETURNING ` + kongTicketColumns
+	t, err := scanKongTicket(r.db.QueryRowContext(ctx, query,
+		service.KongTicketStatusRejected, service.KongTicketStatusUnverified, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("prepare ticket for manual verify: %w", err)
+	}
+	return t, nil
+}
+
+// ListTickets 列一个账号名下的票。含已过期与已拒的——管理页面要能看见"为什么现在没票可用"，
+// 只列可用的那些等于把答案藏起来。
+func (r *kongTicketRepository) ListTickets(ctx context.Context, accountID int64, limit int) ([]*service.KongTicket, error) {
+	// 归一化必须在这里而不是交给调用方：0、负数、超大值都要落到同一个上限，否则测试替身与生产
+	// 在边界上各行其是。
+	if limit <= 0 || limit > kongTicketListMax {
+		limit = kongTicketListMax
+	}
+	query := `SELECT ` + kongTicketColumns + ` FROM kong_ticket_cache
+		WHERE account_id = $1
+		ORDER BY captured_at DESC
+		LIMIT $2`
+	rows, err := r.db.QueryContext(ctx, query, accountID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list tickets: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*service.KongTicket
+	for rows.Next() {
+		t, err := scanKongTicket(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tickets: %w", err)
+	}
+	return out, nil
+}
+
 func (r *kongTicketRepository) CommitVerification(
 	ctx context.Context,
 	id int64,

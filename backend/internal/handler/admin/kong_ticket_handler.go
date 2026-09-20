@@ -163,6 +163,51 @@ func (h *KongTicketHandler) TriggerVerify(c *gin.Context) {
 	response.Success(c, gin.H{"result": result, "status": status})
 }
 
+// TicketDetail 列一个账号名下的票。
+func (h *KongTicketHandler) TicketDetail(c *gin.Context) {
+	if !h.ready(c) {
+		return
+	}
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		response.BadRequest(c, "invalid account id")
+		return
+	}
+	page, err := h.svc.TicketDetail(c.Request.Context(), accountID)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if page == nil {
+		response.NotFound(c, "account not found")
+		return
+	}
+	response.Success(c, page)
+}
+
+// TriggerVerifyTicket 验指名的那一张票。验不通过不是错误——页面靠 steps 说明。
+func (h *KongTicketHandler) TriggerVerifyTicket(c *gin.Context) {
+	if !h.ready(c) {
+		return
+	}
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		response.BadRequest(c, "invalid account id")
+		return
+	}
+	ticketID, err := strconv.ParseInt(c.Param("ticket_id"), 10, 64)
+	if err != nil || ticketID <= 0 {
+		response.BadRequest(c, "invalid ticket id")
+		return
+	}
+	result, page, err := h.svc.TriggerVerifyTicket(c.Request.Context(), accountID, ticketID)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.Success(c, gin.H{"result": result, "detail": page})
+}
+
 // ListEvents 分页查事件。
 func (h *KongTicketHandler) ListEvents(c *gin.Context) {
 	if !h.ready(c) {

@@ -445,6 +445,25 @@ func (s *KongTicketAdminService) TriggerVerify(ctx context.Context, accountID in
 	return result, status, nil
 }
 
+// TriggerVerifyTicket 验指名的那一张票（详情页逐行触发）。触发后回一份新的详情页，页面不必自己
+// 猜哪些行变了——尤其"当前票换成了哪张"必须由服务端重算。
+func (s *KongTicketAdminService) TriggerVerifyTicket(ctx context.Context, accountID, ticketID int64) (*KongManualVerify, *KongTicketDetailPage, error) {
+	if s.svc == nil {
+		return nil, nil, fmt.Errorf("票据功能未启用，无法手工验票")
+	}
+	result, err := s.svc.TriggerVerifyTicket(ctx, accountID, ticketID)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 模型不在门控集合时不拦：这一张票是库里真实存在的行，而门控集合是可以改的——改窄之后仍然
+	// 应该能把遗留的票验掉或看清它，那正是详情页的用处。
+	page, err := s.TicketDetail(ctx, accountID)
+	if err != nil {
+		return result, nil, nil
+	}
+	return result, page, nil
+}
+
 // isGated 判断模型是否在门控集合里。
 func (s *KongTicketAdminService) isGated(model string) bool {
 	for _, m := range s.gatedModels {
@@ -503,4 +522,127 @@ func (s *KongTicketAdminService) ListEvents(ctx context.Context, filter *KongTic
 // 它的用途是离线重算。
 func (s *KongTicketAdminService) ListProbes(ctx context.Context, verificationID string) ([]*KongFingerprintProbe, error) {
 	return s.repo.ListProbesByVerification(ctx, verificationID)
+}
+
+// kongTicketDetailLimit 是详情页一次列多少张票。仓储层另有一个同值的硬上限，两者分工不同：
+// 这个是"页面要多少"，那个是"库层最多允许多少"。Truncated 按这个值判。
+const kongTicketDetailLimit = 200
+
+// KongTicketDetail 是票据详情页上的一行。**不含票原值**——那是可注入的凭据，管理响应只放派生
+// 信息（长度、归因、时间）。
+type KongTicketDetail struct {
+	ID       int64  `json:"id"`
+	Model    string `json:"model"`
+	Status   string `json:"status"`
+	Source   string `json:"source"`
+	StateLen int    `json:"state_len"`
+	// SkipUntilNew 为真表示这张票已被排除出候选池（注入未被上游接受，或本段无票期机会用完）。
+	SkipUntilNew     bool      `json:"skip_until_new"`
+	CapturedAt       time.Time `json:"captured_at"`
+	ExpiresAt        time.Time `json:"expires_at"`
+	ExpiresAtSource  string    `json:"expires_at_source"`
+	RemainingSeconds int64     `json:"remaining_seconds"`
+	FingerprintModel string    `json:"fingerprint_model"`
+	FingerprintP     float64   `json:"fingerprint_p"`
+	// FingerprintProbs 是各模型的归因概率。页面据它解释"为什么这张判不合格"。
+	FingerprintProbs map[string]float64 `json:"fingerprint_probs"`
+	// IsCurrent 为真表示**此刻业务注入的就是它**。两个条件：按当前接受白名单与阈值它是该模型的
+	// 首选票，**且这个账号真的会注入**（`mode=full`）。
+	//
+	// 后一半不能省：`off` / `observe` 都不注入，而 statusOf 刻意保留了它们的存量票信息（那是
+	// "该不该开 full"的依据）。只按首选票标"在用"，页面就会在不注入的模式下宣称有票在服务。
+	IsCurrent bool `json:"is_current"`
+	// Preferred 为真表示按当前判据它是该模型的首选票——与 IsCurrent 的差别只在模式。`off` /
+	// `observe` 下看的就是这个：存量票里哪张最合格，而它并没有在被注入。
+	Preferred bool `json:"preferred"`
+	// Verifiable 为真表示这张票现在可以手工验。四个条件缺一不可：功能已启用、模式非 off
+	// （那下面 recheckVerify 必然以「已退出保护」中止，问不出答案）、账号可调度、票未过期。
+	//
+	// **不含"票据出口可用"**：验证走流量出口。已拒的与被跳过的都可以验——服务端会先按 id 准备
+	// （复位 + 清跳过标记），否则结论必然提交不上。
+	Verifiable bool `json:"verifiable"`
+	// NotVerifiableReason 说明为什么不能验。空字符串表示可以验。不给原因的话页面只能猜，而
+	// "已过期"与"该模式不验票"是完全不同的两件事。
+	NotVerifiableReason string `json:"not_verifiable_reason"`
+}
+
+// KongTicketDetailPage 是某个账号的票据详情。
+type KongTicketDetailPage struct {
+	Account *KongTicketAccountStatus `json:"account"`
+	// Tickets 含已过期与已拒的：详情页要能回答"为什么现在没票可用"，只列可用的等于把答案藏起来。
+	Tickets []*KongTicketDetail `json:"tickets"`
+	// Truncated 为真表示还有更早的票没列出来（撞到行数上限）。
+	Truncated bool `json:"truncated"`
+}
+
+// TicketDetail 列一个账号名下的票。
+func (s *KongTicketAdminService) TicketDetail(ctx context.Context, accountID int64) (*KongTicketDetailPage, error) {
+	account, err := s.accounts.GetAccountView(ctx, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("读账号 %d: %w", accountID, err)
+	}
+	if account == nil {
+		// 账号不存在（或不是 codex 协议）。返回 nil 让处理层报 404，不编一个空页面出来。
+		return nil, nil
+	}
+	status, err := s.statusOf(ctx, account, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	cfg, _ := ParseKongTicketConfig(account.Extra)
+	rows, err := s.repo.ListTickets(ctx, accountID, kongTicketDetailLimit)
+	if err != nil {
+		return nil, err
+	}
+	// 逐模型算一次"此刻在用的是哪张"，与业务注入用的是同一个判据（同一对 accept/confidence）。
+	current := map[string]int64{}
+	for _, m := range status.Models {
+		if m.CurrentTicket != nil {
+			current[m.Model] = m.CurrentTicket.ID
+		}
+	}
+	// 账号级的"能不能验"只算一次：它与具体哪张票无关。顺序是刻意的——先报最根本的原因，
+	// 否则页面会把"功能没开"显示成"账号不可调度"。
+	accountReason := ""
+	switch {
+	case len(s.gatedModels) == 0 || s.svc == nil:
+		accountReason = "票据功能未启用"
+	case cfg.Mode == KongTicketModeOff:
+		accountReason = "该账号已退出保护（off），验证流程必然以「已退出保护」中止"
+	case !status.Ready:
+		accountReason = "账号当前不可调度：" + status.NotReady
+	}
+
+	out := &KongTicketDetailPage{Account: status, Truncated: len(rows) >= kongTicketDetailLimit}
+	for _, t := range rows {
+		remaining := int64(time.Until(t.ExpiresAt).Seconds())
+		if remaining < 0 {
+			remaining = 0
+		}
+		reason := accountReason
+		if reason == "" && remaining <= 0 {
+			reason = "票已过期"
+		}
+		preferred := current[t.Model] == t.ID
+		d := &KongTicketDetail{
+			ID: t.ID, Model: t.Model, Status: t.Status, Source: t.Source,
+			StateLen: len(t.State), SkipUntilNew: t.SkipUntilNew,
+			CapturedAt: t.CapturedAt, ExpiresAt: t.ExpiresAt,
+			ExpiresAtSource: t.ExpiresAtSource, RemainingSeconds: remaining,
+			FingerprintProbs: t.FingerprintProbs,
+			Preferred:        preferred,
+			// 只有 full 才在注入。见 IsCurrent 的说明。
+			IsCurrent:           preferred && cfg.Mode == KongTicketModeFull,
+			Verifiable:          reason == "",
+			NotVerifiableReason: reason,
+		}
+		if t.FingerprintModel != nil {
+			d.FingerprintModel = *t.FingerprintModel
+		}
+		if t.FingerprintP != nil {
+			d.FingerprintP = *t.FingerprintP
+		}
+		out.Tickets = append(out.Tickets, d)
+	}
+	return out, nil
 }

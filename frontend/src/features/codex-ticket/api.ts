@@ -7,7 +7,9 @@ import type {
   TicketConfigRequest,
   TicketEventPage,
   TicketEventQuery,
+  TicketDetailPage,
   TicketOverview,
+  TicketVerifyTicketResponse,
 } from './types'
 
 // 本功能的管理端点。路由注册在 backend/internal/server/routes/admin_kong_ticket.go。
@@ -84,8 +86,30 @@ export async function triggerVerify(
   return data
 }
 
+// getTicketDetail 列一个账号名下的票（含已过期与已拒的——详情页要能回答"为什么现在没票可用"）。
+export async function getTicketDetail(accountID: number): Promise<TicketDetailPage> {
+  const { data } = await apiClient.get<TicketDetailPage>(`${basePath}/accounts/${accountID}/tickets`)
+  return data
+}
+
+// verifyTicket 验指名的那一张。已拒的票服务端会先复位成候选再验；已过期的报 not_applicable。
+// 超时同 triggerVerify：服务端上限 300s，客户端留 30 秒余量。
+export async function verifyTicket(
+  accountID: number,
+  ticketID: number,
+): Promise<TicketVerifyTicketResponse> {
+  const { data } = await apiClient.post<TicketVerifyTicketResponse>(
+    `${basePath}/accounts/${accountID}/tickets/${ticketID}/verify`,
+    {},
+    { timeout: 330_000 },
+  )
+  return data
+}
+
 export default {
   getOverview,
+  getTicketDetail,
+  verifyTicket,
   updateAccountConfig,
   listEvents,
   listProbes,

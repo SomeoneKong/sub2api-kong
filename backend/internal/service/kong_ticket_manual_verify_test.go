@@ -387,3 +387,88 @@ func TestKongTriggerVerifyOffModeNotApplicable(t *testing.T) {
 		t.Errorf("off 下不该动票，实际撤销了 %v", repo.revoked)
 	}
 }
+
+// 按 id 验一张**已拒**票：服务端先把它复位成候选再验。
+//
+// 锁的是"详情页上已拒的票可以重验"——改过接受白名单或阈值之后，同一份证据可能就合格了。
+// 这里没有别的 verified 票，所以验过之后它自然成为当前票；"更晚过期才接替"那条规则由
+// TestKongManualVerifyEarlierExpiryDoesNotReplaceCurrent 专门锁。
+func TestKongTriggerVerifyTicketRevivesRejected(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	accounts.set(kongVerifyTestAccount())
+	up := &kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}, answers: kongVerifyAnswers()}
+	svc := kongTestService(t, repo, up, accounts)
+	const model = "gpt-5.6-sol"
+	svc.accept = KongTicketAccept{model: []string{model}}
+	// 一张已拒但未过期的票，且它比当前票晚过期。
+	rejected := kongSeedCandidate(repo, model, 21, time.Minute)
+	repo.tickets[rejected.ID].Status = KongTicketStatusRejected
+	rejected.Status = KongTicketStatusRejected
+
+	out, err := svc.TriggerVerifyTicket(context.Background(), 1, rejected.ID)
+	if err != nil {
+		t.Fatalf("按 id 验票: %v", err)
+	}
+	if len(out.Steps) != 1 || out.Steps[0].TicketID != rejected.ID {
+		t.Fatalf("只该验点名那一张 #%d，实得 %+v", rejected.ID, out.Steps)
+	}
+	if !out.Accepted {
+		t.Fatalf("复位后应能重新判定合格，实得 %+v（reason=%s）", out, out.Reason)
+	}
+	if len(repo.revived) != 1 || repo.revived[0] != rejected.ID {
+		t.Fatalf("应当先复位 #%d，实际复位了 %v", rejected.ID, repo.revived)
+	}
+	if cur := kongStillCurrent(t, repo, svc, model); cur == nil || cur.ID != rejected.ID {
+		t.Fatalf("验过的票应当成为当前票 #%d，实得 %+v", rejected.ID, cur)
+	}
+}
+
+// 已过期的票不验：票本身已失效，验它只是白烧额度（最多三份真实挑战）。
+func TestKongTriggerVerifyTicketSkipsExpired(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	accounts.set(kongVerifyTestAccount())
+	up := &kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}, answers: kongVerifyAnswers()}
+	svc := kongTestService(t, repo, up, accounts)
+	const model = "gpt-5.6-sol"
+	expired := kongSeedCandidate(repo, model, 22, time.Minute)
+	repo.tickets[expired.ID].ExpiresAt = time.Now().Add(-time.Minute)
+	expired.ExpiresAt = time.Now().Add(-time.Minute)
+
+	out, err := svc.TriggerVerifyTicket(context.Background(), 1, expired.ID)
+	if err != nil {
+		t.Fatalf("按 id 验票: %v", err)
+	}
+	if !out.NotApplicable || len(out.Steps) != 0 {
+		t.Fatalf("过期票不该验，实得 %+v", out)
+	}
+	if up.challengeCall != 0 {
+		t.Errorf("不该发起任何挑战，实际发了 %d 份", up.challengeCall)
+	}
+}
+
+// 别人的票验不了：account_id 参与匹配是权限边界，不是优化。
+func TestKongTriggerVerifyTicketRejectsForeignTicket(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	accounts.set(kongVerifyTestAccount())
+	up := &kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}, answers: kongVerifyAnswers()}
+	svc := kongTestService(t, repo, up, accounts)
+	const model = "gpt-5.6-sol"
+	other := kongSeedCandidate(repo, model, 23, time.Minute)
+	// 把它改挂到另一个账号名下。
+	other.AccountID = 9
+	repo.tickets[other.ID].AccountID = 9
+
+	out, err := svc.TriggerVerifyTicket(context.Background(), 1, other.ID)
+	if err != nil {
+		t.Fatalf("按 id 验票: %v", err)
+	}
+	if !out.NotApplicable || len(out.Steps) != 0 {
+		t.Fatalf("不属于本账号的票不该被验，实得 %+v", out)
+	}
+	if up.challengeCall != 0 {
+		t.Errorf("不该发起任何挑战，实际发了 %d 份", up.challengeCall)
+	}
+}

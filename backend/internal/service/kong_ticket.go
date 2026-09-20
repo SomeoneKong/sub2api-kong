@@ -348,6 +348,9 @@ type KongTicketRepository interface {
 	// InsertTicket 插入一张票。第二个返回值为假表示这张票原值已经存在——重复出现不是新信息，
 	// 调用方不得据此延长期限、解除候选跳过标记或触发诊断探测。
 	InsertTicket(ctx context.Context, t *KongTicket) (int64, bool, error)
+	// TicketByID 按 (账号, 票 id) 读一张票，含票原值。**账号必须参与匹配**——否则换个 id 就能让
+	// 一个账号去验别人的票。不存在或不属于该账号时返回 nil。
+	TicketByID(ctx context.Context, accountID, id int64) (*KongTicket, error)
 	// TicketStatus 读一张票当前的状态。人工重验要据它区分"已被判不合格"与"没得出结论"——
 	// 前者 verifyTicket 自己已经提交成 rejected，后者旧结论仍然有效。
 	TicketStatus(ctx context.Context, id int64) (string, error)
@@ -367,6 +370,21 @@ type KongTicketRepository interface {
 	// 返回复位后的那张票（含票原值），便于调用方把它**直接**钉成本次验证目标——否则泛选候选可能
 	// 选到别张票，而页面已经报了"正在复用该票重验"。没有可复位的票时返回 nil。
 	ReviveRejectedCandidate(ctx context.Context, accountID int64, model string) (*KongTicket, error)
+	// PrepareTicketForManualVerify 把一张**未过期的**票准备成"可以立刻重验"的状态，返回准备后的
+	// 它（不满足条件时返回 nil）。两件事一起做，因为它们的理由是同一个——人工指名要验这一张：
+	//
+	//   - `rejected` → `unverified`：改过接受白名单或阈值之后，同一份证据可能就合格了；
+	//   - 清掉 `skip_until_new`：不清的话 CommitVerification 的 `NOT skip_until_new` 必然挡住结论
+	//     ——挑战照样发出去、额度照样烧，而任何结论都提交不了。
+	//
+	// **只动这一张**（按 id）。不要用 ClearSkipMarks：那会解除整个 (账号, 模型) 候选池的标记，把
+	// 别的票也一起放回池子，而人工只点了一张。
+	PrepareTicketForManualVerify(ctx context.Context, id int64) (*KongTicket, error)
+	// ListTickets 列一个账号名下的票，最近采集的在前，供管理页面展示。
+	//
+	// **返回值含票原值**（`State`），与库里一致；调用方绝不可把它下发给客户端——那是可注入的凭据。
+	// 管理响应只放派生信息（长度、归因、时间）。limit 为 0 时用一个保守上限。
+	ListTickets(ctx context.Context, accountID int64, limit int) ([]*KongTicket, error)
 	// CommitVerification 在同一个事务里落「资格 + 最终事件」。返回假表示条件不满足
 	// （票已过期、已被改写或已被跳过），此时什么都没写。
 	//

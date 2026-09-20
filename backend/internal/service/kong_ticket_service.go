@@ -2029,3 +2029,96 @@ func (s *KongTicketService) TriggerRefresh(ctx context.Context, accountID int64,
 	}
 	return out, nil
 }
+
+// TriggerVerifyTicket 人工验**指名的那一张**票（票据详情页逐行触发用）。
+//
+// 与 TriggerVerify 的分工：那个按规则挑对象（当前票 + 最多一张候选），这个只验调用方点的那一张，
+// 不多验、不改挑法——页面上点了第 3 行却去验第 1 行，是最容易让人误判的一种行为。
+//
+// 三种对象都能验，语义各不相同：
+//   - 正在服务的那张 → reverify，受"证据不完整不推翻既有结论"保护；
+//   - 候选 → 首次验证，走正常候选路径；
+//   - **已拒票 → 先按 id 复位成候选再验**。改过接受白名单或阈值之后，同一份证据可能就合格了；
+//     而注入未被接受那种拒绝重验会再次以 candidate_not_accepted 失败，两者都安全，不必分辨。
+//
+// 已过期的票不验：票本身已失效，验它只是白烧额度（最多三份真实挑战）。
+func (s *KongTicketService) TriggerVerifyTicket(ctx context.Context, accountID, ticketID int64) (*KongManualVerify, error) {
+	account, err := s.accounts.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("读账号 %d: %w", accountID, err)
+	}
+	if account == nil {
+		return nil, fmt.Errorf("账号 %d 不存在", accountID)
+	}
+	out := &KongManualVerify{}
+	cfg, _ := ParseKongTicketConfig(account.Extra)
+	if cfg.Mode == KongTicketModeOff {
+		// 同 TriggerVerify：off 下 recheckVerify 会以「已退出保护」中止，问不出答案。
+		out.NotApplicable = true
+		out.DenyReason = KongDenyModeNotFull
+		return out, nil
+	}
+	if !account.IsSchedulable() {
+		out.DenyReason = KongDenyAccountUnready
+		return out, nil
+	}
+
+	// 占槽之前先粗查一次，只为"有没有这张票"与"属不属于这个账号"——**必须带 accountID**，否则
+	// 换个 id 就能让一个账号去验别人的票。真正的判据要等占到槽位之后重读（见下）。
+	probe, err := s.repo.TicketByID(ctx, accountID, ticketID)
+	if err != nil {
+		return nil, err
+	}
+	if probe == nil {
+		out.NotApplicable = true
+		return out, nil
+	}
+	model := probe.Model
+
+	task, outcome := s.claimTask(accountID, model, kongVerifyOnlySlot(accountID))
+	if outcome != kongClaimFresh {
+		out.DenyReason = KongDenyOtherModelTask
+		if outcome == kongClaimEgressBusy {
+			out.DenyReason = KongDenyEgressBusy
+		}
+		return out, nil
+	}
+	defer s.releaseTask(accountID, task)
+
+	// **占到槽位之后必须重读**。槽位只保证"不同时执行"，挡不住先后交错：粗查与占槽之间，一个刚
+	// 释放槽位的自动任务可能已经把这张票判成 rejected。按旧快照走下去会跳过该做的准备，然后发出
+	// 三份挑战、最后必被 CommitVerification 的状态条件挡掉——额度烧了、结论没落。
+	ticket, err := s.repo.PrepareTicketForManualVerify(ctx, ticketID)
+	if err != nil {
+		return nil, err
+	}
+	// 返回 nil 只有一种原因：票已过期（期限条件在 SQL 的 WHERE 里）。过期票不验——票本身已失效，
+	// 验它只是白烧额度。
+	if ticket == nil {
+		out.NotApplicable = true
+		return out, nil
+	}
+	if probe.Status == KongTicketStatusRejected || probe.SkipUntilNew {
+		// 记下这次人工准备动作：一张 rejected 票突然又变成 unverified、或跳过标记被解除，事后只
+		// 能靠这条事件解释。
+		s.logEventWith(ctx, &KongTicketEvent{
+			AccountID: accountID, Model: model, EventType: KongEventVerify,
+			Outcome: KongOutcomeInfo, TicketID: &ticketID,
+			Detail: map[string]any{
+				"phase": "manual_prepare", "from_status": probe.Status,
+				"cleared_skip": probe.SkipUntilNew,
+			},
+		})
+	}
+
+	// **重验语义按票此刻的状态定，不按"它是否排第一"**：一张仍然合格、只是过期较早的备用 verified
+	// 票，同样已经完整通过过一次，同样该受"证据不完整不推翻既有结论"的保护。按 id 比对当前票会把
+	// 它当成首次验证的候选，于是一份不合格归因加两份 429 就能把它判成 rejected——无谓拒服。
+	reverify := ticket.Status == KongTicketStatusVerified
+
+	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kongWaitBudget)
+	defer cancel()
+	step, _, fatal := s.verifyOneManually(ctx, tctx, account, cfg, model, ticket, reverify)
+	out.Steps = append(out.Steps, step)
+	return kongFinishManualVerify(out), fatal
+}
