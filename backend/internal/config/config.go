@@ -2260,6 +2260,7 @@ func setDefaults() {
 	// 现网全靠 GATEWAY_KONG_CODEX_TICKET_* 环境变量，不注册空默认值就永远读不到。
 	viper.SetDefault("gateway.kong_codex_ticket.accept_extra", DefaultKongTicketAcceptExtra)
 	viper.SetDefault("gateway.kong_codex_ticket.batch_fetch_all_models", DefaultKongTicketBatchFetchAllModels)
+	viper.SetDefault("gateway.kong_codex_ticket.fetch_fused_fingerprint", DefaultKongTicketFetchFusedFingerprint)
 
 	// Ops (vNext)
 	viper.SetDefault("ops.enabled", true)

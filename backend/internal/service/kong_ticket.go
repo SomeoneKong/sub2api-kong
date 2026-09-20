@@ -254,6 +254,15 @@ type KongFingerprintProbe struct {
 	TicketFingerprint string
 	TicketSource      string
 	VerifyEgress      string
+	// Fused 为真表示这一份来自**取票请求本身**（融合取票）：它在票据出口上产生、且当时没有注入
+	// 票。不标出来的话，事后分析会把两类产生条件不同的样本混算。
+	Fused bool
+	// DiscardedReason 非空表示这一份**留档但不采用**：观测保留（它花了额度），但不参与最终归因。
+	// 与 InvalidReason 分开——那一列是"这份回答本身无效"，而丢弃是"回答有效、只是产生条件不同"。
+	//
+	// 被丢弃的样本必须同时把 CountedInAverage 置假，否则离线按它重算会把样本混回去，得出与线上
+	// 不同的结论。
+	DiscardedReason string
 	// CaptureEgress 是这张票被采到时用的票据出口；observed 票为空（它是业务响应带回的）。
 	// 与 VerifyEgress 分开：验证走流量出口，两者通常不同，混用会让「哪个出口取到好票」失真。
 	CaptureEgress string

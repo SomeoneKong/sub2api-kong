@@ -708,8 +708,10 @@ func (r *kongTicketRepository) InsertProbes(ctx context.Context, probes []*servi
 		(created_at, verification_id, part_index, account_id, target_model, ticket_id,
 		 ticket_fingerprint, ticket_source, verify_egress, capture_egress, idle_seconds, challenge_id,
 		 digits, digit_count, scores, part_attribution, cum_probability, temperature_tier,
-		 library_version, parse_valid, counted_in_average, invalid_reason, latency_ms, output_tokens)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`
+		 library_version, parse_valid, counted_in_average, invalid_reason, latency_ms, output_tokens,
+		 fused, discarded_reason)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+		        $25,$26)`
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("prepare probes insert: %w", err)
@@ -752,7 +754,8 @@ func (r *kongTicketRepository) InsertProbes(ctx context.Context, probes []*servi
 			kongNullString(p.CaptureEgress), p.IdleSeconds, p.ChallengeID,
 			string(digits), p.DigitCount, string(scores), p.PartAttribution, p.CumProbability,
 			p.TemperatureTier, string(library), p.ParseValid, p.CountedInAverage,
-			p.InvalidReason, p.LatencyMs, p.OutputTokens); err != nil {
+			p.InvalidReason, p.LatencyMs, p.OutputTokens,
+			p.Fused, kongNullString(p.DiscardedReason)); err != nil {
 			return fmt.Errorf("insert probe part %d: %w", p.PartIndex, err)
 		}
 	}
@@ -767,8 +770,12 @@ func (r *kongTicketRepository) ListProbesByVerification(ctx context.Context, ver
 		ticket_id, coalesce(ticket_fingerprint,''), coalesce(ticket_source,''),
 		coalesce(verify_egress,''), coalesce(capture_egress,''), idle_seconds, challenge_id, digits, digit_count, scores,
 		part_attribution, cum_probability, temperature_tier, library_version,
-		parse_valid, counted_in_average, invalid_reason, latency_ms, output_tokens
-		FROM kong_fingerprint_probes WHERE verification_id = $1 ORDER BY part_index ASC`
+		parse_valid, counted_in_average, invalid_reason, latency_ms, output_tokens,
+		fused, coalesce(discarded_reason,'')
+		FROM kong_fingerprint_probes WHERE verification_id = $1
+		-- 按 part_index 再按 id：融合样本与常规首份都可能占同一个序号（融合被丢弃后 leader 重跑），
+		-- 只按 part_index 排的话两条的先后不确定，而读的人要按发生顺序理解证据。
+		ORDER BY part_index ASC, id ASC`
 	rows, err := r.db.QueryContext(ctx, query, verificationID)
 	if err != nil {
 		return nil, fmt.Errorf("list probes: %w", err)
@@ -784,7 +791,8 @@ func (r *kongTicketRepository) ListProbesByVerification(ctx context.Context, ver
 			&p.CaptureEgress,
 			&p.IdleSeconds, &p.ChallengeID, &digits, &p.DigitCount, &scores, &p.PartAttribution,
 			&p.CumProbability, &p.TemperatureTier, &library, &p.ParseValid, &p.CountedInAverage,
-			&p.InvalidReason, &p.LatencyMs, &p.OutputTokens); err != nil {
+			&p.InvalidReason, &p.LatencyMs, &p.OutputTokens,
+			&p.Fused, &p.DiscardedReason); err != nil {
 			return nil, fmt.Errorf("scan probe: %w", err)
 		}
 		// jsonb 保证内容是合法 JSON，不保证它能装进目标 Go 类型。装不进就是证据已经损坏，

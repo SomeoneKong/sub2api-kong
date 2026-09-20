@@ -56,6 +56,26 @@ const KongTicketBatchFetchEnv = "GATEWAY_KONG_CODEX_TICKET_BATCH_FETCH_ALL_MODEL
 // 机制的地基，换上游、换出口之后要重新确认。
 const DefaultKongTicketBatchFetchAllModels = true
 
+// KongTicketFusedFingerprintEnv 是 FetchFusedFingerprint 对应的环境变量名。
+const KongTicketFusedFingerprintEnv = "GATEWAY_KONG_CODEX_TICKET_FETCH_FUSED_FINGERPRINT"
+
+// DefaultKongTicketFetchFusedFingerprint 是取票融合指纹的内置默认：**开启**。
+//
+// 依据是协议事实：turn-state 是 **sticky-routing token，钉住的正是那次请求被路由到的目标**，且在
+// turn start 下发（读 codex 源码所得，见研究资料 FACTS.md 的协议事实一节）。所以取票那次响应的
+// 正文，就是那张票所钉住的那个目标生成的——票是该次请求路由结果的载体，不是独立于它的东西。于是
+// 取票请求的正文可以直接当第一份指纹样本，省掉一次往返（取票 ~1s、单份挑战 27–31s）。
+//
+// ⚠️ 两处差异是**推理而非实测**，这也是本开关必须存在的理由：
+//
+//  1. **出口不同**：融合样本在票据出口上产生，而业务注入用票时走流量出口。"票是否编码了打票时的
+//     出口 IP"仍是未决问题（FACTS.md §5 Q1）——若编码，融合样本测到的是"打票出口上的档位"。
+//  2. **无票态 vs 注入态**：融合样本是无票状态下的路由结果，注入后是按票路由。
+//
+// 叠加早停（生产实测多数验证一份样本就判定接受），融合样本往往是那张票的**唯一**证据。所以未达标
+// 时刻意**不据它判不合格**，只记 inconclusive 并丢弃重跑（见 verifyTicket 的 fused 分支）。
+const DefaultKongTicketFetchFusedFingerprint = true
+
 // applyKongTicketEnvOverrides 在 Unmarshal 之后按环境变量覆盖票据配置。
 //
 // **为什么必须单独覆盖**：viper 的 `AutomaticEnv` 默认忽略**空**环境变量，所以把
@@ -79,19 +99,28 @@ func applyKongTicketEnvOverrides(cfg *KongCodexTicketConfig) {
 //
 // `viper.Set` 的优先级高于环境变量，所以写回一个已规范化的布尔值也就同时挡掉了原始字符串。
 func normalizeKongTicketEnv() {
-	raw, present := os.LookupEnv(KongTicketBatchFetchEnv)
+	normalizeKongTicketBool(KongTicketBatchFetchEnv,
+		"gateway.kong_codex_ticket.batch_fetch_all_models",
+		DefaultKongTicketBatchFetchAllModels)
+	normalizeKongTicketBool(KongTicketFusedFingerprintEnv,
+		"gateway.kong_codex_ticket.fetch_fused_fingerprint",
+		DefaultKongTicketFetchFusedFingerprint)
+}
+
+// normalizeKongTicketBool 规范化一个布尔开关。非法值回退到**内置默认**并告警。
+//
+// 不回退成 false：两个开关的 false 都是"悄悄退回旧行为"——批量取票关掉会让同时门控的两个模型重新
+// 出现空窗，融合关掉会让每次取票多付一次往返。把笔误解读成关闭，问题会以性能退化的形式藏很久。
+func normalizeKongTicketBool(env, key string, def bool) {
+	raw, present := os.LookupEnv(env)
 	if !present {
 		return
 	}
-	key := "gateway.kong_codex_ticket.batch_fetch_all_models"
 	v, err := strconv.ParseBool(strings.TrimSpace(raw))
 	if err != nil {
-		// 非法值回退到内置默认并告警。**不回退成 false**：把笔误解读成"关闭"是悄悄退回旧行为，
-		// 而那个方向会让同时门控的两个模型重新出现空窗。
-		slog.Warn("codex 票据：批量取票开关取值非法，按默认值处理",
-			"env", KongTicketBatchFetchEnv, "value", raw,
-			"default", DefaultKongTicketBatchFetchAllModels)
-		viper.Set(key, DefaultKongTicketBatchFetchAllModels)
+		slog.Warn("codex 票据：布尔开关取值非法，按默认值处理",
+			"env", env, "value", raw, "default", def)
+		viper.Set(key, def)
 		return
 	}
 	viper.Set(key, v)
@@ -115,6 +144,9 @@ type KongCodexTicketConfig struct {
 	// 从环境变量来，而 map 没法从单个环境变量表达。
 	AcceptExtra string `mapstructure:"accept_extra"`
 
+	// FetchFusedFingerprint 决定取票请求是否顺带充当第一份指纹样本（见
+	// DefaultKongTicketFetchFusedFingerprint 的依据与差异说明）。
+	FetchFusedFingerprint bool `mapstructure:"fetch_fused_fingerprint"`
 	// BatchFetchAllModels 决定一次取票是否**并发**把所有门控模型的票一起取回来。
 	//
 	// 开启的收益不是"省一次请求"，而是**让多个门控模型能共用同一段静默**：取票间隔由

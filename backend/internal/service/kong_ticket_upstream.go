@@ -27,6 +27,15 @@ type KongUpstreamProbe struct {
 	StatusCode int
 	// IdleSecondsAtStart 由调用方填，仅为写事件方便。
 	IdleSecondsAtStart *int64
+	// Answer 只在**融合取票且正文读成功**时非空：取票请求的 prompt 就是一份指纹挑战，于是它的
+	// 正文可以直接当第一份样本。
+	Answer *KongUpstreamAnswer
+	// FusedAttempted 表示这次取票**发起过**融合（prompt 带了挑战题）。它与 Answer 是否为 nil 分开：
+	// 读正文失败时 Answer 为 nil，但额度已经花了、也该留一条处置记录——把两者混成一个字段会让
+	// "读失败"被下游当成"没融合"，于是既不记账也不留记录。
+	FusedAttempted bool
+	// FusedReadErr 是读正文的失败原因（仅 FusedAttempted 且 Answer 为 nil 时有值）。
+	FusedReadErr string
 }
 
 // KongUpstreamAnswer 是一次指纹挑战的结果。
@@ -53,8 +62,12 @@ type KongTicketUpstream interface {
 	// 「解析成功」会让到期与停用两个分支在生产里永远不可达——而那正是票据出口最常见的失效
 	// 方式（上游的到期清扫只改 accounts.proxy_id，不认识我们的键）。
 	ProxyState(ctx context.Context, proxyID *int64) (KongTicketProxyState, error)
-	// FetchTurnState 经指定出口发一个最小请求，只为拿回响应头里的票。
-	FetchTurnState(ctx context.Context, account *Account, egressProxyURL, model string) (*KongUpstreamProbe, error)
+	// FetchTurnState 经指定出口发一个请求，拿回响应头里的票。
+	//
+	// fused 非 nil 时用它的 prompt 代替最小 prompt，并把正文读回 KongUpstreamProbe.Answer
+	// ——取票那次响应本就是那张票所钉住的目标生成的，于是它能直接当第一份指纹样本，省掉一次往返。
+	// fused 为 nil 时行为不变：最小 prompt、丢弃正文。
+	FetchTurnState(ctx context.Context, account *Account, egressProxyURL, model string, fused *KongFingerprintChallenge) (*KongUpstreamProbe, error)
 	// RunChallenge 经流量出口发一次指纹挑战。injectState 非空时带上它——验证必须带着被验证的
 	// 那张票发出，否则测到的是另一次请求的状态。
 	RunChallenge(ctx context.Context, account *Account, trafficProxyURL, model string, challenge KongFingerprintChallenge, injectState string) (*KongUpstreamAnswer, error)
@@ -108,7 +121,11 @@ func (u *kongTicketUpstream) ProxyState(ctx context.Context, proxyID *int64) (Ko
 	return KongProxyStateOf(proxy, time.Now()), nil
 }
 
-// kongCodexProbePrompt 是取票用的最小 prompt。取票只要响应头，正文越短越省额度。
+// kongCodexProbePrompt 是**不融合**时取票用的最小 prompt。那时只要响应头，正文越短越省额度。
+//
+// ⚠️ 真正的成本不在这里：请求体里的 `instructions` 是完整的 codex 系统提示词，比这个 prompt 长
+// 几个量级。缩短它会让取票请求不像真实 codex 请求、可能影响上游是否愿意下发票，没有实测依据之前
+// 不要动。
 const kongCodexProbePrompt = "ok"
 
 const (
@@ -218,11 +235,19 @@ func (u *kongTicketUpstream) sendWith(req *http.Request, proxyURL string, accoun
 // FetchTurnState 只取响应头里的票。
 //
 // 请求刻意**不带**任何票：上游的规则是「带有效票就不下发、不带才下发」，带着票去取票只会拿回空。
-func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Account, egressProxyURL, model string) (*KongUpstreamProbe, error) {
-	ctx, cancel := context.WithTimeout(ctx, kongFetchTimeout)
+func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Account, egressProxyURL, model string, fused *KongFingerprintChallenge) (*KongUpstreamProbe, error) {
+	// 融合时要等整份答案生成完（生产实测单份挑战 27–31s），60 秒的取票期限不够用，改用挑战那一档。
+	// 仍远小于 292 窗口的约 4 分钟寿命。
+	budget := kongFetchTimeout
+	prompt := kongCodexProbePrompt
+	if fused != nil {
+		budget = kongChallengeTimeout
+		prompt = fused.Prompt
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	req, err := u.buildCodexRequest(ctx, account, model, kongCodexProbePrompt, "")
+	req, err := u.buildCodexRequest(ctx, account, model, prompt, "")
 	if err != nil {
 		// 还没发包。调用方据此不推进出口活动 A——静默其实还在。
 		return nil, &KongErrUpstreamNotAttempted{Err: err}
@@ -233,6 +258,7 @@ func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Accoun
 	if concurrency < kongFetchPoolFloor {
 		concurrency = kongFetchPoolFloor
 	}
+	started := time.Now()
 	resp, err := u.sendWith(req, egressProxyURL, account, concurrency)
 	if err != nil {
 		// 传输层已经区分过「还没发包」：主机校验不通过、客户端池取不到连接都属于本地失败，
@@ -243,9 +269,13 @@ func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Accoun
 		}
 		return nil, fmt.Errorf("取票请求失败: %w", err)
 	}
+	fusedRead := false
 	defer func() {
-		// 必须读干并关闭：连接池的在途计数依赖它，漏关会泄漏计数并阻止淘汰。
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		// 必须读干并关闭：连接池的在途计数依赖它，漏关会泄漏计数并阻止淘汰。融合时正文已被完整
+		// 读走（SSE 读到 EOF），这里再读一次是空操作，但关闭仍然必需。
+		if !fusedRead {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		}
 		_ = resp.Body.Close()
 	}()
 
@@ -255,6 +285,32 @@ func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Accoun
 	}
 	if resp.StatusCode >= 400 {
 		return probe, fmt.Errorf("取票请求返回 %d", resp.StatusCode)
+	}
+	if fused != nil {
+		// 融合：把正文当第一份指纹样本读回来。
+		//
+		// EchoedState 取的是**同一个响应头**里的票，语义与挑战路径刻意保持一致，但含义相反：取票
+		// 请求本就不带票、本就期待上游下发，所以这里有票是正常的。调用方据 probe.State 判断取票
+		// 成功，不拿 Answer.EchoedState 当"注入未被接受"。
+		fusedRead = true
+		probe.FusedAttempted = true
+		text, outputTokens, readErr := kongReadCodexSSEText(resp.Body)
+		answer := &KongUpstreamAnswer{
+			StatusCode:   resp.StatusCode,
+			EchoedState:  probe.State,
+			Text:         text,
+			OutputTokens: outputTokens,
+			LatencyMs:    int(time.Since(started).Milliseconds()),
+		}
+		if readErr != nil {
+			// 读正文失败**不影响取票本身**：票在响应头里，已经拿到了，绝不能因此把整次取票判失败
+			// ——那会连一张好票一起丢掉，而取票要花一整段出口静默。
+			//
+			// 但也不能装作没融合：额度已经花了。把失败原因带回去，由编排层留档并记一条 inconclusive。
+			probe.FusedReadErr = readErr.Error()
+			return probe, nil
+		}
+		probe.Answer = answer
 	}
 	return probe, nil
 }

@@ -34,6 +34,8 @@ type KongTicketService struct {
 	gatedModels []string
 	// batchFetch 开启时，一次取票并发把所有门控模型的票一起取回来（见 config 里的说明）。
 	batchFetch bool
+	// fusedFingerprint 开启时，取票请求顺带充当第一份指纹样本（见 config 里的依据与差异说明）。
+	fusedFingerprint bool
 
 	// accept 记录每个门控模型接受哪些归因结果（永远含自己）。采纳判据只此一份。
 	accept KongTicketAccept
@@ -73,7 +75,7 @@ type kongTicketTask struct {
 }
 
 // NewKongTicketService 创建编排服务。
-func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream, accounts KongAccountLoader, bank *KongFingerprintBank, params KongTicketParams, gatedModels []string, batchFetch bool, accept KongTicketAccept, confidence float64) *KongTicketService {
+func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream, accounts KongAccountLoader, bank *KongFingerprintBank, params KongTicketParams, gatedModels []string, batchFetch, fusedFingerprint bool, accept KongTicketAccept, confidence float64) *KongTicketService {
 	if confidence <= 0 || confidence >= 1 {
 		confidence = 0.9
 	}
@@ -85,6 +87,7 @@ func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream
 		params:           params,
 		gatedModels:      append([]string(nil), gatedModels...),
 		batchFetch:       batchFetch,
+		fusedFingerprint: fusedFingerprint,
 		accept:           accept,
 		confidence:       confidence,
 		inflight:         make(map[int64]*kongTicketTask),
@@ -390,7 +393,7 @@ func (s *KongTicketService) runTask(ctx context.Context, account *Account, model
 	// 那条限制是压被动票的**自动**验证频率，对人工指名的重验没有意义。
 	if revived != nil && in.AccountReady {
 		id, verr := s.verifyTicket(ctx, fresh, freshCfg, model, revived.ID, revived.State, revived.Source,
-			revived.ExpiresAt, kongCaptureOf(revived), taskStartedAt, false)
+			revived.ExpiresAt, kongCaptureOf(revived), taskStartedAt, false, nil)
 		return id, revivedID, verr
 	}
 
@@ -597,11 +600,17 @@ var ErrKongTicketDowngraded = errors.New("归因不合格，已判为降档")
 // kongFetchOne 是一次取票的结果。只有触发模型（leader）的这一份会回传给调用方——其余成员的
 // 成败全部在 fetchStore 内部记进事件，调用方不据此改变行为（见 fetchAndVerify 的注释）。
 type kongFetchOne struct {
-	model    string
-	ticketID int64
-	state    string
-	expires  time.Time
-	err      error
+	// answer 只在融合取票且正文读成功时非空。
+	answer *KongUpstreamAnswer
+	// fusedAttempted / fusedReadErr 让调用方区分"没融合"与"融合了但正文读失败"：后者额度已经花了，
+	// 按约定要留一条 inconclusive，而票本身是好的、照常入库。
+	fusedAttempted bool
+	fusedReadErr   string
+	model          string
+	ticketID       int64
+	state          string
+	expires        time.Time
+	err            error
 }
 
 // otherGatedModels 返回除 exclude 之外的门控模型。
@@ -663,6 +672,14 @@ func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account
 	if s.batchFetch {
 		models = append(models, s.otherGatedModels(model)...)
 	}
+	// 融合取票：整批共用**第一份**挑战。用同一份是刻意的——批内各成员的样本因此可比，"同一个窗口
+	// 里取的票档位是否一致"这个问题才答得上来。
+	var fusedChallenge *KongFingerprintChallenge
+	if s.fusedFingerprint {
+		if all := KongFingerprintChallenges(); len(all) > 0 {
+			fusedChallenge = &all[0]
+		}
+	}
 	// leader 的结果单独走一个 channel。**只等 leader 就开始验证**：等齐全部成员会把非触发模型的
 	// 慢失败算进触发请求的等待时间——leader 取票 1s + 三份挑战 270s 本来 271s 就够，而一个 60s
 	// 才失败的非触发模型会把总耗时推到 330s，超过 kongWaitBudget(300s)，于是本来能服务的请求被
@@ -677,11 +694,27 @@ func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account
 				ticketEgress: ticketEgress, trafficEgress: trafficEgress,
 				egressProxyURL: egressProxyURL, model: models[i],
 				idle: idle, batchIndex: i, batchTotal: len(models), leaderModel: model,
+				fused: fusedChallenge,
 			})
 			if i == 0 {
 				leadCh <- out
+				return
 			}
-			// 非触发模型的结果全部在 fetchStore 内部记完事件了，这里无须回传。
+			// 非触发模型：融合样本够就地落结论，那张票立刻可用，省掉它自己第一个请求的验证等待。
+			// 不够则**不重跑**（OnlyFused）——此刻没有请求在等这张票，不值得再花一份长答案。
+			//
+			// 取票失败时 out.ticketID 为 0，没有可结算的对象。
+			// 条件用 fusedAttempted 而不是 answer != nil：正文读失败时样本不可用，但那次调用已经
+			// 花了额度，按约定要留一条 inconclusive——跳过就什么记录都没有。
+			if out.err == nil && out.fusedAttempted && fusedChallenge != nil && out.ticketID != 0 {
+				capture := &kongCaptureFacts{Egress: ticketEgress, IdleSeconds: idle}
+				_, _ = s.verifyTicket(ctx, account, cfg, models[i], out.ticketID, out.state,
+					KongTicketSourceFetch, out.expires, capture, taskStartedAt, false,
+					&kongFusedSample{
+						Challenge: *fusedChallenge, Answer: out.answer, ReadErr: out.fusedReadErr,
+						Egress: ticketEgress, OnlyFused: true,
+					})
+			}
 		}(i)
 	}
 	lead := <-leadCh
@@ -693,8 +726,17 @@ func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account
 		return 0, lead.err
 	}
 	capture := &kongCaptureFacts{Egress: ticketEgress, IdleSeconds: idle}
+	// 触发模型的融合样本进 verifyTicket 当第一份；不达标它会丢弃并按常规路径重跑（有请求在等，
+	// 值得那几份长答案）。
+	var fused *kongFusedSample
+	if lead.fusedAttempted && fusedChallenge != nil {
+		fused = &kongFusedSample{
+			Challenge: *fusedChallenge, Answer: lead.answer, ReadErr: lead.fusedReadErr,
+			Egress: ticketEgress,
+		}
+	}
 	return s.verifyTicket(ctx, account, cfg, model, lead.ticketID, lead.state, KongTicketSourceFetch,
-		lead.expires, capture, taskStartedAt, false)
+		lead.expires, capture, taskStartedAt, false, fused)
 }
 
 // kongFetchArgs 是一次取票的入参。批内成员共用同一个出口、同一个静默值。
@@ -707,6 +749,8 @@ type kongFetchArgs struct {
 	batchIndex     int
 	batchTotal     int
 	leaderModel    string
+	// fused 非 nil 时取票请求用它的 prompt，并把正文当第一份指纹样本带回。
+	fused *KongFingerprintChallenge
 }
 
 // fetchStore 取一张票并入库。不验证——验证由调用方对触发模型那一张单独发起。
@@ -735,7 +779,7 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 		}
 	}
 
-	probe, err := s.upstream.FetchTurnState(ctx, account, in.egressProxyURL, in.model)
+	probe, err := s.upstream.FetchTurnState(ctx, account, in.egressProxyURL, in.model, in.fused)
 	// 活动结束时刻在这里定死，后面存票、清标记、写事件的耗时都不再影响它。事件的 CreatedAt 与
 	// 内存事实用同一个值，两者才对得上——不固定的话持久化的 A 会比真实活动晚上百毫秒，而调度
 	// 判的是「距上次活动多久」。
@@ -790,6 +834,14 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 	if batched {
 		extra["state_fingerprint"] = kongTicketFingerprint(probe.State)
 	}
+	// 标明这次取票是否融合了指纹挑战。**按"是否发起过"记，不按"是否读到答案"记**：读失败时额度
+	// 一样花了，记成 false 会让"额度花在哪了"这个问题答错。读失败另记原因。
+	if probe.FusedAttempted {
+		extra["fused"] = true
+		if probe.FusedReadErr != "" {
+			extra["fused_read_error"] = probe.FusedReadErr
+		}
+	}
 	// 事件在存票之后才写：这样它能带上票 id，验证记录与「这张票是怎么采到的」（出口、静默值）
 	// 才对得上——票缓存会随过期被删，只靠时间相邻去猜是猜不准的。
 	// 一次真实的网络取票**只记一条** fetch 事件，不论入库这一步结果如何：记两条的话成功率统计
@@ -837,6 +889,11 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 	out.ticketID = ticketID
 	out.state = probe.State
 	out.expires = expiresAt
+	// 融合样本随结果带回：调用方拿它当第一份指纹证据。只在这条成功路径上带——失败时那张票压根
+	// 没入库，样本没有可挂的对象。读正文失败也要带，那时样本不可用但要留记录。
+	out.answer = probe.Answer
+	out.fusedAttempted = probe.FusedAttempted
+	out.fusedReadErr = probe.FusedReadErr
 	return out
 }
 
@@ -868,7 +925,7 @@ func (s *KongTicketService) verifyExistingCandidate(ctx context.Context, account
 	if candidate.CaptureEgress != "" || candidate.CaptureIdleSeconds != nil {
 		capture = &kongCaptureFacts{Egress: candidate.CaptureEgress, IdleSeconds: candidate.CaptureIdleSeconds}
 	}
-	return s.verifyTicket(ctx, account, cfg, model, candidate.ID, candidate.State, candidate.Source, candidate.ExpiresAt, capture, taskStartedAt, false)
+	return s.verifyTicket(ctx, account, cfg, model, candidate.ID, candidate.State, candidate.Source, candidate.ExpiresAt, capture, taskStartedAt, false, nil)
 }
 
 // kongVerifySnapshot 是任务发起时的前提快照。
@@ -963,12 +1020,42 @@ type kongCaptureFacts struct {
 // taskStartedAt 是本次任务真正开始的时刻，用作候选淘汰的水位。**必须由调用方传入**：在本函数里
 // 现取会晚于任务开始（代理解析、取票都在前面），那段时间里新到的票会被当成「任务开始时就存在的
 // 旧候选」一起标掉，而它恰恰是唯一的恢复机会（`full + none` 下尤甚）。
+// kongFusedPartIndex 是融合样本在探测记录里的序号。
+//
+// 取 0 而不是 1：常规挑战用 1..N，融合被丢弃后 leader 会重跑一份同样是"第 1 份"的常规样本。两者
+// 共用 1 的话，同一个 verification 下出现两条 part_index=1——页面显示两个第 1 份，离线重算也分不清
+// 先后。0 同时表达了"它发生在所有常规挑战之前"。
+const kongFusedPartIndex = 0
+
+// attrErrText 把归因错误转成可入库的文本，nil 时为空串。
+func attrErrText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// kongFusedSample 是取票请求顺带拿回的第一份指纹样本（融合取票）。
+type kongFusedSample struct {
+	Challenge KongFingerprintChallenge
+	// Answer 为 nil 表示取票成功但正文没读回来（提前 EOF、SSE 错误）。**不能因此当作"没融合"**：
+	// 那次调用已经花了额度，而且按约定要留一条 inconclusive。
+	Answer *KongUpstreamAnswer
+	// ReadErr 是读正文的失败原因，仅在 Answer 为 nil 时有值。
+	ReadErr string
+	// Egress 是这份样本产生时用的出口——**票据出口**，与常规样本的流量出口不同。
+	Egress string
+	// OnlyFused 为真表示不达标时不再发后续挑战。批内非触发模型用它：此刻没有请求在等那张票，
+	// 不值得再花一份长答案，留作候选等它自己的第一个请求。
+	OnlyFused bool
+}
+
 // verifyTicket 的 reverify 为真表示这是**重验一张正在服务的票**（人工「立即验票」），不是候选的
 // 首次验证。两处行为因此不同，理由都是"这张票已经有过一次完整通过的结论"：
 //
 //   - 不淘汰别的候选、不推进取票冷却：那些是候选路径的机制，重验一张旧票失败说明不了出口有问题；
 //   - 证据不完整时不提交 rejected：一份有效回答加两份 429 不足以证伪一个既有结论。
-func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, cfg KongTicketConfig, model string, ticketID int64, state, source string, expiresAt time.Time, capture *kongCaptureFacts, taskStartedAt time.Time, reverify bool) (int64, error) {
+func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, cfg KongTicketConfig, model string, ticketID int64, state, source string, expiresAt time.Time, capture *kongCaptureFacts, taskStartedAt time.Time, reverify bool, fused *kongFusedSample) (int64, error) {
 	if s.bank == nil {
 		return 0, fmt.Errorf("校准资料未加载，无法验证")
 	}
@@ -1146,8 +1233,125 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	var (
 		answers []KongFingerprintAnswer
 		result  *KongFingerprintResult
+		// fusedAccepted 只由融合样本达标置真。**不能用 `result != nil` 代替**：循环体每轮都会
+		// 给 result 赋值（它是"到目前为止的累计归因"），拿它当跳过条件会让三份挑战退化成一份。
+		fusedAccepted bool
 	)
+	// takeAnswer 把一份回答计入证据、回填该份的观测字段，返回累计归因。
+	//
+	// 抽出来是因为融合样本与常规挑战必须走**同一套**归因与回填：两处各写一遍的话，其中一处漏填
+	// 就会让那类样本在探测记录里少一个维度，而事后分析看不出少了什么。
+	takeAnswer := func(probe *KongFingerprintProbe, text string, expected int) (*KongFingerprintResult, error) {
+		answers = append(answers, KongFingerprintAnswer{Text: text, ExpectedCount: expected})
+		attributed, attrErr := KongFingerprintAttribute(answers, s.bank)
+		if attributed != nil && len(attributed.Parts) > 0 {
+			part := attributed.Parts[len(attributed.Parts)-1]
+			probe.Digits = part.Numbers
+			probe.DigitCount = part.ParsedNumbers
+			probe.ParseValid = part.Accepted
+			probe.CountedInAverage = part.Accepted
+			if part.Accepted {
+				probe.Scores = kongScoresByModel(part.Scores, s.bank)
+				if pred, ok := KongFingerprintPartPrediction(part, s.bank); ok {
+					probe.PartAttribution = kongStrPtr(pred)
+				}
+			} else if part.InvalidReason != "" {
+				probe.InvalidReason = kongStrPtr(part.InvalidReason)
+			}
+		}
+		return attributed, attrErr
+	}
+
+	// ---- 融合样本：取票请求顺带拿回的第一份 ----
+	//
+	// 取票那次响应本就是这张票所钉住的目标生成的（turn-state 是 sticky-routing token），所以它能
+	// 当第一份指纹样本用，省掉一次往返。但它与常规样本的产生条件不同——**在票据出口上、且当时没有
+	// 注入票**，所以未达标时刻意不据它判不合格：那可能只是"打票出口上的档位"，而票在流量出口上仍
+	// 然可用，据此作废就是无谓拒服。
+	if fused != nil {
+		// 融合样本占序号 0：常规挑战从 1 起。**不能与常规首份共用 1**——融合被丢弃后 leader 会重跑
+		// 一份同样是第 1 份的常规样本，同一个 verification 下出现两条 part_index=1，页面显示两个
+		// "第 1 份"，离线重算也分不清先后。
+		probe := newProbe(kongFusedPartIndex, fused.Challenge.ID)
+		// 这一份的验证出口是**票据出口**，与常规样本不同，必须如实记——混算会直接毁掉"哪个出口
+		// 取到好票"这个判断。
+		probe.VerifyEgress = fused.Egress
+		probe.Fused = true
+		// 耗时与 token 用量照常回填：这一份同样是一次真实调用，"额度花在哪了"要靠它们回答。
+		if fused.Answer != nil {
+			probe.LatencyMs = kongIntPtr(fused.Answer.LatencyMs)
+			probe.OutputTokens = fused.Answer.OutputTokens
+		}
+
+		var attributed *KongFingerprintResult
+		var attrErr error
+		reason := "fused_unreadable"
+		if fused.Answer == nil {
+			// 取票成功但正文没读回来（提前 EOF、SSE 错误）。样本不可用，但**票是好的**——留档、
+			// 记一条 inconclusive，绝不因此丢票。
+			attrErr = fmt.Errorf("融合取票没有拿回可用正文")
+			if fused.ReadErr != "" {
+				attrErr = fmt.Errorf("融合取票读取正文失败: %s", fused.ReadErr)
+			}
+			probe.InvalidReason = kongStrPtr(KongProbeInvalidTruncated)
+		} else {
+			attributed, attrErr = takeAnswer(probe, fused.Answer.Text, fused.Challenge.ExpectedCount)
+			if attributed != nil {
+				probe.CumProbability = &attributed.Probability
+				probe.TemperatureTier = kongIntPtr(kongTierToInt(attributed.CalibrationTier))
+			}
+			reason = "fused_insufficient"
+			if attrErr != nil {
+				reason = "fused_unparsable"
+			}
+		}
+
+		if attrErr == nil && s.accept.Accepts(model, kongProbsOf(attributed), s.confidence) {
+			// 达标：一次上游请求就完成了取票 + 验票，后面整个挑战循环都不必跑。
+			result = attributed
+			fusedAccepted = true
+			probes = append(probes, probe)
+		} else {
+			// 不达标：丢弃这份样本，按常规路径重跑（带票、走流量出口）。混进后续样本会让归因概率
+			// 失去意义——两类样本的产生条件不同，而"证据不完整"那条保护也是按同条件样本设计的。
+			//
+			// **观测留档但必须标成不采用**：不置假的话，离线按 counted_in_average 重算会把这份
+			// 混回去，得出与线上不同的结论。
+			probe.DiscardedReason = reason
+			probe.CountedInAverage = false
+			probes = append(probes, probe)
+			answers = nil
+			if fused.OnlyFused {
+				// 批内非触发模型：此刻没有请求在等这张票，不值得再花一份长答案去重跑——票留在
+				// 候选池，等该模型自己的第一个请求按常规路径验。
+				//
+				// 只落**一条**最终记录：failBeforeConclusion 自己会存探测并写最终事件，这里再
+				// 显式存一次会让同一份观测入库两遍（真实仓储是普通 INSERT，不去重）。
+				return failBeforeConclusion(KongOutcomeInconclusive,
+					map[string]any{
+						"reason": reason, "fused": true, "retry": false,
+						"detail": attrErrText(attrErr),
+					},
+					fmt.Errorf("融合样本不足以判定，留作候选: %w", attrErr))
+			}
+			// leader 有请求在等，值得重跑。阶段事件说明这一份为什么被丢弃。
+			s.logEvent(ctx, &KongTicketEvent{
+				AccountID: account.ID, Model: model, EventType: KongEventVerify,
+				Outcome: KongOutcomeInconclusive, TicketID: &ticketID,
+				TicketEgress: fused.Egress, TrafficEgress: trafficEgress,
+				Detail: map[string]any{
+					"reason": reason, "fused": true, "verification_id": verificationID,
+					"final": false, "retry": true, "detail": attrErrText(attrErr),
+				},
+			})
+		}
+	}
+
+	// 融合样本已判定接受时整个循环都不跑——那次取票请求就是全部证据。
 	for i, challenge := range KongFingerprintChallenges() {
+		if fusedAccepted {
+			break
+		}
 		// 每次主动请求之前复核：前提已经不成立时继续打上游只是白烧额度。
 		if lost := s.recheckVerify(ctx, snap, time.Now()); lost != nil {
 			probe := newProbe(i+1, challenge.ID)
@@ -1197,23 +1401,7 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 				ErrKongTicketNotAccepted)
 		}
 
-		answers = append(answers, KongFingerprintAnswer{Text: answer.Text, ExpectedCount: challenge.ExpectedCount})
-		attributed, attrErr := KongFingerprintAttribute(answers, s.bank)
-		if attributed != nil && len(attributed.Parts) > 0 {
-			part := attributed.Parts[len(attributed.Parts)-1]
-			probe.Digits = part.Numbers
-			probe.DigitCount = part.ParsedNumbers
-			probe.ParseValid = part.Accepted
-			probe.CountedInAverage = part.Accepted
-			if part.Accepted {
-				probe.Scores = kongScoresByModel(part.Scores, s.bank)
-				if pred, ok := KongFingerprintPartPrediction(part, s.bank); ok {
-					probe.PartAttribution = kongStrPtr(pred)
-				}
-			} else if part.InvalidReason != "" {
-				probe.InvalidReason = kongStrPtr(part.InvalidReason)
-			}
-		}
+		attributed, attrErr := takeAnswer(probe, answer.Text, challenge.ExpectedCount)
 		if attrErr != nil {
 			// 还没有任何可用回答。留下这一份的观测，继续下一条挑战。
 			probes = append(probes, probe)
@@ -1698,7 +1886,7 @@ func (s *KongTicketService) maybeObserveProbe(ctx context.Context, accountID int
 		defer cancel()
 		defer s.releaseTask(accountID, task)
 		// 诊断只求一个结论，不授予服务资格——observe 模式本来就不注入。
-		_, _ = s.verifyTicket(detached, account, cfg, model, ticketID, state, KongTicketSourceObserved, expiresAt, nil, probeStartedAt, false)
+		_, _ = s.verifyTicket(detached, account, cfg, model, ticketID, state, KongTicketSourceObserved, expiresAt, nil, probeStartedAt, false, nil)
 	}()
 }
 
@@ -1958,7 +2146,7 @@ func (s *KongTicketService) verifyOneManually(ctx, tctx context.Context, account
 ) (KongManualVerifyStep, error, error) {
 	step := KongManualVerifyStep{TicketID: ticket.ID, Candidate: !reverify}
 	granted, verifyErr := s.verifyTicket(tctx, account, cfg, model, ticket.ID, ticket.State,
-		ticket.Source, ticket.ExpiresAt, kongCaptureOf(ticket), time.Now(), reverify)
+		ticket.Source, ticket.ExpiresAt, kongCaptureOf(ticket), time.Now(), reverify, nil)
 	if granted != 0 && verifyErr == nil {
 		step.Accepted = true
 		return step, nil, nil

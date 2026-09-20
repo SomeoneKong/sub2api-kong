@@ -39,7 +39,7 @@ func TestKongVerifyDoesNotGrantWhenCommitFails(t *testing.T) {
 	cfg, _ := ParseKongTicketConfig(account.Extra)
 
 	id, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-		7, strings.Repeat("a", 292), KongTicketSourceFetch, time.Now().Add(time.Hour), nil, time.Now(), false)
+		7, strings.Repeat("a", 292), KongTicketSourceFetch, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
 	if err == nil || id != 0 {
 		t.Fatalf("提交失败时不该授予资格，得到 id=%d err=%v", id, err)
 	}
@@ -74,7 +74,7 @@ func TestKongVerifyConsumesCandidateBudgetOnNonTargetModel(t *testing.T) {
 	cfg, _ := ParseKongTicketConfig(account.Extra)
 
 	id, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-		7, strings.Repeat("a", 292), KongTicketSourceFetch, time.Now().Add(time.Hour), nil, time.Now(), false)
+		7, strings.Repeat("a", 292), KongTicketSourceFetch, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
 	if err == nil || id != 0 {
 		t.Fatalf("非目标归因不该授予资格，得到 id=%d err=%v", id, err)
 	}

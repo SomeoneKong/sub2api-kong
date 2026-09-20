@@ -20,13 +20,19 @@ const (
 
 // kongBatchService 造一个门控两个模型、按需开关批量取票的服务。
 func kongBatchService(t *testing.T, repo *kongStubRepo, up *kongStubUpstream, accounts *kongStubAccounts, batch bool) *KongTicketService {
+	return kongBatchServiceWith(t, repo, up, accounts, batch, false)
+}
+
+func kongBatchServiceWith(t *testing.T, repo *kongStubRepo, up *kongStubUpstream,
+	accounts *kongStubAccounts, batch, fused bool,
+) *KongTicketService {
 	t.Helper()
 	bank, err := KongFingerprintBankLoad()
 	if err != nil {
 		t.Fatalf("加载校准资料: %v", err)
 	}
 	return NewKongTicketService(repo, up, accounts, bank, KongDefaultTicketParams(),
-		[]string{kongBatchAstra, kongBatchSol}, batch,
+		[]string{kongBatchAstra, kongBatchSol}, batch, fused,
 		KongTicketAccept{
 			kongBatchAstra: []string{kongBatchAstra},
 			kongBatchSol:   []string{kongBatchSol, kongBatchAstra},
@@ -46,6 +52,19 @@ func kongBatchSetup(t *testing.T, up *kongStubUpstream, batch bool) (*KongTicket
 	account.ProxyID = &proxyID
 	accounts.set(account)
 	return kongBatchService(t, repo, up, accounts, batch), repo
+}
+
+func kongFusedSetup(t *testing.T, up *kongStubUpstream, batch bool) (*KongTicketService, *kongStubRepo) {
+	t.Helper()
+	repo := newKongStubRepo()
+	idleSince := time.Now().Add(-40 * time.Minute)
+	repo.lastEgressUsed = &idleSince
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	account := kongTestAccount(1, KongTicketModeFull, KongTicketEgressDirect)
+	proxyID := int64(100)
+	account.ProxyID = &proxyID
+	accounts.set(account)
+	return kongBatchServiceWith(t, repo, up, accounts, batch, true), repo
 }
 
 // kongFetchEvents 取所有真实取票事件（fetch，不含 fetch_skipped）。
@@ -439,5 +458,187 @@ func TestKongRefreshWindowPrefersCandidateOverFetch(t *testing.T) {
 	in.HasCandidate, in.CandidateID = false, 0
 	if got := KongDecideTicketAction(in); got.Action != KongActionInjectAndPrefetch {
 		t.Fatalf("没有候选时才该预取，实得 %s", got.Action)
+	}
+}
+
+// 融合取票：取票请求顺带拿回的那一份就够判定时，**一次上游请求完成取票 + 验票**，不再发任何挑战。
+func TestKongFusedFetchNeedsNoChallenge(t *testing.T) {
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		fetchState: strings.Repeat("a", 292),
+		answers:    kongVerifyAnswers(),
+		// 取票请求要回的正文用同一份合格答案：它归因到 sol，而 sol 的白名单含 sol。
+		fusedText: kongVerifyAnswers()[0].Text,
+	}
+	svc, repo := kongFusedSetup(t, up, false)
+	// 放宽白名单让**一份**样本就过门槛：生产实测多数验证一份即接受，而合成答案的单份归因偏低。
+	// 这条用例要测的是"够用时不再发挑战"，不是门槛本身。
+	svc.accept = KongTicketAccept{kongBatchSol: []string{kongBatchSol, kongBatchAstra, "gpt-5.5"}}
+
+	grant, err := svc.EnsureTicket(context.Background(), 1, kongBatchSol)
+	if err != nil {
+		t.Fatalf("取票: %v", err)
+	}
+	if !grant.Allowed {
+		t.Fatalf("融合样本已达标，应当拿到票：%+v", grant)
+	}
+	if up.fusedCalls != 1 {
+		t.Fatalf("取票该带融合挑战，实际带了 %d 次", up.fusedCalls)
+	}
+	// 这是本功能的全部收益：验证不再需要独立的上游请求。
+	if up.challengeCall != 0 {
+		t.Fatalf("融合样本够用时不该再发挑战，实际发了 %d 份", up.challengeCall)
+	}
+	// 探测记录要标明这一份来自取票请求、且出口是**票据出口**，否则事后分析会把两类样本混算。
+	if len(repo.probes) != 1 {
+		t.Fatalf("应当留下一份探测记录，实得 %d", len(repo.probes))
+	}
+	if !repo.probes[0].Fused {
+		t.Error("融合样本必须标记出来")
+	}
+	if repo.probes[0].VerifyEgress != KongEgressKey(KongTicketEgressDirect, nil) {
+		t.Errorf("融合样本的验证出口应是票据出口，实得 %q", repo.probes[0].VerifyEgress)
+	}
+}
+
+// 融合样本不够判定时**丢弃重跑**：不据它判不合格（它在票据出口上产生、当时没注入票），而是按常规
+// 路径重新发三份挑战。
+func TestKongFusedInsufficientFallsBackToChallenges(t *testing.T) {
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		fetchState: strings.Repeat("a", 292),
+		answers:    kongVerifyAnswers(),
+		// 融合样本是个解析不出数字的回答：归因跑不出来。
+		fusedText: "no digits here",
+	}
+	svc, repo := kongFusedSetup(t, up, false)
+
+	grant, err := svc.EnsureTicket(context.Background(), 1, kongBatchSol)
+	if err != nil {
+		t.Fatalf("取票: %v", err)
+	}
+	// 重跑之后照常拿到票——融合失败不该让这次请求拒服。
+	if !grant.Allowed {
+		t.Fatalf("重跑后应当拿到票：%+v", grant)
+	}
+	if up.challengeCall == 0 {
+		t.Fatal("融合样本不够时必须按常规路径重跑挑战")
+	}
+	// 留一条 inconclusive 记录：它花了额度，且"没测出来"与"测出不合格"必须分得开。
+	var fusedNotes int
+	for _, ev := range repo.events {
+		if ev.EventType == KongEventVerify && ev.Outcome == KongOutcomeInconclusive {
+			if fused, _ := ev.Detail["fused"].(bool); fused {
+				fusedNotes++
+			}
+		}
+	}
+	if fusedNotes != 1 {
+		t.Fatalf("应当留下一条融合未达标的 inconclusive 记录，实得 %d", fusedNotes)
+	}
+}
+
+// 批内**非触发模型**也融合：它的票够判定就地落成 verified，省掉它自己第一个请求的验证等待。
+func TestKongFusedSettlesNonLeaderTicket(t *testing.T) {
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		fetchState: strings.Repeat("a", 292),
+		answers:    kongVerifyAnswers(),
+		fusedText:  kongVerifyAnswers()[0].Text,
+	}
+	svc, repo := kongFusedSetup(t, up, true)
+	// 同上：让一份样本就过门槛，两个模型都靠融合判定。
+	svc.accept = KongTicketAccept{
+		kongBatchSol:   []string{kongBatchSol, kongBatchAstra, "gpt-5.5"},
+		kongBatchAstra: []string{kongBatchAstra, kongBatchSol, "gpt-5.5"},
+	}
+
+	if _, err := svc.EnsureTicket(context.Background(), 1, kongBatchSol); err != nil {
+		t.Fatalf("取票: %v", err)
+	}
+	if up.fusedCalls != 2 {
+		t.Fatalf("批内两个模型都该带融合挑战，实际 %d", up.fusedCalls)
+	}
+	// 非触发模型那张票应当已经是 verified——这正是"不用单独排验票请求"。
+	astra, err := kongPickCurrent(context.Background(), repo, svc.accept, svc.confidence, 1, kongBatchAstra)
+	if err != nil {
+		t.Fatalf("读非触发模型的当前票: %v", err)
+	}
+	if astra == nil {
+		t.Fatal("非触发模型的票应当已被融合样本验成可用")
+	}
+	if up.challengeCall != 0 {
+		t.Fatalf("两个模型都靠融合样本判定，不该发独立挑战，实际 %d 份", up.challengeCall)
+	}
+}
+
+// 批内非触发模型的融合样本不够时**不重跑**：此刻没有请求在等它，不值得再花一份长答案。
+func TestKongFusedNonLeaderDoesNotRetry(t *testing.T) {
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		fetchState: strings.Repeat("a", 292),
+		answers:    kongVerifyAnswers(),
+		fusedText:  "no digits here",
+	}
+	svc, repo := kongFusedSetup(t, up, true)
+
+	if _, err := svc.EnsureTicket(context.Background(), 1, kongBatchSol); err != nil {
+		t.Fatalf("取票: %v", err)
+	}
+	// 触发模型会重跑（有请求在等），所以挑战次数应当正好是它一个模型的份额。
+	if up.challengeCall > len(KongFingerprintChallenges()) {
+		t.Fatalf("非触发模型不该重跑挑战，总挑战数 %d 超过一个模型的上限 %d",
+			up.challengeCall, len(KongFingerprintChallenges()))
+	}
+	// 非触发模型那张票留在候选池，不该被判成 rejected。
+	astra, err := repo.NewestCandidate(context.Background(), 1, kongBatchAstra, time.Now())
+	if err != nil {
+		t.Fatalf("读候选: %v", err)
+	}
+	if astra == nil {
+		t.Fatal("非触发模型的票该留在候选池等下一次机会")
+	}
+}
+
+// 融合正文读失败：票要留着（取票花了一整段静默），而且**必须留一条 inconclusive**——那次调用已经
+// 花了额度，装作没融合就什么记录都没有。
+func TestKongFusedReadFailureKeepsTicketAndRecords(t *testing.T) {
+	up := &kongStubUpstream{
+		proxyState:   KongTicketProxyState{Exists: true},
+		fetchState:   strings.Repeat("a", 292),
+		answers:      kongVerifyAnswers(),
+		fusedReadErr: "unexpected EOF",
+	}
+	svc, repo := kongFusedSetup(t, up, false)
+
+	if _, err := svc.EnsureTicket(context.Background(), 1, kongBatchSol); err != nil {
+		t.Fatalf("取票: %v", err)
+	}
+	// 票照常入库。
+	if len(repo.inserted) == 0 {
+		t.Fatal("读正文失败不该让票丢掉——取票花的是一整段出口静默")
+	}
+	// fetch 事件要记 fused=true（额度花了）并带上失败原因。
+	var fusedFetch, fusedNote int
+	for _, ev := range repo.events {
+		if ev.EventType == KongEventFetch {
+			if f, _ := ev.Detail["fused"].(bool); f {
+				fusedFetch++
+				if _, ok := ev.Detail["fused_read_error"]; !ok {
+					t.Error("读失败要记原因，否则事后看不出这次融合为什么没产出样本")
+				}
+			}
+		}
+		if ev.EventType == KongEventVerify && ev.Outcome == KongOutcomeInconclusive {
+			if f, _ := ev.Detail["fused"].(bool); f {
+				fusedNote++
+			}
+		}
+	}
+	if fusedFetch != 1 {
+		t.Fatalf("fetch 事件该按「是否发起过融合」记，实得 %d", fusedFetch)
+	}
+	if fusedNote == 0 {
+		t.Fatal("读失败要留一条融合的 inconclusive 记录")
 	}
 }

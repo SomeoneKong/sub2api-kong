@@ -29,6 +29,12 @@ type kongStubUpstream struct {
 
 	// answers 按调用顺序返回；用尽后重复最后一个。
 	answers []*KongUpstreamAnswer
+	// fusedCalls 记有多少次取票带了融合挑战；fusedText 是取票请求要回的正文（空表示不给答案，
+	// 用来构造"融合开着但上游没给正文"这种局面）。
+	fusedCalls int
+	fusedText  string
+	// fusedReadErr 非空时模拟"票拿到了、但正文读失败"（提前 EOF / SSE 错误）。
+	fusedReadErr string
 	// answerErrFor 按调用序号（从 0 起）覆盖挑战结果，用来构造"一份有效 + 两份失败"这种局面。
 	answerErrFor  map[int]error
 	answerErr     error
@@ -46,13 +52,18 @@ func (u *kongStubUpstream) ProxyState(_ context.Context, _ *int64) (KongTicketPr
 	return u.proxyState, u.proxyErr
 }
 
-func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, model string) (*KongUpstreamProbe, error) {
+func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, model string,
+	fused *KongFingerprintChallenge,
+) (*KongUpstreamProbe, error) {
 	u.mu.Lock()
 	u.fetchCalls++
 	hook := u.fetchHook
 	// 按模型覆盖：批量取票要能构造「触发模型成功、另一个模型失败」这种局面。
 	modelErr, hasModelErr := u.fetchErrFor[model]
 	modelState, hasModelState := u.fetchStateFor[model]
+	if fused != nil {
+		u.fusedCalls++
+	}
 	u.mu.Unlock()
 	if hook != nil {
 		hook()
@@ -63,10 +74,34 @@ func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, mode
 	if u.fetchErr != nil {
 		return &KongUpstreamProbe{StatusCode: 500}, u.fetchErr
 	}
+	state := u.fetchState
 	if hasModelState {
-		return &KongUpstreamProbe{State: modelState, StatusCode: 200}, nil
+		state = modelState
 	}
-	return &KongUpstreamProbe{State: u.fetchState, StatusCode: 200}, nil
+	probe := &KongUpstreamProbe{State: state, StatusCode: 200}
+	// 生产侧在融合时把正文读回来当第一份样本。桩照做，否则融合路径在测试里根本走不到。
+	//
+	// **FusedAttempted 必须照生产设**：它表示"发起过融合"，与是否读到答案分开。下游用它判断要不要
+	// 留处置记录——桩不设的话，"读正文失败"那条路径在测试里等于不存在。
+	if fused != nil {
+		u.mu.Lock()
+		text := u.fusedText
+		readErr := u.fusedReadErr
+		u.mu.Unlock()
+		probe.FusedAttempted = true
+		switch {
+		case readErr != "":
+			probe.FusedReadErr = readErr
+		case text != "":
+			probe.Answer = &KongUpstreamAnswer{
+				Text: text, EchoedState: state, StatusCode: 200,
+				LatencyMs: 28000, OutputTokens: kongIntPtr(1200),
+			}
+		default:
+			probe.FusedReadErr = "桩未提供融合正文"
+		}
+	}
+	return probe, nil
 }
 
 func (u *kongStubUpstream) RunChallenge(_ context.Context, _ *Account, _, _ string, _ KongFingerprintChallenge, _ string) (*KongUpstreamAnswer, error) {
@@ -129,10 +164,10 @@ func kongTestService(t *testing.T, repo *kongStubRepo, up *kongStubUpstream, acc
 		t.Fatalf("加载校准资料: %v", err)
 	}
 	params := KongDefaultTicketParams()
-	// 默认关掉批量取票：绝大多数用例只关心单模型路径，开着会让它们凭空多发几次取票。
-	// 批量取票自己的用例显式打开（见 kong_ticket_batch_fetch_test.go）。
+	// 默认关掉批量取票与融合取票：绝大多数用例只关心单模型、单挑战路径，开着会让它们凭空多发
+	// 几次取票、或把取票响应也当成一份样本。两者各自的用例显式打开。
 	return NewKongTicketService(repo, up, accounts, bank, params,
-		[]string{"gpt-6-astra"}, false,
+		[]string{"gpt-6-astra"}, false, false,
 		KongTicketAccept{"gpt-6-astra": []string{"gpt-6-astra"}}, 0.9)
 }
 
@@ -218,7 +253,7 @@ func TestKongObservedFailureDoesNotEnterCooldown(t *testing.T) {
 
 			cfg, _ := ParseKongTicketConfig(account.Extra)
 			_, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-				7, strings.Repeat("a", 292), c.source, time.Now().Add(time.Hour), nil, time.Now(), false)
+				7, strings.Repeat("a", 292), c.source, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
 			if err == nil {
 				t.Fatal("数字不足时不该判为合格")
 			}
@@ -245,7 +280,7 @@ func TestKongProbesKeepDigitsWhenAttributionFails(t *testing.T) {
 
 	cfg, _ := ParseKongTicketConfig(account.Extra)
 	_, _ = svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-		7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now(), false)
+		7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
 
 	if len(repo.probes) == 0 {
 		t.Fatal("没有任何探测记录落库")
@@ -300,7 +335,7 @@ func TestKongVerifyRejectsStaleConclusion(t *testing.T) {
 			accounts.set(changed)
 
 			_, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-				7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now(), false)
+				7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
 			if err == nil {
 				t.Fatal("前提已失效，不该给出有效结论")
 			}
@@ -337,7 +372,7 @@ func TestKongVerifyHonorsStatusUpdateResult(t *testing.T) {
 	cfg, _ := ParseKongTicketConfig(account.Extra)
 
 	id, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-		7, strings.Repeat("a", 292), KongTicketSourceFetch, time.Now().Add(time.Hour), nil, time.Now(), false)
+		7, strings.Repeat("a", 292), KongTicketSourceFetch, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
 	if err == nil || id != 0 {
 		t.Fatalf("状态未更新时不该授予资格，得到 id=%d err=%v", id, err)
 	}
