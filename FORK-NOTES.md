@@ -52,6 +52,11 @@
 
 ## 本地验证的已知差异
 
+⚠️ **判断测试是否通过只看 `go test` 自己的退出码或完整的 FAIL 计数。** 上游测试会往 stderr 打
+大量日志（`[Billing] Using fallback pricing...` 之类），所以
+`go test ./... | grep -v '^ok' | head -20` 这种写法会被日志噪音占满前几十行、把 FAIL 行整段切掉，
+而管道的退出码来自 `head` 不是 `go test`——两头都在骗人，结果是"全绿"的假象。
+
 `go test -tags=unit ./internal/service/` 在 Windows 上会有一个上游测试失败：
 `TestOllamaProbeCallback_StaleLongDoesNotOverrideNewShort`（`stale long callback must not pass
 the CAS`）。**它在纯上游基线 tag 上同样失败**，与本 fork 的定制无关，CI（Linux）也是绿的——
