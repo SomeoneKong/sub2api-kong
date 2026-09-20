@@ -8,7 +8,9 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -425,5 +427,126 @@ func TestKongFusedReadFailureStillCarriesReportedModel(t *testing.T) {
 				t.Error("融合失败事件里读不回上游回报的 model")
 			}
 		})
+	}
+}
+
+// 零 mismatch 是最常见的情况，它的序列化结果必须是 `[]` 而不是 `null`——前端按数组读它。
+func TestKongStg0StatsSerializesEmptyListAsArray(t *testing.T) {
+	stats := &KongStg0Stats{
+		AccountID: 1, Model: kongBatchAstra, Total: 11550,
+		TopReported: []KongStg0Reported{},
+	}
+	encoded, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("序列化: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"top_reported":[]`) {
+		t.Errorf("空列表要序列化成 []，实得 %s", encoded)
+	}
+	// 反面：留成 nil 就会变 null，那会让前端读 .length 时打崩整个页面。
+	nilled := &KongStg0Stats{AccountID: 1, Model: kongBatchAstra, Total: 1}
+	encoded, err = json.Marshal(nilled)
+	if err != nil {
+		t.Fatalf("序列化: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"top_reported":null`) {
+		t.Errorf("这条断言在提醒：nil 切片确实会变 null，所以仓储必须显式给空切片，实得 %s", encoded)
+	}
+}
+
+// 详情页要能区分"结论来自哪一层"：stg0 是上游自己回报的 model，不是一次指纹测量。
+//
+// stg0 判死票时会把回报值当归因结果写进票行（p=1、单点分布），那是为了让下游统一按概率工作。但页面
+// 照 p 显示就成了"指纹归因，置信度 1.00"——把一句声明呈现成确定性测量。来源取自该票已提交的最终验证
+// 事件，**不按 p == 1 猜**：stg1 的概率也可以恰好是 1。
+func TestKongTicketDetailDistinguishesStg0Conclusion(t *testing.T) {
+	const model = kongBatchAstra
+	repo, _, svc := kongManualFixture(t, model)
+	now := time.Now()
+	stg0Ticket := kongSeedCurrentTicket(repo, model, now)
+	stg1Ticket := kongSeedCandidate(repo, model, 21, 5*time.Minute)
+	noEventTicket := kongSeedCandidate(repo, model, 22, 6*time.Minute)
+
+	// 已提交归因的最终事件：两条提交路径都会填 FingerprintModel（stg0 填回报值、stg1 填 argmax）。
+	final := func(ticketID int64, at time.Time, fingerprint string, detail map[string]any) *KongTicketEvent {
+		detail["final"] = true
+		ev := &KongTicketEvent{
+			AccountID: 1, Model: model, EventType: KongEventVerify,
+			Outcome: KongOutcomeFailure, TicketID: &ticketID, CreatedAt: at, Detail: detail,
+		}
+		if fingerprint != "" {
+			ev.FingerprintModel = kongStrPtr(fingerprint)
+		}
+		return ev
+	}
+	ctx := context.Background()
+	// 同一张票先有一条 stg1 结论、后被重验为 stg0：取最新那条，顺序由事件时间决定。
+	if err := repo.InsertEvent(ctx, final(stg0Ticket.ID, now.Add(-10*time.Minute), model,
+		map[string]any{"reason": "not_target_model", "probability": 0.42})); err != nil {
+		t.Fatalf("写事件: %v", err)
+	}
+	if err := repo.InsertEvent(ctx, final(stg0Ticket.ID, now.Add(-5*time.Minute), "gpt-5.6-luna",
+		map[string]any{"reason": "stg0_model_mismatch", "stg": float64(0), "reported_model": "gpt-5.6-luna"})); err != nil {
+		t.Fatalf("写事件: %v", err)
+	}
+	// **之后的人工重验以 inconclusive 收尾**：那也是一条最终事件，但它没有提交归因，票行仍挂着 stg0
+	// 的回报值。据它改写来源会让页面把这张票重新显示成"指纹归因 p=1.00"。
+	if err := repo.InsertEvent(ctx, final(stg0Ticket.ID, now.Add(-time.Minute), "",
+		map[string]any{"reason": "no_valid_answer"})); err != nil {
+		t.Fatalf("写事件: %v", err)
+	}
+	if err := repo.InsertEvent(ctx, final(stg1Ticket.ID, now.Add(-2*time.Minute), model,
+		map[string]any{"reason": "not_target_model", "probability": 1.0})); err != nil {
+		t.Fatalf("写事件: %v", err)
+	}
+	// **一张票被反复重验**：已提交的那条结论之后又追加了四条未提交归因的最终事件。按"先取一批再在应用层
+	// 筛"的做法，那批里一条已提交的都不剩，来源于是丢失、页面落回概率展示分支。
+	for i := 0; i < 4; i++ {
+		if err := repo.InsertEvent(ctx, final(stg0Ticket.ID, now.Add(time.Duration(i)*time.Second), "",
+			map[string]any{"reason": "no_valid_answer"})); err != nil {
+			t.Fatalf("写事件: %v", err)
+		}
+	}
+	// 非最终事件不得参与判定：它是"某一份挑战失败"，不是本次验证的结论。
+	nonFinal := &KongTicketEvent{
+		AccountID: 1, Model: model, EventType: KongEventVerify, Outcome: KongOutcomeInconclusive,
+		TicketID: &noEventTicket.ID, CreatedAt: now,
+		Detail: map[string]any{"reason": "fused_unreadable", "stg": float64(0)},
+	}
+	if err := repo.InsertEvent(ctx, nonFinal); err != nil {
+		t.Fatalf("写事件: %v", err)
+	}
+
+	views := &kongStubAdminAccounts{views: []KongAccountView{
+		{ID: 1, Ready: true, Extra: map[string]any{KongTicketModeKey: string(KongTicketModeFull)}},
+	}}
+	admin := NewKongTicketAdminService(repo, views, KongDefaultTicketParams(),
+		[]string{model}, svc.accept, svc.confidence)
+	admin.SetTicketService(svc)
+
+	page, err := admin.TicketDetail(ctx, 1)
+	if err != nil {
+		t.Fatalf("票据详情: %v", err)
+	}
+	// 解引用成可读的值：`%v` 打指针只会给出地址，排查时看不出实际来源。
+	got := map[int64]string{}
+	for _, row := range page.Tickets {
+		if row.Stg == nil {
+			got[row.ID] = "未知"
+			continue
+		}
+		got[row.ID] = strconv.Itoa(*row.Stg)
+	}
+	if got[stg0Ticket.ID] != "0" {
+		t.Errorf("#%d 的结论来自 stg0（之后那条 inconclusive 没提交归因，不该改写来源），实得 %s",
+			stg0Ticket.ID, got[stg0Ticket.ID])
+	}
+	// 概率恰好是 1 的 stg1 结论不能被当成 stg0——这正是"不按 p 猜"的理由。
+	if got[stg1Ticket.ID] != "1" {
+		t.Errorf("#%d 的结论来自 stg1（概率恰好 1.0），实得 %s", stg1Ticket.ID, got[stg1Ticket.ID])
+	}
+	// 只有非最终事件的票仍是"来源未知"：那条事件不是结论。
+	if got[noEventTicket.ID] != "未知" {
+		t.Errorf("#%d 没有已提交的结论，来源应当未知，实得 %s", noEventTicket.ID, got[noEventTicket.ID])
 	}
 }

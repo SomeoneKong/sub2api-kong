@@ -69,7 +69,13 @@
                   {{ t.source }} · {{ t.state_len }}
                 </td>
                 <td class="px-3 py-3 text-xs text-gray-500 dark:text-dark-400">
-                  <template v-if="t.fingerprint_model">
+                  <!-- stg0 的结论是上游自己回报的 model，不是一次指纹测量：不显示概率，也不列档位分布。
+                       票行里那个 p=1 只是为了让下游统一按概率工作，照它显示会把一句声明说成确定性测量。 -->
+                  <template v-if="t.stg === 0 && t.fingerprint_model">
+                    上游回报 {{ t.fingerprint_model }}
+                    <p class="text-gray-400 dark:text-dark-500">stg0，非指纹归因</p>
+                  </template>
+                  <template v-else-if="t.fingerprint_model">
                     {{ t.fingerprint_model }} · p={{ t.fingerprint_p.toFixed(2) }}
                     <!-- 列出各模型的概率：一张票判不合格时，这里才看得出它被归到了哪个档位。 -->
                     <p v-if="probsText(t)" class="text-gray-400 dark:text-dark-500">{{ probsText(t) }}</p>

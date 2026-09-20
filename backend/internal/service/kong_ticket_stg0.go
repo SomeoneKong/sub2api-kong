@@ -138,3 +138,39 @@ func kongModelSnapshotMatch(base, reported string) bool {
 	}
 	return reported[len(prefix)] >= '0' && reported[len(prefix)] <= '9'
 }
+
+// KongStg0Stats 是某个 (账号, 模型) 近若干天的 stg0 观测汇总，数据来自业务请求。
+//
+// 三个计数互斥、相加等于窗口内该模型的受控请求数。Unknown 必须单独显示：它与 Match 是两件事，
+// 全是 Unknown 时"零次不一致"是假的安全感——那说明观测没工作，不是没被降智。
+type KongStg0Stats struct {
+	AccountID int64  `json:"account_id"`
+	Model     string `json:"model"`
+	// Total 是窗口内该 (账号, 模型) 的请求数，也是比例的分母。**与分子同一总体**。
+	Total int64 `json:"total"`
+	// Mismatch 是上游回报了别的模型的次数。
+	Mismatch int64 `json:"mismatch"`
+	// Unknown 是没观测到回报值的次数。
+	Unknown int64 `json:"unknown"`
+	// TopReported 列出 Mismatch 里回报值出现最多的几项。**永远是非 nil 切片**——nil 会序列化成
+	// JSON `null`，而前端按数组读它；零 mismatch 是最常见的情况，留 nil 等于让正常账号打崩页面。
+	//
+	// 没有它，运维看到"mismatch 87%"也不知道该往 stg0_accept 加什么——而上游投放新模型时，那恰好
+	// 是唯一要做的动作。
+	TopReported []KongStg0Reported `json:"top_reported"`
+}
+
+// KongStg0Reported 是一个被回报过的替代模型及其次数。
+type KongStg0Reported struct {
+	Model string `json:"model"`
+	Count int64  `json:"count"`
+}
+
+// MismatchRate 返回不一致占比。Total 为 0 时返回 0，调用方需自行区分"无样本"与"零不一致"
+// ——把无样本显示成 0% 会被读成"查过了、没问题"。
+func (s *KongStg0Stats) MismatchRate() float64 {
+	if s == nil || s.Total <= 0 {
+		return 0
+	}
+	return float64(s.Mismatch) / float64(s.Total)
+}

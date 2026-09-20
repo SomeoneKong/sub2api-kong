@@ -197,6 +197,19 @@
                       <p v-if="m.last_sample" class="text-xs text-gray-500 dark:text-dark-400">
                         取样 {{ sampleText(m.last_sample) }} · {{ formatTime(m.last_sample.at) }}
                       </p>
+                      <!-- stg0（上游回报的 model）近三天的观测。它与上面两行的来源不同：这里统计的是
+                           **业务请求**，样本量比验票高两个数量级，所以比例才有意义。 -->
+                      <p class="text-xs" :class="stg0Class(m.stg0)">
+                        {{ stg0Text(m.stg0) }}
+                      </p>
+                      <!-- 回报值原文是这块信息里最可操作的部分：上游投放新模型时照着它往
+                           stg0_accept 加一条即可。只给比例的话不知道该加什么。 -->
+                      <p
+                        v-if="stg0Reported(m.stg0).length"
+                        class="text-xs text-rose-700 dark:text-rose-300"
+                      >
+                        回报：{{ stg0Reported(m.stg0).map((r) => `${r.model} ×${r.count}`).join('、') }}
+                      </p>
                     </div>
                   </td>
                   <td class="px-3 py-3 text-xs text-gray-600 dark:text-dark-300">
@@ -289,7 +302,12 @@
                   </td>
                   <td class="px-3 py-2 text-xs text-gray-500 dark:text-dark-400">
                     <span v-if="ev.state_len !== null">len={{ ev.state_len }} </span>
-                    <span v-if="topModelsOf(ev).length" class="whitespace-nowrap">
+                    <!-- stg0 事件里的 model 是上游自己回报的，不是指纹归因的产物：标签要区分，
+                         否则两种证据强度完全不同的结论在事件流里长得一样。 -->
+                    <span v-if="stgOf(ev) === 0 && ev.fingerprint_model" class="whitespace-nowrap">
+                      上游回报 {{ ev.fingerprint_model }}
+                    </span>
+                    <span v-else-if="topModelsOf(ev).length" class="whitespace-nowrap">
                       归因
                       <span
                         v-for="(tm, i) in topModelsOf(ev)"
@@ -376,6 +394,7 @@ import EventFilterSelect from './EventFilterSelect.vue'
 import type {
   FingerprintProbe,
   TicketDiagnosis,
+  TicketStg0Stats,
   TicketSummary,
   TicketAccountStatus,
   TicketEgress,
@@ -569,6 +588,35 @@ function sampleText(n: TicketSampleNote): string {
   else parts.push(n.outcome)
   if (n.state_len !== null) parts.push(`长度 ${n.state_len}`)
   return parts.join('，')
+}
+
+// stg0（上游回报的 model）近三天的观测文案。
+//
+// 三种情况必须能分开：**无样本**（窗口内没请求，或统计没查到）、**全都没观测到回报值**、以及
+// 真的有不一致。把第一种显示成 "0%" 会被读成"查过了、没问题"，第二种更危险——它看起来像"没被
+// 降智"，其实是这项观测根本没工作。
+function stg0Text(s: TicketStg0Stats | null): string {
+  if (!s || s.total === 0) return 'stg0（近三天）：无样本'
+  const rate = ((s.mismatch / s.total) * 100).toFixed(2)
+  const parts = [`stg0（近三天）：不一致 ${s.mismatch}/${s.total}（${rate}%）`]
+  if (s.unknown > 0) parts.push(`未观测 ${s.unknown}`)
+  if (s.unknown === s.total) parts.push('← 全部未观测，这个 0 不代表没被降智')
+  return parts.join(' · ')
+}
+
+// top_reported 可能是 null（Go 的 nil 切片序列化结果、历史数据、明细查询失败分支）。
+// **模板里一律经它取数组**：直接读 `.length` 会让零 mismatch 的正常账号打崩整个页面。
+function stg0Reported(s: TicketStg0Stats | null): Array<{ model: string; count: number }> {
+  return s?.top_reported ?? []
+}
+
+function stg0Class(s: TicketStg0Stats | null): string {
+  if (!s || s.total === 0) return 'text-gray-500 dark:text-dark-400'
+  // 有不一致就是红的：那是上游自己声明给了别的模型，比归因更硬的证据。
+  if (s.mismatch > 0) return 'text-red-600 dark:text-red-400'
+  // 一条都没观测到 = 这项观测没在工作，需要注意但不是降智的定论。
+  if (s.unknown === s.total) return 'text-amber-700 dark:text-amber-300'
+  return 'text-gray-500 dark:text-dark-400'
 }
 
 function diagnosisClass(d: TicketDiagnosis): string {
@@ -942,6 +990,13 @@ function outcomeClass(outcome: string): string {
   if (outcome === 'inconclusive') return 'badge-warning'
   if (outcome === 'skipped') return 'badge-gray'
   return 'badge-gray'
+}
+
+// stg 是这条事件的结论出自哪一层：0 = 上游自己回报的 model，缺失即 stg1（含全部历史事件）。
+// 不按「概率是不是 1」去猜——stg1 的概率也可以恰好是 1，而两者的证据强度完全不同。
+function stgOf(ev: TicketEvent): number | null {
+  const raw = ev.detail?.stg
+  return typeof raw === 'number' ? raw : null
 }
 
 // top_models 是归因分布的前三名，由验证事件写进 detail。只看 argmax（fingerprint_model）

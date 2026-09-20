@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -14,7 +15,10 @@ import (
 // 什么都不留痕，这类问题在测试里就看不见。
 
 type kongStubRepo struct {
-	mu sync.Mutex
+	// stg0Stats / stg0Err 由用例预置，供 Stg0Stats 原样交回（聚合逻辑测不到，见该方法注释）。
+	stg0Stats []*KongStg0Stats
+	stg0Err   error
+	mu        sync.Mutex
 
 	current      map[string][]*KongTicket
 	candidates   map[string][]*KongTicket
@@ -548,10 +552,99 @@ func (r *kongStubRepo) InsertEvent(_ context.Context, e *KongTicketEvent) error 
 	return nil
 }
 
-func (r *kongStubRepo) ListEvents(_ context.Context, _ *KongTicketEventFilter) ([]*KongTicketEvent, int, error) {
+// TicketConclusions 按生产口径实现：只认提交了归因的最终事件（`fingerprint_model` 非空），每张票取
+// 事件时间最新的一条，缺 `stg` 键算 stg1。
+//
+// 桩也照这个口径走，否则"未提交的收尾不该改写来源"这条在桩上测不出来——生产是在 SQL 里筛的。
+func (r *kongStubRepo) TicketConclusions(_ context.Context, accountID int64, ticketIDs []int64) (map[int64]int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.events, len(r.events), nil
+	want := map[int64]bool{}
+	for _, id := range ticketIDs {
+		want[id] = true
+	}
+	out := map[int64]int{}
+	newest := map[int64]time.Time{}
+	for _, e := range r.events {
+		switch {
+		case e == nil || e.TicketID == nil || !want[*e.TicketID]:
+			continue
+		case e.AccountID != accountID || e.EventType != KongEventVerify:
+			continue
+		case e.Detail["final"] != true:
+			continue
+		case e.FingerprintModel == nil || *e.FingerprintModel == "":
+			continue
+		}
+		if at, seen := newest[*e.TicketID]; seen && !e.CreatedAt.After(at) {
+			continue
+		}
+		newest[*e.TicketID] = e.CreatedAt
+		if raw, ok := e.Detail["stg"].(float64); ok {
+			out[*e.TicketID] = int(raw)
+		} else {
+			out[*e.TicketID] = 1
+		}
+	}
+	return out, nil
+}
+
+// ListEvents 要按生产口径过滤与排序。
+//
+// 原来它把 filter 整个忽略、原序返回全部事件，于是两类差异测不出来：`FinalOnly` 漏筛会把"某一份挑战
+// 失败"当成本次验证的结论（生产侧那条筛选正是为此加的），而升序返回会让"同一张票取最新那条结论"的
+// 代码在桩上恰好取到最旧的一条——方向反了还全绿。
+func (r *kongStubRepo) ListEvents(_ context.Context, filter *KongTicketEventFilter) ([]*KongTicketEvent, int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	match := func(e *KongTicketEvent) bool {
+		if e == nil {
+			return false
+		}
+		if filter == nil {
+			return true
+		}
+		if len(filter.AccountIDs) > 0 && !slices.Contains(filter.AccountIDs, e.AccountID) {
+			return false
+		}
+		if len(filter.Models) > 0 && !slices.Contains(filter.Models, e.Model) {
+			return false
+		}
+		if len(filter.EventTypes) > 0 && !slices.Contains(filter.EventTypes, e.EventType) {
+			return false
+		}
+		if filter.FinalOnly && e.Detail["final"] != true {
+			return false
+		}
+		if filter.Since != nil && e.CreatedAt.Before(*filter.Since) {
+			return false
+		}
+		if filter.Until != nil && !e.CreatedAt.Before(*filter.Until) {
+			return false
+		}
+		return true
+	}
+	var out []*KongTicketEvent
+	for i := len(r.events) - 1; i >= 0; i-- {
+		// 倒着遍历：生产是 `ORDER BY created_at DESC, id DESC`，插入序即 id 序。
+		if match(r.events[i]) {
+			out = append(out, r.events[i])
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	total := len(out)
+	if filter != nil {
+		if filter.Offset > 0 {
+			if filter.Offset >= len(out) {
+				return nil, total, nil
+			}
+			out = out[filter.Offset:]
+		}
+		if filter.Limit > 0 && filter.Limit < len(out) {
+			out = out[:filter.Limit]
+		}
+	}
+	return out, total, nil
 }
 
 func (r *kongStubRepo) LastEgressActivity(_ context.Context, _ string) (*time.Time, error) {
@@ -669,4 +762,33 @@ func (r *kongStubRepo) ReviveRejectedCandidate(_ context.Context, accountID int6
 	best.SkipUntilNew = false
 	r.revived = append(r.revived, best.ID)
 	return best, nil
+}
+
+// Stg0Stats 返回用例预置的汇总。
+//
+// ⚠️ **聚合逻辑在这里是测不到的**：生产实现是一条打 usage_logs 的 SQL（两次 GROUP BY、
+// FILTER、有效模型表达式），桩只是把预置值原样交回。所以这个方法只够测上层的装配与展示——
+// "分母取错了列""FILTER 写反了"这类错误只能在真库上发现（口径见 PG-VERIFY.md）。
+//
+// 桩不忠实已经在本子系统上咬过多次（最近一次是 fused 列压根没落库而测试全绿），所以这里把
+// 边界写明，而不是让后来人以为统计被测过了。
+func (r *kongStubRepo) Stg0Stats(_ context.Context, models []string, _ time.Time) ([]*KongStg0Stats, error) {
+	if r.stg0Err != nil {
+		return nil, r.stg0Err
+	}
+	want := map[string]bool{}
+	for _, m := range models {
+		want[m] = true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*KongStg0Stats, 0, len(r.stg0Stats))
+	for _, s := range r.stg0Stats {
+		// 照生产口径按模型过滤：用例传的门控集合变了、预置数据没跟着变时，这一条能让它露出来。
+		if s != nil && want[s.Model] {
+			clone := *s
+			out = append(out, &clone)
+		}
+	}
+	return out, nil
 }

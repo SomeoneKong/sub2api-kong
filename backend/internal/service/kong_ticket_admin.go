@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"time"
 )
 
@@ -67,6 +69,11 @@ type KongTicketModelStatus struct {
 	// 它与 CurrentTicket 是两件事：一张旧的 verified astra 票可以还在服务，而最近一次探测已经
 	// 归因为 sol——那正是「该给这个账号开 full 了」的信号。只显示当前票会把这个信号藏起来。
 	Diagnosis *KongTicketDiagnosis `json:"diagnosis"`
+	// Stg0 是近 kongStg0Window 内业务请求上的 stg0 观测汇总（见 kong_ticket_stg0.go）。
+	//
+	// 为空表示该窗口内没有样本、或统计查询失败——两者在页面上都该显示成"无样本"而不是 0%：后者
+	// 会被读成"查过了、没问题"。
+	Stg0 *KongStg0Stats `json:"stg0"`
 	// LastSample 是最近一次**取样**的处置，与 Diagnosis 回答的问题不同。
 	//
 	// 归因结论只在验证真正跑起来时才有。一个账号可能一直在收票、但每张都因长度黑名单（312）
@@ -197,7 +204,61 @@ func (s *KongTicketAdminService) Overview(ctx context.Context, now time.Time) ([
 		}
 		out = append(out, *status)
 	}
+	// stg0 统计**一次查完再分发**：概览是按账号循环的，每账号扫一次 usage_logs 就是 N+1，而这张表
+	// 是全系统最大的。
+	index := s.stg0Index(ctx, now)
+	for i := range out {
+		applyStg0(&out[i], index)
+	}
 	return out, nil
+}
+
+// kongStg0Window 是页面上 stg0 统计的回看窗口。
+//
+// 三天：短到能反映"上游此刻在做什么"（投放策略变化要当天看见），长到样本量够算比例（受控模型的
+// 业务请求量在这个窗口里是千级）。不做成配置项——它只影响一个展示口径，加一个旋钮的代价大于收益。
+const kongStg0Window = 72 * time.Hour
+
+// stg0Index 查一次近期的 stg0 观测汇总，按 (账号, 模型) 建索引。
+//
+// **查不到就返回空索引，不让调用方失败**：票状态才是这个页面的主体，统计是附加信息。但要留一条
+// Warn——静默失败会让"统计一直是空的"看起来像"一直没有不一致"，而那正是这个功能要区分的两件事。
+func (s *KongTicketAdminService) stg0Index(ctx context.Context, now time.Time) map[string]*KongStg0Stats {
+	if len(s.gatedModels) == 0 {
+		return nil
+	}
+	stats, err := s.repo.Stg0Stats(ctx, s.gatedModels, now.Add(-kongStg0Window))
+	if err != nil {
+		slog.Warn("codex 票据：stg0 统计查询失败，该列留空", "error", err)
+		return nil
+	}
+	byKey := make(map[string]*KongStg0Stats, len(stats))
+	for _, st := range stats {
+		if st != nil {
+			byKey[kongStg0StatsKey(st.AccountID, st.Model)] = st
+		}
+	}
+	return byKey
+}
+
+// applyStg0 把索引里的统计挂到一行账号状态的各受控模型上。
+//
+// **每一个对外返回账号状态的入口都要挂**，不只是概览：前端保存配置、取票、验票之后会整行替换，
+// 漏挂的那条路径会把刚显示过的不一致次数与回报值抹成"无样本"——而"无样本"是刻意设计的语义
+// （窗口内没请求），被误触发等于让它失真。
+func applyStg0(row *KongTicketAccountStatus, index map[string]*KongStg0Stats) {
+	if row == nil || len(index) == 0 {
+		return
+	}
+	for j := range row.Models {
+		if st := index[kongStg0StatsKey(row.AccountID, row.Models[j].Model)]; st != nil {
+			row.Models[j].Stg0 = st
+		}
+	}
+}
+
+func kongStg0StatsKey(accountID int64, model string) string {
+	return strconv.FormatInt(accountID, 10) + "\x00" + model
 }
 
 func (s *KongTicketAdminService) statusOf(ctx context.Context, account *KongAccountView, now time.Time) (*KongTicketAccountStatus, error) {
@@ -280,6 +341,19 @@ func (s *KongTicketAdminService) statusOf(ctx context.Context, account *KongAcco
 		modelStatus.LastSample = sample
 		status.Models = append(status.Models, modelStatus)
 	}
+	return status, nil
+}
+
+// statusOfWithStg0 是 statusOf 加上 stg0 统计，供**单账号**入口使用（保存配置、取票、验票、明细页）。
+//
+// 概览不走它：那里按账号循环，每次查一遍 usage_logs 就是 N+1。单账号入口都是人工点击触发、频率低，
+// 各自查一次可接受，换来的是"任何返回账号状态的地方统计都在"。
+func (s *KongTicketAdminService) statusOfWithStg0(ctx context.Context, account *KongAccountView, now time.Time) (*KongTicketAccountStatus, error) {
+	status, err := s.statusOf(ctx, account, now)
+	if err != nil {
+		return nil, err
+	}
+	applyStg0(status, s.stg0Index(ctx, now))
 	return status, nil
 }
 
@@ -425,7 +499,7 @@ func (s *KongTicketAdminService) TriggerRefresh(ctx context.Context, accountID i
 	if err != nil || account == nil {
 		return result, nil, nil
 	}
-	status, err := s.statusOf(ctx, account, time.Now())
+	status, err := s.statusOfWithStg0(ctx, account, time.Now())
 	if err != nil {
 		return result, nil, nil
 	}
@@ -448,7 +522,7 @@ func (s *KongTicketAdminService) TriggerVerify(ctx context.Context, accountID in
 	if err != nil || account == nil {
 		return result, nil, nil
 	}
-	status, err := s.statusOf(ctx, account, time.Now())
+	status, err := s.statusOfWithStg0(ctx, account, time.Now())
 	if err != nil {
 		return result, nil, nil
 	}
@@ -520,7 +594,7 @@ func (s *KongTicketAdminService) UpdateConfig(ctx context.Context, accountID int
 			"egress": string(cfg.Egress),
 		},
 	})
-	return s.statusOf(ctx, account, time.Now())
+	return s.statusOfWithStg0(ctx, account, time.Now())
 }
 
 // ListEvents 分页查事件。
@@ -556,6 +630,14 @@ type KongTicketDetail struct {
 	FingerprintP     float64   `json:"fingerprint_p"`
 	// FingerprintProbs 是各模型的归因概率。页面据它解释"为什么这张判不合格"。
 	FingerprintProbs map[string]float64 `json:"fingerprint_probs"`
+	// Stg 是得出这个结论的那一层：0 = 上游自己回报的 model，1 = 指纹归因。nil = 未知（历史数据）。
+	//
+	// **必须与概率分开看**：stg0 判死票时会把回报值当作归因结果写进票行（P=1、单点分布），那是为了让
+	// 下游全部按 fingerprint_probs 工作、不必到处加分支。但页面照 P 显示就成了"指纹归因，置信度 1.00"
+	// ——把上游的一句声明呈现成一次确定性测量，两者的证据强度完全不同。
+	//
+	// 来源取自该票**已提交的最终验证事件**，不按 `P == 1` 猜：stg1 的概率也可以恰好是 1。
+	Stg *int `json:"stg"`
 	// IsCurrent 为真表示**此刻业务注入的就是它**。两个条件：按当前接受白名单与阈值它是该模型的
 	// 首选票，**且这个账号真的会注入**（`mode=full`）。
 	//
@@ -585,6 +667,28 @@ type KongTicketDetailPage struct {
 	Truncated bool `json:"truncated"`
 }
 
+// ticketConclusionStg 建一张「票 id → 结论来自哪一层」的索引。
+//
+// 判据是"最后一次**已提交归因**的结论"，由仓储在 SQL 里做完（见 TicketConclusions）：只认提交了归因
+// 的最终事件、每张票取最新一条。`final` 本身不够——一次 inconclusive 收尾（重验时没有可用回答、前提
+// 失效……）同样是最终事件，它不写票行，据它改写来源会让页面把一张仍挂着 stg0 回报值的票重新显示成
+// 指纹归因。
+//
+// 查不到就不填：来源未知时页面按历史数据显示，不猜。
+func (s *KongTicketAdminService) ticketConclusionStg(ctx context.Context, accountID int64, ticketIDs []int64) map[int64]int {
+	if len(ticketIDs) == 0 {
+		return nil
+	}
+	out, err := s.repo.TicketConclusions(ctx, accountID, ticketIDs)
+	if err != nil {
+		// 来源缺失只影响展示措辞，不该让整页打不开。
+		slog.Warn("kong ticket: 查结论来源失败，详情页按未知展示",
+			"account_id", accountID, "error", err)
+		return nil
+	}
+	return out
+}
+
 // TicketDetail 列一个账号名下的票。
 func (s *KongTicketAdminService) TicketDetail(ctx context.Context, accountID int64) (*KongTicketDetailPage, error) {
 	account, err := s.accounts.GetAccountView(ctx, accountID)
@@ -595,7 +699,7 @@ func (s *KongTicketAdminService) TicketDetail(ctx context.Context, accountID int
 		// 账号不存在（或不是 codex 协议）。返回 nil 让处理层报 404，不编一个空页面出来。
 		return nil, nil
 	}
-	status, err := s.statusOf(ctx, account, time.Now())
+	status, err := s.statusOfWithStg0(ctx, account, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -623,6 +727,12 @@ func (s *KongTicketAdminService) TicketDetail(ctx context.Context, accountID int
 		accountReason = "账号当前不可调度：" + status.NotReady
 	}
 
+	// 逐票的"结论来自哪一层"：一次查询建索引，不按票循环查（那是 N+1）。
+	ticketIDs := make([]int64, 0, len(rows))
+	for _, t := range rows {
+		ticketIDs = append(ticketIDs, t.ID)
+	}
+	stgByTicket := s.ticketConclusionStg(ctx, accountID, ticketIDs)
 	out := &KongTicketDetailPage{Account: status, Truncated: len(rows) >= kongTicketDetailLimit}
 	for _, t := range rows {
 		remaining := int64(time.Until(t.ExpiresAt).Seconds())
@@ -651,6 +761,10 @@ func (s *KongTicketAdminService) TicketDetail(ctx context.Context, accountID int
 		}
 		if t.FingerprintP != nil {
 			d.FingerprintP = *t.FingerprintP
+		}
+		if stg, ok := stgByTicket[t.ID]; ok {
+			value := stg
+			d.Stg = &value
 		}
 		out.Tickets = append(out.Tickets, d)
 	}

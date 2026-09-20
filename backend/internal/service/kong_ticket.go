@@ -378,6 +378,11 @@ type KongTicketRepository interface {
 	// ⚠️ 口径：它查的是票表，**看不到账号的 mode 与调度资格**。所以返回非空也不等于"那个账号一定
 	// 能接手"，调用方要自己把这些账号与本请求的可调度集合取交集。
 	VerifiedTicketsElsewhere(ctx context.Context, excludeAccountID int64, model string) ([]*KongTicket, error)
+	// Stg0Stats 汇总 since 之后业务请求里上游回报 model 的一致性，按 (账号, 有效模型) 分组。
+	//
+	// 数据来自上游既有的 usage_logs 两列，本子系统只读不写——业务路径的 stg0 是纯观测（见
+	// DESIGN §5.7）。models 为空时返回空结果，不是"不过滤"：那会把全表所有模型都聚合进来。
+	Stg0Stats(ctx context.Context, models []string, since time.Time) ([]*KongStg0Stats, error)
 	// TicketByID 按 (账号, 票 id) 读一张票，含票原值。**账号必须参与匹配**——否则换个 id 就能让
 	// 一个账号去验别人的票。不存在或不属于该账号时返回 nil。
 	TicketByID(ctx context.Context, accountID, id int64) (*KongTicket, error)
@@ -435,6 +440,12 @@ type KongTicketRepository interface {
 
 	InsertEvent(ctx context.Context, e *KongTicketEvent) error
 	ListEvents(ctx context.Context, filter *KongTicketEventFilter) ([]*KongTicketEvent, int, error)
+	// TicketConclusions 取这些票各自**最后一次已提交归因**的结论来自哪一层（0 = stg0，1 = stg1）。
+	//
+	// 单独一个方法而不是拿 ListEvents 过滤：判据（只认提交了归因的最终事件）与"每张票取最新一条"都
+	// 必须在 SQL 里做完。放到 Go 里筛就得先按行数上限取一批，而一张票被反复重验时那批里可能一条已提交
+	// 的都不剩；票数一多，上限本身也盖不住整页。
+	TicketConclusions(ctx context.Context, accountID int64, ticketIDs []int64) (map[int64]int, error)
 	// LastEgressActivity 返回该票据出口最后一次被本系统使用的时刻，即 A。取票本身有耗时，
 	// 记的是最后一次网络活动而不是请求开始时刻，否则静默会被算多。
 	LastEgressActivity(ctx context.Context, ticketEgress string) (*time.Time, error)

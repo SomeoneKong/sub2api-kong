@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -577,6 +578,49 @@ func insertTicketEventTx(ctx context.Context, db kongExecer, e *service.KongTick
 	return nil
 }
 
+// TicketConclusions 取这些票各自最后一次**已提交归因**的结论层级。
+//
+// 三件事都在 SQL 里做完：只认提交了归因的最终事件（`fingerprint_model` 非空——stg0 填回报值、stg1 填
+// argmax，未提交的收尾不填）、每个 `ticket_id` 只取最新一条（`DISTINCT ON`）、缺 `stg` 键的历史事件
+// 算 stg1。放到应用层筛就要先按行数上限取一批，而一张票被反复重验时那批里可能一条已提交的都不剩。
+//
+// `stg` 只接受纯数字文本再转 int：那个键由本系统写入，但库里的历史数据不该让一次展示查询报错。
+func (r *kongTicketRepository) TicketConclusions(
+	ctx context.Context, accountID int64, ticketIDs []int64,
+) (map[int64]int, error) {
+	if len(ticketIDs) == 0 {
+		return map[int64]int{}, nil
+	}
+	const query = `SELECT DISTINCT ON (ticket_id) ticket_id,
+		CASE WHEN detail->>'stg' ~ '^[0-9]+$' THEN (detail->>'stg')::int ELSE 1 END AS stg
+		FROM kong_ticket_events
+		WHERE account_id = $1
+		  AND ticket_id = ANY($2)
+		  AND event_type = $3
+		  AND detail->>'final' = 'true'
+		  AND fingerprint_model IS NOT NULL
+		  AND fingerprint_model <> ''
+		ORDER BY ticket_id, created_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, accountID, pq.Array(ticketIDs), service.KongEventVerify)
+	if err != nil {
+		return nil, fmt.Errorf("list ticket conclusions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make(map[int64]int, len(ticketIDs))
+	for rows.Next() {
+		var ticketID int64
+		var stg int
+		if err := rows.Scan(&ticketID, &stg); err != nil {
+			return nil, fmt.Errorf("scan ticket conclusion: %w", err)
+		}
+		out[ticketID] = stg
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate ticket conclusions: %w", err)
+	}
+	return out, nil
+}
+
 func (r *kongTicketRepository) ListEvents(ctx context.Context, filter *service.KongTicketEventFilter) ([]*service.KongTicketEvent, int, error) {
 	if filter == nil {
 		filter = &service.KongTicketEventFilter{}
@@ -855,4 +899,114 @@ func kongNullString(s string) any {
 		return nil
 	}
 	return s
+}
+
+// kongStg0EffectiveModel 是"发给上游的模型名"的 SQL 表达式。
+//
+// **必须用它而不是 `model`**：存在 model mapping 时客户端请求的名字与发给上游的名字不同，而门控是按
+// 后者判的，按 `model` 聚合会漏掉被映射过来的请求。写法照抄上游同口径的表达式索引
+// （idx_usage_logs_effective_upstream_model_created），保持两边对"有效上游模型"的定义一致。
+//
+// 实测（生产库、3 天窗口 1.5 万行）：规划器走的是 `idx_usage_logs_created_at` 再按模型过滤，约
+// 120ms，而不是那个表达式索引——因为窗口内几乎所有请求都是受控模型，过滤掉的只有几十行。这个量级对
+// 管理页面可接受；若将来窗口内行数涨到百万级，这里需要重新看计划。
+const kongStg0EffectiveModel = `COALESCE(NULLIF(BTRIM(upstream_model), ''), model)`
+
+// kongStg0TopReportedMax 是每个 (账号, 模型) 保留的回报值种数上限。
+//
+// 它只为挡住"上游大面积回报各种模型时查出过多行"。取 5：运维需要的是"该往 stg0_accept 加哪一条"，
+// 前几名足以回答，而列全部只会把那个答案埋掉。
+const kongStg0TopReportedMax = 5
+
+// Stg0Stats 汇总近期业务请求里上游回报 model 的一致性，按 (账号, 有效模型) 分组。
+//
+// 数据全部来自上游既有的两列（upstream_response_model / upstream_model_mismatch），本功能不写入
+// 任何东西——业务路径的 stg0 是纯观测。**分子分母同在一行**，所以比例可解释；分母若另取一处
+// （例如只数请求数的计数器），两侧口径不同会让比例变成两个不同总体的商。
+//
+// mismatch 判据用的是**上游的审计口径**（字面相等），比验票路径的 stg0 判据更严——它会把
+// `gpt-5.4-mini-2026-03-17` 这种快照后缀也算成不一致。这里刻意不做二次收窄：这一侧只用于观测与告警，
+// 宁可多报几条让人看见，也不要在统计里悄悄抹掉上游确实回报过别的字符串这个事实。
+func (r *kongTicketRepository) Stg0Stats(ctx context.Context, models []string, since time.Time) ([]*service.KongStg0Stats, error) {
+	models = kongNonEmpty(models)
+	if len(models) == 0 {
+		return nil, nil
+	}
+
+	query := `SELECT account_id, ` + kongStg0EffectiveModel + ` AS eff_model,
+		count(*) AS total,
+		count(*) FILTER (WHERE upstream_model_mismatch) AS mismatch,
+		count(*) FILTER (WHERE upstream_model_mismatch IS NULL) AS unknown
+		FROM usage_logs
+		WHERE created_at >= $1 AND ` + kongStg0EffectiveModel + ` = ANY($2)
+		GROUP BY 1, 2`
+	rows, err := r.db.QueryContext(ctx, query, since.UTC(), pq.Array(models))
+	if err != nil {
+		return nil, fmt.Errorf("query stg0 stats: %w", err)
+	}
+	byKey := map[string]*service.KongStg0Stats{}
+	out := make([]*service.KongStg0Stats, 0, len(models))
+	func() {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			// TopReported 显式给空切片，**不能让它留成 nil**：nil 切片序列化成 JSON `null`，而
+			// 前端按数组读 `.length` / `.map`。零 mismatch 是最常见的正常情况，留 nil 等于让每个
+			// 正常账号都把页面打崩，而 Go 侧与 TS 侧的类型检查都看不出来。
+			s := &service.KongStg0Stats{TopReported: []service.KongStg0Reported{}}
+			if err = rows.Scan(&s.AccountID, &s.Model, &s.Total, &s.Mismatch, &s.Unknown); err != nil {
+				return
+			}
+			byKey[kongStg0Key(s.AccountID, s.Model)] = s
+			out = append(out, s)
+		}
+		err = rows.Err()
+	}()
+	if err != nil {
+		return nil, fmt.Errorf("scan stg0 stats: %w", err)
+	}
+
+	// 第二趟取回报值明细。只在确实有不一致时才查——绝大多数时候上一趟的 mismatch 全是 0，那时这次
+	// 查询纯属浪费。
+	var hasMismatch bool
+	for _, s := range out {
+		if s.Mismatch > 0 {
+			hasMismatch = true
+			break
+		}
+	}
+	if !hasMismatch {
+		return out, nil
+	}
+
+	detail := `SELECT account_id, ` + kongStg0EffectiveModel + ` AS eff_model,
+		COALESCE(upstream_response_model, '') AS reported, count(*) AS n
+		FROM usage_logs
+		WHERE created_at >= $1 AND ` + kongStg0EffectiveModel + ` = ANY($2)
+		  AND upstream_model_mismatch
+		GROUP BY 1, 2, 3
+		ORDER BY 1, 2, 4 DESC`
+	drows, err := r.db.QueryContext(ctx, detail, since.UTC(), pq.Array(models))
+	if err != nil {
+		// 明细查不到不该让整个统计失败：总数与比例已经拿到了，那是页面上的主要信息。
+		return out, nil
+	}
+	defer func() { _ = drows.Close() }()
+	for drows.Next() {
+		var accountID int64
+		var model, reported string
+		var n int64
+		if err := drows.Scan(&accountID, &model, &reported, &n); err != nil {
+			return out, nil
+		}
+		s := byKey[kongStg0Key(accountID, model)]
+		if s == nil || len(s.TopReported) >= kongStg0TopReportedMax {
+			continue
+		}
+		s.TopReported = append(s.TopReported, service.KongStg0Reported{Model: reported, Count: n})
+	}
+	return out, nil
+}
+
+func kongStg0Key(accountID int64, model string) string {
+	return strconv.FormatInt(accountID, 10) + "\x00" + model
 }

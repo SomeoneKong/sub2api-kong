@@ -73,8 +73,39 @@ export interface TicketModelStatus {
    * 而最近一次探测已经归因为 sol——那正是「该给这个账号开 full 了」的信号。
    */
   diagnosis: TicketDiagnosis | null
+  /**
+   * 近三天业务请求上的 stg0 观测（上游回报的 model 是否就是请求的那个）。
+   *
+   * 为 null 表示该窗口内没有样本、或统计查询失败——两者都要显示成「无样本」而不是 0%，后者会被
+   * 读成「查过了、没问题」。
+   */
+  stg0: TicketStg0Stats | null
   /** 最近一次取样处置，解释「现在在采什么样」。 */
   last_sample: TicketSampleNote | null
+}
+
+/**
+ * stg0 的近期观测汇总。三个计数互斥、相加等于窗口内该模型的受控请求数。
+ *
+ * `unknown` 必须单独看：它是「没拿到上游回报值」，与「一致」是两件事。全是 unknown 时
+ * 「零次不一致」是假的安全感——那说明观测没工作，不是没被降智。
+ */
+export interface TicketStg0Stats {
+  account_id: number
+  model: string
+  total: number
+  mismatch: number
+  unknown: number
+  /**
+   * 不一致时上游回报过的 model 及次数（最多几项）。
+   *
+   * 它是这块信息里最可操作的部分：上游投放新模型时，运维照着它往 stg0_accept 加一条即可。只给
+   * 比例的话，看到「mismatch 87%」也不知道该加什么。
+   *
+   * **声明成可能为 null**：Go 的 nil 切片序列化成 `null`，历史数据与明细查询失败的分支都可能给
+   * 这个值。按数组直接读 `.length` 会打崩整个页面，所以一律经归一化再用。
+   */
+  top_reported: Array<{ model: string; count: number }> | null
 }
 
 export interface TicketAccountStatus {
@@ -220,6 +251,14 @@ export interface TicketDetailRow {
   fingerprint_p: number
   /** 各模型的归因概率，用来解释"为什么这张判不合格"。 */
   fingerprint_probs: Record<string, number> | null
+  /**
+   * 这个结论出自哪一层：0 = stg0（上游自己回报的 model），1 = stg1（指纹归因），null = 未知（历史数据）。
+   *
+   * stg0 判死票时会把回报值当归因结果写进票行（p=1、单点分布），那是为了让下游统一按概率工作。
+   * 但**显示时必须据这个字段区分来源**：照 p 显示就把上游的一句声明呈现成"指纹归因，置信度 1.00"。
+   * 不能按"概率是不是 1"去猜——stg1 的概率也可以恰好是 1。
+   */
+  stg: number | null
   /**
    * 此刻业务注入的就是它：按当前白名单与阈值是首选票，**且这个账号真的会注入**（mode=full）。
    * 由服务端算，前端不能按 status 自己猜。
