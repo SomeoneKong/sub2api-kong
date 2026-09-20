@@ -287,14 +287,50 @@ func (r *kongTicketRepository) ClearSkipMarks(ctx context.Context, accountID int
 //
 // 调用方必须传入**本次实际使用的票**的 id，不是「当前票」：并发下请求用 K1 发出、预取的 K2
 // 可能已验证通过并接替成当前票，按当前票撤销会作废无辜的 K2，还白搭一段拒服。
+// RevokeTicket 把一张票作废。
+//
+// 条件覆盖 verified **与 unverified**：被撤销的票总是注入过的（所以撤销时通常是 verified），但它
+// 可能刚被手工复位成候选、正在重验。只收 verified 的话那次撤销会静默更新 0 行，随后的重验照样能
+// 提交出资格——于是一张已经拿到"注入未被接受"证据的票被重新授予。收进 unverified 让重验的条件更新
+// 落空，方向是拒服，符合本项目的取舍。
 func (r *kongTicketRepository) RevokeTicket(ctx context.Context, id int64) error {
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE kong_ticket_cache SET status = $1 WHERE id = $2 AND status = $3`,
-		service.KongTicketStatusRejected, id, service.KongTicketStatusVerified)
+		`UPDATE kong_ticket_cache SET status = $1
+		  WHERE id = $2 AND status IN ($3, $4)`,
+		service.KongTicketStatusRejected, id,
+		service.KongTicketStatusVerified, service.KongTicketStatusUnverified)
 	if err != nil {
 		return fmt.Errorf("revoke ticket: %w", err)
 	}
 	return nil
+}
+
+// ReviveRejectedCandidate 把最晚过期的那张未过期已拒票复位成候选。
+//
+// 同时清 skip_until_new：那张票自己通常没被标（批量跳过只标仍为 unverified 的），但手工触发的
+// 语义是"把它重新变成可验证的候选"，留着标记等于复位一半。
+//
+// 归因列**不清**：它是上一次验证的证据，留到新结论落库时自然被覆盖；提前清掉只会让这段时间的
+// 管理面显示不出这张票之前判成了什么。
+func (r *kongTicketRepository) ReviveRejectedCandidate(ctx context.Context, accountID int64, model string) (*service.KongTicket, error) {
+	// 外层 WHERE 必须重复 status 与期限两个条件，**不能只按 id**：子查询选中之后、外层更新之前，
+	// 另一路可能已经把同一张票复位并验证成 verified；只按 id 更新会把那张刚取得资格的票打回
+	// unverified，撤掉已经生效的服务资格。零行时调用方按"没有可复位的票"处理即可。
+	query := `UPDATE kong_ticket_cache SET status = $1, skip_until_new = FALSE
+		  WHERE id = (SELECT id FROM kong_ticket_cache
+		               WHERE account_id = $2 AND model = $3 AND status = $4 AND expires_at > now()
+		               ORDER BY expires_at DESC LIMIT 1)
+		    AND status = $4 AND expires_at > now()
+		  RETURNING ` + kongTicketColumns
+	t, err := scanKongTicket(r.db.QueryRowContext(ctx, query,
+		service.KongTicketStatusUnverified, accountID, model, service.KongTicketStatusRejected))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("revive rejected candidate: %w", err)
+	}
+	return t, nil
 }
 
 func (r *kongTicketRepository) CountTickets(ctx context.Context, accountID int64, model string, status string) (int, error) {

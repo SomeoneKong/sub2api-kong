@@ -1,6 +1,7 @@
 import { apiClient } from '@/api/client'
 import type {
   FingerprintProbe,
+  TicketRefreshResponse,
   TicketAccountStatus,
   TicketConfigRequest,
   TicketEventPage,
@@ -44,4 +45,23 @@ export async function listProbes(verificationID: string): Promise<FingerprintPro
   return data.items ?? []
 }
 
-export default { getOverview, updateAccountConfig, listEvents, listProbes }
+// triggerRefresh 手工触发一次取票/验票。
+//
+// 同步等结果：整条路径最坏是取票 + 三份挑战，调用方要据此显示结论。拿不到票**不是**错误
+// （静默未满等都是正常结论），所以只有 HTTP 层失败才会 reject。
+export async function triggerRefresh(
+  accountID: number,
+  model: string,
+): Promise<TicketRefreshResponse> {
+  const { data } = await apiClient.post<TicketRefreshResponse>(
+    `${basePath}/accounts/${accountID}/refresh`,
+    { model },
+    // 必须覆盖 apiClient 的 30s 默认超时：服务端的等待上限是 5 分钟（kongWaitBudget），一次取票
+    // 加三份挑战完全可能超过 30 秒。超时后后台任务仍会跑完（它脱离请求 context），但调用方拿不到
+    // 结论，同步返回的设计就白费了。留半分钟余量。
+    { timeout: 330_000 },
+  )
+  return data
+}
+
+export default { getOverview, updateAccountConfig, listEvents, listProbes, triggerRefresh }

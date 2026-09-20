@@ -59,7 +59,10 @@ type kongTicketTask struct {
 	// ticketEgress 是本任务占用的票据出口，释放时要据它清掉出口占用。
 	ticketEgress string
 	ticketID     int64
-	err          error
+	// revivedID 非零表示本任务开头把一张已拒票复位成了候选，并以它为验证目标。同步等待的人工
+	// 触发要据此向调用方说明走的是重验而不是取票。
+	revivedID int64
+	err       error
 }
 
 // NewKongTicketService 创建编排服务。
@@ -99,6 +102,9 @@ type KongTicketGrant struct {
 	TicketID   int64
 	DenyReason string
 	RetryAfter time.Time
+	// RevivedTicketID 只在人工触发时非零：本次任务把一张已拒票复位成候选并以它为验证目标。
+	// 它**不对外序列化**（本结构带 State，是可注入的凭据，绝不经管理接口下发）。
+	RevivedTicketID int64
 }
 
 // EnsureTicket 为一个门控请求准备票。
@@ -106,6 +112,14 @@ type KongTicketGrant struct {
 // 这是请求驱动的唯一入口：没有定时器，闲置期完全无活动。闲置本身也在为下一张好票做准备——
 // 票据出口因此积累静默，而静默是拿到 292 的前提。
 func (s *KongTicketService) EnsureTicket(ctx context.Context, accountID int64, model string) (*KongTicketGrant, error) {
+	return s.ensureTicket(ctx, accountID, model, false, false)
+}
+
+// ensureTicket 是 EnsureTicket 的实现。
+//
+// manual 为真时跳过静默与冷却（见 KongScheduleInput.IgnoreWindow）；revive 为真时任务在持有槽位
+// 之后先尝试复位一张已拒票并以它为验证目标。两者都只由人工触发置真。
+func (s *KongTicketService) ensureTicket(ctx context.Context, accountID int64, model string, manual, revive bool) (*KongTicketGrant, error) {
 	account, err := s.accounts.GetByID(ctx, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("读账号 %d: %w", accountID, err)
@@ -125,7 +139,7 @@ func (s *KongTicketService) EnsureTicket(ctx context.Context, accountID int64, m
 		return &KongTicketGrant{NotApplicable: true, DenyReason: KongDenyModeNotFull}, nil
 	}
 
-	in, err := s.buildScheduleInput(ctx, account, cfg, model, time.Now())
+	in, err := s.buildScheduleInput(ctx, account, cfg, model, time.Now(), manual)
 	if err != nil {
 		return nil, err
 	}
@@ -135,12 +149,17 @@ func (s *KongTicketService) EnsureTicket(ctx context.Context, accountID int64, m
 	case KongActionInject:
 		return s.grantExisting(ctx, accountID, model)
 	case KongActionInjectAndPrefetch:
+		if manual {
+			// 人工触发必须**真的跑一遍**。走异步预取会让它在后台按自动口径重算（manual 丢失），
+			// 退回 Inject 什么都不做，而接口已经拿旧票报了成功——人工干预于是静默失效。
+			return s.runTaskAndWait(ctx, account, cfg, model, decision.Action, manual, revive)
+		}
 		s.startPrefetch(ctx, account, cfg, model)
 		return s.grantExisting(ctx, accountID, model)
 	case KongActionWait:
 		return s.waitForTask(ctx, accountID, model)
 	case KongActionVerifyCandidate, KongActionFetch:
-		return s.runTaskAndWait(ctx, account, cfg, model, decision.Action)
+		return s.runTaskAndWait(ctx, account, cfg, model, decision.Action, manual, revive)
 	default:
 		if !in.AccountReady {
 			s.logEvent(ctx, &KongTicketEvent{
@@ -152,9 +171,10 @@ func (s *KongTicketService) EnsureTicket(ctx context.Context, accountID int64, m
 	}
 }
 
-func (s *KongTicketService) buildScheduleInput(ctx context.Context, account *Account, cfg KongTicketConfig, model string, now time.Time) (*KongScheduleInput, error) {
+func (s *KongTicketService) buildScheduleInput(ctx context.Context, account *Account, cfg KongTicketConfig, model string, now time.Time, manual bool) (*KongScheduleInput, error) {
 	ticketEgress := KongEgressKey(cfg.Egress, cfg.ProxyID)
 	in := &KongScheduleInput{
+		IgnoreWindow: manual,
 		Now:          now,
 		Mode:         cfg.Mode,
 		Egress:       cfg.Egress,
@@ -276,13 +296,13 @@ const kongPersistBudget = 15 * time.Second
 //
 // 任务不跟随调用者的 context：产物（一张票）对下一个请求仍有价值，当前请求结束不该把它取消。
 // 但必须带自己的总期限，否则「不被取消」会变成「永不结束」。
-func (s *KongTicketService) startTask(ctx context.Context, task *kongTicketTask, account *Account, model, action string) {
+func (s *KongTicketService) startTask(ctx context.Context, task *kongTicketTask, account *Account, model, action string, manual, revive bool) {
 	detached, cancel := context.WithTimeout(context.WithoutCancel(ctx), kongTaskBudget)
 	go func() {
 		defer cancel()
 		defer s.releaseTask(account.ID, task)
-		id, err := s.runTask(detached, account, model, action, task.ticketEgress)
-		task.ticketID, task.err = id, err
+		id, revived, err := s.runTask(detached, account, model, action, task.ticketEgress, manual, revive)
+		task.ticketID, task.revivedID, task.err = id, revived, err
 	}()
 }
 
@@ -293,21 +313,47 @@ func (s *KongTicketService) startTask(ctx context.Context, task *kongTicketTask,
 //
 // claimedEgress 是认领时锁住的票据出口。重查后配置可能已经改到另一个出口上，而我们持有的锁还是
 // 旧那个——此时必须结束本任务，不能在没持有锁的出口上发请求（那个出口可能正被别的账号占着）。
-func (s *KongTicketService) runTask(ctx context.Context, account *Account, model, action, claimedEgress string) (int64, error) {
+func (s *KongTicketService) runTask(ctx context.Context, account *Account, model, action, claimedEgress string, manual, revive bool) (ticketID int64, revivedID int64, err error) {
 	// 任务开始时刻在**这里**固定，一路传到候选淘汰那一步。后面还有重读账号、代理解析、取票几个
 	// 可能阻塞的步骤，在它们之后再取时间，会把这期间新到的票误当成「任务开始时就存在的旧候选」。
 	taskStartedAt := time.Now()
 	fresh, err := s.accounts.GetByID(ctx, account.ID)
 	if err != nil {
-		return 0, fmt.Errorf("重读账号 %d: %w", account.ID, err)
+		return 0, 0, fmt.Errorf("重读账号 %d: %w", account.ID, err)
 	}
 	if fresh == nil {
-		return 0, fmt.Errorf("账号 %d 已不存在", account.ID)
+		return 0, 0, fmt.Errorf("账号 %d 已不存在", account.ID)
 	}
 	freshCfg, _ := ParseKongTicketConfig(fresh.Extra)
-	in, err := s.buildScheduleInput(ctx, fresh, freshCfg, model, time.Now())
+
+	// 复位已拒票必须在**这里**做，而不是在触发入口：入口那时还没拿到槽位，若有同模型任务在跑，
+	// 它收尾时的批量跳过会按自己的边界把刚复位的票标成 skip——那张票此后既选不中、也不再是
+	// rejected，连下一次人工触发都救不回来。持有槽位再复位就没有这个交错。
+	var revived *KongTicket
+	if revive {
+		revived, err = s.repo.ReviveRejectedCandidate(ctx, fresh.ID, model)
+		if err != nil {
+			// 复位失败不该让整次任务失败：下面照常按正常决策走（多半是去取新票）。
+			s.logEvent(ctx, &KongTicketEvent{
+				AccountID: fresh.ID, Model: model,
+				EventType: KongEventManualRefresh, Outcome: KongOutcomeFailure,
+				Detail: map[string]any{"stage": "revive", "error": err.Error()},
+			})
+			revived = nil
+		} else if revived != nil {
+			revivedID = revived.ID
+			s.logEvent(ctx, &KongTicketEvent{
+				AccountID: fresh.ID, Model: model,
+				EventType: KongEventManualRefresh, Outcome: KongOutcomeInfo,
+				TicketID: &revivedID,
+				Detail:   map[string]any{"stage": "revive", "note": "已拒票复位为候选，本次以它为验证目标"},
+			})
+		}
+	}
+
+	in, err := s.buildScheduleInput(ctx, fresh, freshCfg, model, time.Now(), manual)
 	if err != nil {
-		return 0, err
+		return 0, revivedID, err
 	}
 	// 自己已经占住槽位了，重算时不要把它当成「别人在跑」而退成 wait。
 	in.InflightTask = false
@@ -317,28 +363,47 @@ func (s *KongTicketService) runTask(ctx context.Context, account *Account, model
 	needsTicketEgress := decision.Action == KongActionFetch || decision.Action == KongActionInjectAndPrefetch
 	if needsTicketEgress {
 		if current := KongEgressKey(freshCfg.Egress, freshCfg.ProxyID); current != claimedEgress {
-			return 0, fmt.Errorf("票据出口已从 %s 改为 %s，本任务持有的是旧锁", claimedEgress, current)
+			return 0, revivedID, fmt.Errorf("票据出口已从 %s 改为 %s，本任务持有的是旧锁", claimedEgress, current)
 		}
+	}
+
+	// 复位成功且账号可调度时，**直接验证那一张**，不再泛选候选。泛选可能挑到更早的另一张票，
+	// 而调用方已经据 revivedID 报了"正在复用该票重验"；它也能绕开 observed 的最小年龄限制——
+	// 那条限制是压被动票的**自动**验证频率，对人工指名的重验没有意义。
+	if revived != nil && in.AccountReady {
+		id, verr := s.verifyTicket(ctx, fresh, freshCfg, model, revived.ID, revived.State, revived.Source,
+			revived.ExpiresAt, kongCaptureOf(revived), taskStartedAt)
+		return id, revivedID, verr
 	}
 
 	switch decision.Action {
 	case KongActionVerifyCandidate:
-		return s.verifyExistingCandidate(ctx, fresh, freshCfg, model, taskStartedAt)
+		id, verr := s.verifyExistingCandidate(ctx, fresh, freshCfg, model, taskStartedAt)
+		return id, revivedID, verr
 	case KongActionFetch, KongActionInjectAndPrefetch:
 		// InjectAndPrefetch 必须**真的取票**：预取正是在这个决策下启动的，重算必然又得到它，
 		// 把它并到 Inject 里直接返回当前票，等于让异步预取变成永不取票的空任务。
-		return s.fetchAndVerify(ctx, fresh, freshCfg, model, taskStartedAt)
+		id, ferr := s.fetchAndVerify(ctx, fresh, freshCfg, model, taskStartedAt)
+		return id, revivedID, ferr
 	case KongActionInject:
 		// 认领与重查之间已经有票可用了（别的任务刚落库）。直接用它，不必再动出口。
 		if in.CurrentTicketID != 0 {
-			return in.CurrentTicketID, nil
+			return in.CurrentTicketID, revivedID, nil
 		}
-		return 0, fmt.Errorf("重查后无可用票")
+		return 0, revivedID, fmt.Errorf("重查后无可用票")
 	default:
 		// 前提已不成立（静默不够、冷却中、出口失效、账号不可调度）。什么都不做是正确的：
 		// 这一次拒服，下一次请求重新判定。
-		return 0, fmt.Errorf("重查后不再满足取票条件: %s", decision.DenyReason)
+		return 0, revivedID, fmt.Errorf("重查后不再满足取票条件: %s", decision.DenyReason)
 	}
+}
+
+// kongCaptureOf 取一张票行上的采集事实。没有就返回 nil——探测记录如实留空，不猜一个。
+func kongCaptureOf(t *KongTicket) *kongCaptureFacts {
+	if t == nil || (t.CaptureEgress == "" && t.CaptureIdleSeconds == nil) {
+		return nil
+	}
+	return &kongCaptureFacts{Egress: t.CaptureEgress, IdleSeconds: t.CaptureIdleSeconds}
 }
 
 // startPrefetch 起一个异步预取：当前票还能用，但已进入提前换票窗口。
@@ -348,11 +413,11 @@ func (s *KongTicketService) startPrefetch(ctx context.Context, account *Account,
 		// 已有在途任务，或出口被别的账号占着。预取是机会性的，不必为此拒服——当前票还能用。
 		return
 	}
-	s.startTask(ctx, task, account, model, KongActionInjectAndPrefetch)
+	s.startTask(ctx, task, account, model, KongActionInjectAndPrefetch, false, false)
 }
 
 // runTaskAndWait 在当前请求上同步跑一次取票/验证。冷启动走这条路。
-func (s *KongTicketService) runTaskAndWait(ctx context.Context, account *Account, cfg KongTicketConfig, model string, action string) (*KongTicketGrant, error) {
+func (s *KongTicketService) runTaskAndWait(ctx context.Context, account *Account, cfg KongTicketConfig, model string, action string, manual, revive bool) (*KongTicketGrant, error) {
 	// 候选验证走**流量出口**，不占票据出口的静默，所以不该抢那个槽位——否则两个都配 `none`
 	// 的账号会争用同一个 "none" 锁，一个在验证、另一个被拒为 egress_busy。
 	ticketEgress := KongEgressKey(cfg.Egress, cfg.ProxyID)
@@ -373,7 +438,7 @@ func (s *KongTicketService) runTaskAndWait(ctx context.Context, account *Account
 		})
 		return &KongTicketGrant{Allowed: false, DenyReason: KongDenyEgressBusy}, nil
 	}
-	s.startTask(ctx, task, account, model, action)
+	s.startTask(ctx, task, account, model, action, manual, revive)
 	return s.awaitTask(ctx, task, account.ID, model)
 }
 
@@ -425,15 +490,18 @@ func (s *KongTicketService) awaitTask(ctx context.Context, task *kongTicketTask,
 		return nil, err
 	}
 	if grant != nil {
+		grant.RevivedTicketID = task.revivedID
 		return grant, nil
 	}
 	// 自己确实没有合格票。这一次拒服，不在同一个请求里重新排一轮任务——账号与出口的互斥仍然握在
 	// 别人手里，而下一个请求会按请求驱动的常规路径重新决策（任务槽此时已经释放）。
-	reason := KongDenyWindowClosed
+	// 本模型的任务跑完却没票，原因是"取过了没成"而不是"还没到能取的时候"——两者必须分开，否则
+	// 人工触发（已跳过窗口）也会被解释成静默未满，把排查引向错误方向。
+	reason := KongDenyTaskNoTicket
 	if task.model != "" && task.model != model {
 		reason = KongDenyOtherModelTask
 	}
-	return &KongTicketGrant{Allowed: false, DenyReason: reason}, nil
+	return &KongTicketGrant{Allowed: false, DenyReason: reason, RevivedTicketID: task.revivedID}, nil
 }
 
 // kongClaimOutcome 说明一次认领的结果。
@@ -1428,4 +1496,63 @@ func kongTierToInt(tier string) int {
 	default:
 		return 0
 	}
+}
+
+// KongManualRefresh 是一次手工触发的结果。
+//
+// **刻意不内嵌 KongTicketGrant**：那个结构带 `State`，也就是票原值——可注入的凭据。把它交给
+// 管理接口等于送进浏览器与前端日志。这里只暴露判断结论所需的字段。
+type KongManualRefresh struct {
+	// RevivedTicketID 非零表示本次先把一张未过期的已拒票复位成候选，于是走的是"重验"而不是"取票"。
+	RevivedTicketID int64 `json:"revived_ticket_id"`
+	// Allowed 为真表示拿到了可用票。
+	Allowed bool `json:"allowed"`
+	// TicketID 是本次实际拿到的票；未拿到时为 0。
+	TicketID int64 `json:"ticket_id"`
+	// DenyReason 说明为什么没拿到。多数不是故障：静默未满、模式不是 full 都是正常结论。
+	DenyReason string `json:"deny_reason"`
+	// NotApplicable 表示该账号不在保护范围内（mode 不是 full），与"该保护但保不了"是两件事。
+	NotApplicable bool `json:"not_applicable"`
+	// RetryAfter 是可以再试的最早时刻，拿不到估计时为空。
+	RetryAfter *time.Time `json:"retry_after"`
+}
+
+// TriggerRefresh 手工触发一次取票/验票，同步返回结果。这是**人工干预手段**，不是自动路径。
+//
+// **跳过静默与冷却这两条时间窗口约束**。它们是给自动运行用的保守估计：系统只看得见自己产生的
+// 出口活动（设计 §6.2），真实静默常常更长，而运维能据带外信息判断此刻可不可以取。代价由触发者
+// 承担——静默确实不足时会拿到坏票、把静默清零并进冷却。
+//
+// **不跳过结构性约束**：没配票据出口、出口失效或与流量出口合并、账号不可调度。那些不是调度规则，
+// 而是物理上做不到（没有出口可用）或做了有害（票据出口与业务出口合并会让业务流量自己毁掉好票）。
+//
+// 另有一个前置动作：先尝试复位一张未过期的已拒票（见 ReviveRejectedCandidate）。它在改过白名单
+// 或阈值之后最有价值——同一张票的证据在新判据下可能就合格了，而重验走流量出口、不消耗票据出口的
+// 静默，比取一张新票便宜得多。
+func (s *KongTicketService) TriggerRefresh(ctx context.Context, accountID int64, model string) (*KongManualRefresh, error) {
+	account, err := s.accounts.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("读账号 %d: %w", accountID, err)
+	}
+	if account == nil {
+		return nil, fmt.Errorf("账号 %d 不存在", accountID)
+	}
+	out := &KongManualRefresh{}
+	// manual=true 跳过静默与冷却；revive=true 让任务在持有槽位之后先复位一张已拒票。**复位不在
+	// 这里做**——此刻还没拿到槽位，若有同模型任务在跑，它收尾时的批量跳过会把刚复位的票标成
+	// skip，那张票此后连人工触发都救不回来。
+	grant, err := s.ensureTicket(ctx, accountID, model, true, true)
+	if err != nil {
+		return nil, err
+	}
+	out.RevivedTicketID = grant.RevivedTicketID
+	out.Allowed = grant.Allowed
+	out.TicketID = grant.TicketID
+	out.DenyReason = grant.DenyReason
+	out.NotApplicable = grant.NotApplicable
+	if !grant.RetryAfter.IsZero() {
+		retry := grant.RetryAfter
+		out.RetryAfter = &retry
+	}
+	return out, nil
 }

@@ -47,6 +47,8 @@ type kongStubRepo struct {
 	// 必然更新 0 行」这条回归就是靠桩不忠实才全绿通过的。current / candidate 两张表只决定「读到
 	// 哪一张」，是否真的可用由这里的状态决定。
 	tickets map[int64]*kongStubTicketState
+	// revived 记下被手工复位过的票 id。
+	revived []int64
 }
 
 // kongStubTicketState 是一张票在桩里的状态，字段与生产表一一对应。
@@ -88,12 +90,30 @@ func kongStubKey(accountID int64, model string) string {
 // 真实实现改了规则而桩没改时测试仍然全绿。但另外三条必须照做：status 与期限（撤销与过期要真的
 // 影响读取），以及**返回多张并排好序**——只回一张的桩测不出「较新的票按当前白名单不合格、较旧
 // 那张合格」这个场景，而那正是不能在 SQL 里截断的理由。
+// poolOf 返回该 (账号, 模型) 下的全部票，**不分 current / candidate**——那两个 map 只是用例放票的
+// 位置，生产里是同一张表。分开查会让「复位的候选验证成功后成为可用票」这条链在测试里永远断开。
+func (r *kongStubRepo) poolOf(accountID int64, model string) []*KongTicket {
+	key := kongStubKey(accountID, model)
+	seen := map[int64]bool{}
+	var out []*KongTicket
+	for _, t := range r.current[key] {
+		if t != nil && !seen[t.ID] {
+			seen[t.ID] = true
+			out = append(out, t)
+		}
+	}
+	if t := r.candidate[key]; t != nil && !seen[t.ID] {
+		out = append(out, t)
+	}
+	return out
+}
+
 func (r *kongStubRepo) VerifiedTickets(_ context.Context, accountID int64, model string) ([]*KongTicket, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now()
 	var out []*KongTicket
-	for _, t := range r.current[kongStubKey(accountID, model)] {
+	for _, t := range r.poolOf(accountID, model) {
 		if t == nil {
 			continue
 		}
@@ -147,20 +167,29 @@ func (r *kongStubRepo) stateOf(t *KongTicket) *kongStubTicketState {
 func (r *kongStubRepo) OldestCandidate(_ context.Context, accountID int64, model string, minAge time.Duration, now time.Time) (*KongTicket, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	t := r.candidate[kongStubKey(accountID, model)]
-	if t == nil {
-		return nil, nil
-	}
 	// 生产条件：unverified、未过期、未被跳过，且 observed 来源要满足最小年龄（fetch 不受限）。
-	if st := r.stateOf(t); st != nil {
-		if st.Status != KongTicketStatusUnverified || st.SkipUntilNew || !st.ExpiresAt.After(now) {
-			return nil, nil
+	// 从整池里挑**最早采集**的那张，与生产的 ORDER BY captured_at ASC 一致。
+	var best *KongTicket
+	var bestCaptured time.Time
+	for _, t := range r.poolOf(accountID, model) {
+		st := r.stateOf(t)
+		status, expires, skip := t.Status, t.ExpiresAt, t.SkipUntilNew
+		captured, source := t.CapturedAt, t.Source
+		if st != nil {
+			status, expires, skip = st.Status, st.ExpiresAt, st.SkipUntilNew
+			captured, source = st.CapturedAt, st.Source
 		}
-		if st.Source == KongTicketSourceObserved && st.CapturedAt.After(now.Add(-minAge)) {
-			return nil, nil
+		if status != KongTicketStatusUnverified || skip || !expires.After(now) {
+			continue
+		}
+		if source == KongTicketSourceObserved && captured.After(now.Add(-minAge)) {
+			continue
+		}
+		if best == nil || captured.Before(bestCaptured) {
+			best, bestCaptured = t, captured
 		}
 	}
-	return t, nil
+	return best, nil
 }
 
 func (r *kongStubRepo) InsertTicket(_ context.Context, t *KongTicket) (int64, bool, error) {
@@ -393,4 +422,41 @@ func kongTestAttr(p float64) KongAttribution {
 		Model: "gpt-6-astra", P: p,
 		Probs: map[string]float64{"gpt-6-astra": p, "gpt-5.6-sol": 1 - p},
 	}
+}
+
+// ReviveRejectedCandidate 照生产 SQL 的条件实现：只复位**未过期**且**已拒**的那一张，取最晚
+// 过期的，并清掉 skip 标记。
+//
+// 桩少实现一个条件那个条件的错误就测不出来——已过期的票被复位会让"重验一张过期票"这种问题全绿
+// 通过，而它在生产里会走到提交时才被期限条件挡掉、白烧三份挑战。
+func (r *kongStubRepo) ReviveRejectedCandidate(_ context.Context, accountID int64, model string) (*KongTicket, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	// 从整池里挑**最晚过期**的那张已拒且未过期的票，与生产的 ORDER BY expires_at DESC 一致。
+	var best *KongTicket
+	for _, t := range r.poolOf(accountID, model) {
+		status, expires := t.Status, t.ExpiresAt
+		if st := r.stateOf(t); st != nil {
+			status, expires = st.Status, st.ExpiresAt
+		}
+		if status != KongTicketStatusRejected || !expires.After(now) {
+			continue
+		}
+		if best == nil || expires.After(best.ExpiresAt) {
+			best = t
+		}
+	}
+	if best == nil {
+		return nil, nil
+	}
+	// 状态表与票对象都要改：前者是后续条件判定的权威，后者是调用方拿到手直接用的那份。
+	if st := r.stateOf(best); st != nil {
+		st.Status = KongTicketStatusUnverified
+		st.SkipUntilNew = false
+	}
+	best.Status = KongTicketStatusUnverified
+	best.SkipUntilNew = false
+	r.revived = append(r.revived, best.ID)
+	return best, nil
 }

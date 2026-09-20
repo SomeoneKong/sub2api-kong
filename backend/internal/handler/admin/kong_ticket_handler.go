@@ -106,6 +106,39 @@ func (h *KongTicketHandler) UpdateAccountConfig(c *gin.Context) {
 	response.Success(c, status)
 }
 
+type kongTicketRefreshRequest struct {
+	Model string `json:"model" binding:"required"`
+}
+
+// TriggerRefresh 手工触发一次取票/验票。
+//
+// 同步返回：调用方是页面上的一次点击，异步触发拿不到结论，等于让人对着页面猜。整条路径受服务端
+// 的任务预算约束，最坏情况是取票 + 三份挑战。
+func (h *KongTicketHandler) TriggerRefresh(c *gin.Context) {
+	if !h.ready(c) {
+		return
+	}
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		response.BadRequest(c, "invalid account id")
+		return
+	}
+	var req kongTicketRefreshRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body: "+err.Error())
+		return
+	}
+	result, status, err := h.svc.TriggerRefresh(c.Request.Context(), accountID, strings.TrimSpace(req.Model))
+	if err != nil {
+		// 未启用、模型不在门控集合、账号不存在都是调用方能改的，按 400 回。
+		response.BadRequest(c, err.Error())
+		return
+	}
+	// grant 里 Allowed 为假时**不是**错误：静默未满、出口不可用、模式不是 full 都是正常结论，
+	// 页面要靠 deny_reason 把原因显示出来。当成错误回会让人以为触发本身失败了。
+	response.Success(c, gin.H{"result": result, "status": status})
+}
+
 // ListEvents 分页查事件。
 func (h *KongTicketHandler) ListEvents(c *gin.Context) {
 	if !h.ready(c) {

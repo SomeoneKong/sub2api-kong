@@ -12,7 +12,7 @@ import (
 // 采纳判据的两条要点：自接受不靠配置写对；概率按白名单求和而不是只看 argmax。
 func TestKongTicketAcceptMassAndSelf(t *testing.T) {
 	gated := []string{"gpt-6-astra", "gpt-5.6-sol"}
-	accept, err := KongParseTicketAccept(gated, "gpt-5.6-sol:gpt-6-astra", nil)
+	accept, _, err := KongParseTicketAccept(gated, "gpt-5.6-sol:gpt-6-astra", nil)
 	if err != nil {
 		t.Fatalf("解析白名单: %v", err)
 	}
@@ -47,18 +47,39 @@ func TestKongTicketAcceptMassAndSelf(t *testing.T) {
 // 两类配置错误都必须让启动失败：它们不会报错，只会表现成「配了没生效」。
 func TestKongParseTicketAcceptRejectsDeadConfig(t *testing.T) {
 	gated := []string{"gpt-6-astra"}
-	if _, err := KongParseTicketAccept(gated, "gpt-5.6-sol:gpt-6-astra", nil); err == nil {
-		t.Error("键不在门控集合里时应当报错——那条配置永远不会被用到")
+
+	// 死配置：忽略 + 告警，**不让启动失败**。白名单只会比预期更小，方向是拒服而非放行降智；
+	// 而拒绝启动会把配置笔误升级成整个网关不可用。
+	accept, warns, err := KongParseTicketAccept(gated, "gpt-5.6-sol:gpt-6-astra", nil)
+	if err != nil {
+		t.Fatalf("键不在门控集合里不该报错：%v", err)
 	}
-	if _, err := KongParseTicketAccept(gated, "gpt-6-astra", nil); err == nil {
-		t.Error("缺冒号的条目应当报错")
+	if len(warns) != 1 {
+		t.Errorf("应当给出一条告警，得到 %v", warns)
 	}
+	if _, ok := accept["gpt-5.6-sol"]; ok {
+		t.Error("被忽略的条目不得进入接受关系")
+	}
+
 	bank, err := KongFingerprintBankLoad()
 	if err != nil {
 		t.Fatalf("加载校准资料: %v", err)
 	}
-	if _, err := KongParseTicketAccept(gated, "gpt-6-astra:no-such-model", bank); err == nil {
-		t.Error("值不在校准资料里时应当报错——闭集归因永远不会判为它")
+	accept, warns, err = KongParseTicketAccept(gated, "gpt-6-astra:no-such-model", bank)
+	if err != nil {
+		t.Fatalf("值不在校准资料里不该报错：%v", err)
+	}
+	if len(warns) != 1 {
+		t.Errorf("应当给出一条告警，得到 %v", warns)
+	}
+	// 忽略掉那一项后 astra 仍然接受自己——自接受由代码补齐，不受配置错误影响。
+	if got := accept.Of("gpt-6-astra"); len(got) != 1 || got[0] != "gpt-6-astra" {
+		t.Errorf("astra 应仍只接受自己，得到 %v", got)
+	}
+
+	// 格式错误仍然报错：整条配置没被解析成任何东西，静默忽略会让人以为配上了。
+	if _, _, err := KongParseTicketAccept(gated, "gpt-6-astra", nil); err == nil {
+		t.Error("缺冒号的条目应当报错")
 	}
 }
 
@@ -90,9 +111,14 @@ func TestKongDefaultsAreConsistent(t *testing.T) {
 			t.Errorf("默认门控模型 %q 不在校准资料里，准入判定不成立", m)
 		}
 	}
-	accept, err := KongParseTicketAccept(KongDefaultGatedModels, config.DefaultKongTicketAcceptExtra, bank)
+	accept, warns, err := KongParseTicketAccept(KongDefaultGatedModels, config.DefaultKongTicketAcceptExtra, bank)
 	if err != nil {
 		t.Fatalf("默认白名单与默认门控集合不自洽: %v", err)
+	}
+	// **必须断言 warnings 为空**：死配置现在只告警不报错，丢掉这个返回值的话，往默认串里加一个
+	// 拼错的模型名测试照样通过，这条"默认全自洽"的检查就形同虚设。
+	if len(warns) != 0 {
+		t.Errorf("默认配置不该产生任何告警，得到 %v", warns)
 	}
 	// sol 接受自己、astra 与 gpt-5.5（后者因为指纹法分不开 sol 与 5.5）；astra 只接受自己。
 	sol := accept.Of("gpt-5.6-sol")

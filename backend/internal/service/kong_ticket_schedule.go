@@ -42,6 +42,12 @@ const (
 	// 可能等到另一个模型的任务。它完成时本模型并没有新票——这一次拒服，下一个请求会重新决策。
 	// 单列一个原因是为了让「为什么这个模型一直没被验证」在事件流里读得出来。
 	KongDenyOtherModelTask = "other_model_task"
+	// KongDenyTaskNoTicket 表示**本模型的任务跑完了但没产出可用票**：上游没下发、长度被黑名单
+	// 挡住、或归因不合格。
+	//
+	// 它与 window_closed 必须分开：后者的含义是"还没到能取的时候"，而这里是"取过了、没成"。混在
+	// 一起会把运维引向错误的原因——人工触发已经跳过了窗口，页面却提示"静默或冷却未满"。
+	KongDenyTaskNoTicket = "task_no_ticket"
 )
 
 // KongTicketParams 是调度的时间参数。默认值的依据见设计 §7.1 / §7.2。
@@ -113,6 +119,12 @@ type KongScheduleInput struct {
 	AccountReady bool
 	// InflightTask 表示该账号已有在途的取票验证任务。
 	InflightTask bool
+	// IgnoreWindow 只由**人工触发**置真：跳过静默与冷却这两条时间窗口约束。
+	//
+	// 它之所以正当，是因为系统只看得见**自己产生的**出口活动（§6.2）——真实静默常常比 A 记录的
+	// 更长，运维据带外信息判断"现在可以取"是合理的。结构性约束（没配出口、出口失效或与流量出口
+	// 合并、账号不可调度）**不受它影响**：那些不是调度规则，而是物理上做不到或会造成伤害。
+	IgnoreWindow bool
 
 	// CurrentExpiresAt 是当前可用票的过期时刻，无票时为零值。
 	CurrentExpiresAt time.Time
@@ -216,8 +228,10 @@ func (in KongScheduleInput) canStartTask() string {
 	if !in.EgressUsable {
 		return KongDenyEgressUnusable
 	}
-	if allowed := KongNextFetchAllowedAt(in.LastEgressUsed, in.LastCooldownAt, in.Params); in.Now.Before(allowed) {
-		return KongDenyWindowClosed
+	if !in.IgnoreWindow {
+		if allowed := KongNextFetchAllowedAt(in.LastEgressUsed, in.LastCooldownAt, in.Params); in.Now.Before(allowed) {
+			return KongDenyWindowClosed
+		}
 	}
 	return ""
 }

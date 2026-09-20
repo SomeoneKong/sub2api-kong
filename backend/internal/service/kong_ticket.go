@@ -200,6 +200,7 @@ const (
 	KongEventFetchSkipped   = "fetch_skipped"   // 取票未发出（本地失败，不算出口活动）
 	KongEventProbeSkipped   = "probe_skipped"   // observe 未取样
 	KongEventObserveProbe   = "observe_probe"   // observe 模式的诊断探测
+	KongEventManualRefresh  = "manual_refresh"  // 管理面手工触发取票/验票
 )
 
 // 事件成败。单独一列而不是塞进 detail：冷却要查「最近一次失败」（F），参数校准要算
@@ -343,6 +344,17 @@ type KongTicketRepository interface {
 	SetTicketStatus(ctx context.Context, id int64, status string, attr KongAttribution) (bool, error)
 	// SkipCandidate 标记该候选在本段无票期内不再被选中。
 	SkipCandidate(ctx context.Context, id int64) error
+	// ReviveRejectedCandidate 把最晚过期的那张**未过期的已拒票**复位成候选，返回其 id（没有则 0）。
+	//
+	// 只给手工触发用。被拒有两种来路：验证判为不合格（白名单或阈值改了之后同一张票可能就合格了），
+	// 以及注入未被上游接受后被撤销（与配置无关，重验会再次以 candidate_not_accepted 失败）。两者
+	// 都安全，所以不必分辨——验证路径本身能识别后者。
+	//
+	// 复位而不是新取票的理由是资源：验证走**流量出口**，不消耗票据出口的静默，而静默是这套系统
+	// 最稀缺的资源（门槛约 34 分钟）。
+	// 返回复位后的那张票（含票原值），便于调用方把它**直接**钉成本次验证目标——否则泛选候选可能
+	// 选到别张票，而页面已经报了"正在复用该票重验"。没有可复位的票时返回 nil。
+	ReviveRejectedCandidate(ctx context.Context, accountID int64, model string) (*KongTicket, error)
 	// CommitVerification 在同一个事务里落「资格 + 最终事件」。返回假表示条件不满足
 	// （票已过期、已被改写或已被跳过），此时什么都没写。
 	//

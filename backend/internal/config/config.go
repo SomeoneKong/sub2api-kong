@@ -1828,6 +1828,8 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 		cfg.Security.ForwardedClientIPHeaders = normalizeStringSlice(strings.Split(forwardedClientIPHeadersEnv, ","))
 	}
 	cfg.Server.TrustedProxiesConfigured = trustedProxiesConfigured
+	// 票据配置的空值语义要自己兜：viper 的 AutomaticEnv 忽略空环境变量（见 kong_ticket_config.go）。
+	applyKongTicketEnvOverrides(&cfg.Gateway.KongCodexTicket)
 	if cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs == 0 {
 		cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs = 15000
 	}

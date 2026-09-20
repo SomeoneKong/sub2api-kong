@@ -28,12 +28,18 @@ type KongTicketAccept map[string][]string
 
 // KongParseTicketAccept 按门控集合与白名单配置构造接受关系。
 //
-// 两处校验都让启动失败，而不是忽略：
-//   - 键不是门控模型——那条配置永远不会被用到，多半是拼错了模型名；
+// **配置里指向不存在目标的条目一律忽略并返回告警，不让启动失败**：
+//   - 键不是门控模型——那条配置永远不会被用到，多半是拼错了模型名，或是改门控集合时漏改了它；
 //   - 值不在校准资料里——闭集归因永远不会产出该结果，那条接受关系恒为空。
 //
-// 两种错误都不会报错，只会表现成「配了却没生效」，所以必须在启动时挡掉。
-func KongParseTicketAccept(gated []string, raw string, bank *KongFingerprintBank) (KongTicketAccept, error) {
+// 这两类都是**死配置**，忽略它们不会让任何票被错误放行：白名单只会比预期更小，方向是拒服而非
+// 放行降智。而让启动失败会把一个纯配置笔误升级成整个网关不可用，连与票据无关的流量一起断——
+// 爆炸半径与错误的严重性完全不成比例。真正必须 fail-closed 的是"启用了却加载不了校准资料"
+// （那会放行降智，见 NewKongTicketComponents）。
+//
+// 格式本身写错（缺冒号）仍然报错：那说明整条配置没被解析成任何东西，静默忽略会让人以为配上了。
+func KongParseTicketAccept(gated []string, raw string, bank *KongFingerprintBank) (KongTicketAccept, []string, error) {
+	var warnings []string
 	accept := make(KongTicketAccept, len(gated))
 	gatedSet := make(map[string]bool, len(gated))
 	for _, m := range gated {
@@ -49,22 +55,26 @@ func KongParseTicketAccept(gated []string, raw string, bank *KongFingerprintBank
 		model, list, ok := strings.Cut(entry, ":")
 		model = strings.TrimSpace(model)
 		if !ok || model == "" {
-			return nil, fmt.Errorf("%s 的条目 %q 不是 `model:accepted[,accepted…]` 形式",
+			return nil, nil, fmt.Errorf("%s 的条目 %q 不是 `model:accepted[,accepted…]` 形式",
 				kongTicketAcceptKey, entry)
 		}
 		if !gatedSet[model] {
-			return nil, fmt.Errorf("%s 给了 %q 的接受关系，但它不在 %s 里，这条配置不会生效",
-				kongTicketAcceptKey, model, KongTicketGatedModelsEnv)
+			warnings = append(warnings, fmt.Sprintf(
+				"%s 给了 %q 的接受关系，但它不在 %s 里，该条已忽略",
+				kongTicketAcceptKey, model, KongTicketGatedModelsEnv))
+			continue
 		}
 		for _, accepted := range kongSplitModels(list) {
 			if bank != nil && !bank.HasModel(accepted) {
-				return nil, fmt.Errorf("%s 让 %q 接受 %q，但后者不在校准资料里，归因永远不会判为它",
-					kongTicketAcceptKey, model, accepted)
+				warnings = append(warnings, fmt.Sprintf(
+					"%s 让 %q 接受 %q，但后者不在校准资料里、归因永远不会判为它，该项已忽略",
+					kongTicketAcceptKey, model, accepted))
+				continue
 			}
 			accept[model] = kongAppendUnique(accept[model], accepted)
 		}
 	}
-	return accept, nil
+	return accept, warnings, nil
 }
 
 // Of 返回某个模型接受的归因结果，顺序稳定（便于写进事件与日志后逐次对比）。

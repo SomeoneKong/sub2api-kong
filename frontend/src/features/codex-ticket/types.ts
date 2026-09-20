@@ -181,3 +181,22 @@ export interface FingerprintProbe {
   latency_ms: number | null
   output_tokens: number | null
 }
+
+/** 一次手工触发的结论。**不含票原值**——那是可注入的凭据，服务端刻意不下发。 */
+export interface TicketRefreshResult {
+  /** 非零表示本次先把一张未过期的已拒票复位成候选，走的是重验而不是取新票。 */
+  revived_ticket_id: number
+  allowed: boolean
+  ticket_id: number
+  /** 未拿到票的原因；多数不是故障（静默未满、模式不是 full 都是正常结论）。 */
+  deny_reason: string
+  /** 该账号不在保护范围内（mode 不是 full），与"该保护但保不了"是两件事。 */
+  not_applicable: boolean
+  retry_after: string | null
+}
+
+export interface TicketRefreshResponse {
+  result: TicketRefreshResult | null
+  /** 触发后该行的最新状态；服务端一并返回，避免调用方重拉 overview 冲掉别行的草稿。 */
+  status: TicketAccountStatus | null
+}

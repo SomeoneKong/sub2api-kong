@@ -359,7 +359,7 @@ func TestKongEgressActivitySurvivesEventWriteFailure(t *testing.T) {
 
 	_, _ = svc.fetchAndVerify(context.Background(), account, cfg, "gpt-6-astra", time.Now())
 
-	in, err := svc.buildScheduleInput(context.Background(), account, cfg, "gpt-6-astra", time.Now())
+	in, err := svc.buildScheduleInput(context.Background(), account, cfg, "gpt-6-astra", time.Now(), false)
 	if err != nil {
 		t.Fatalf("构造调度输入: %v", err)
 	}

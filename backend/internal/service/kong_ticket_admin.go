@@ -148,9 +148,12 @@ type KongTicketAdminService struct {
 	// 不会注入的票（目标改过之后留下的旧 verified 票），运维据此判断「有票可用」就错了。
 	accept     KongTicketAccept
 	confidence float64
-	repo       KongTicketRepository
-	accounts   KongAccountAccess
-	params     KongTicketParams
+	// svc 只用于手工触发。装配时注入而不进构造函数：未启用时 Admin 照常装配而 Service 为 nil，
+	// 放进参数表会让"未启用"这条路径也得传个 nil 进来。
+	svc      *KongTicketService
+	repo     KongTicketRepository
+	accounts KongAccountAccess
+	params   KongTicketParams
 	// gatedModels 是门控模型集合。按**最终上游模型**判定，不按客户端传来的别名——
 	// 否则换个别名就绕过了整套保护。
 	gatedModels []string
@@ -387,6 +390,47 @@ func kongSummarizeTicket(t *KongTicket, now time.Time) *KongTicketSummary {
 //
 // 界面靠它区分「未启用」与「服务故障」，也靠它决定配置是否可写。
 func (s *KongTicketAdminService) Enabled() bool { return len(s.gatedModels) > 0 }
+
+// SetTicketService 注入编排服务，供手工触发使用。未启用时不注入。
+func (s *KongTicketAdminService) SetTicketService(svc *KongTicketService) { s.svc = svc }
+
+// TriggerRefresh 手工触发一次取票/验票，并把该行的最新状态一起返回。
+//
+// 同步执行：整条路径最长受任务预算约束，而调用方是管理页上的一次点击——拿不到结果的异步触发
+// 等于让人对着页面猜。
+func (s *KongTicketAdminService) TriggerRefresh(ctx context.Context, accountID int64, model string) (*KongManualRefresh, *KongTicketAccountStatus, error) {
+	if s.svc == nil {
+		return nil, nil, fmt.Errorf("票据功能未启用，无法手工触发")
+	}
+	if !s.isGated(model) {
+		return nil, nil, fmt.Errorf("模型 %q 不在门控集合里", model)
+	}
+	result, err := s.svc.TriggerRefresh(ctx, accountID, model)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 触发之后重新读这一行：当前票、出口可用性、下次可取时刻都可能变了。让页面一次拿到新状态，
+	// 而不是靠调用方再发一次 overview——那会把其它行未保存的草稿一起冲掉。
+	account, err := s.accounts.GetAccountView(ctx, accountID)
+	if err != nil || account == nil {
+		return result, nil, nil
+	}
+	status, err := s.statusOf(ctx, account, time.Now())
+	if err != nil {
+		return result, nil, nil
+	}
+	return result, status, nil
+}
+
+// isGated 判断模型是否在门控集合里。
+func (s *KongTicketAdminService) isGated(model string) bool {
+	for _, m := range s.gatedModels {
+		if m == model {
+			return true
+		}
+	}
+	return false
+}
 
 // UpdateConfig 改一个账号的票据配置。
 func (s *KongTicketAdminService) UpdateConfig(ctx context.Context, accountID int64, cfg KongTicketConfig) (*KongTicketAccountStatus, error) {

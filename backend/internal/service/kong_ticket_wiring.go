@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"strconv"
@@ -171,9 +172,14 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 			return nil, fmt.Errorf("门控模型 %q 不在校准资料里，准入判定不成立", model)
 		}
 	}
-	accept, err := KongParseTicketAccept(gated, ticketCfg.AcceptExtra, bank)
+	accept, acceptWarnings, err := KongParseTicketAccept(gated, ticketCfg.AcceptExtra, bank)
 	if err != nil {
 		return nil, err
+	}
+	for _, w := range acceptWarnings {
+		// 死配置只告警不拒启动（理由见 KongParseTicketAccept）。用 Warn 而不是 Info：它一定是
+		// 配错了，只是错得不值得把整个网关停掉。
+		slog.Warn("codex 票据：接受白名单有条目被忽略", "detail", w)
 	}
 
 	params := KongDefaultTicketParams()
@@ -210,11 +216,14 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 
 	access := NewKongAccountAccess(accountRepo, proxyRepo)
 	ticketService := NewKongTicketService(repo, upstream, accountRepo, bank, params, accept, confidence)
+	adminService := NewKongTicketAdminService(repo, access, params, gated, accept, confidence)
+	// 手工触发要走编排服务的正常决策路径，所以 Admin 需要它。
+	adminService.SetTicketService(ticketService)
 	return &KongTicketComponents{
 		Enabled: true,
 		Service: ticketService,
 		// 接受关系与阈值必须与编排服务同源：管理面显示的「当前票」要和业务实际会注入的那张一致。
-		Admin:   NewKongTicketAdminService(repo, access, params, gated, accept, confidence),
+		Admin:   adminService,
 		Gateway: NewKongTicketGateway(ticketService, gated),
 	}, nil
 }

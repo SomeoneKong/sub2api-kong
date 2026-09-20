@@ -14,6 +14,7 @@ func registerKongTicketRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 	{
 		group.GET("/overview", h.Admin.KongTicket.GetOverview)
 		group.PUT("/accounts/:id", h.Admin.KongTicket.UpdateAccountConfig)
+		group.POST("/accounts/:id/refresh", h.Admin.KongTicket.TriggerRefresh)
 		group.GET("/events", h.Admin.KongTicket.ListEvents)
 		group.GET("/probes/:verification_id", h.Admin.KongTicket.ListProbes)
 	}

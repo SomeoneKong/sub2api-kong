@@ -838,6 +838,20 @@ Create / Edit 两个模板之间保持字段同步。
 | `GET /admin/kong/ticket/overview` | 账号列表 + 各自的配置与当前票状态（区 1、2） |
 | `PUT /admin/kong/ticket/accounts/:id` | 改 `codex_ticket_mode` / `ticket_egress` / `ticket_proxy_id` |
 | `GET /admin/kong/ticket/events` | 事件分页，按账号、类型、时间筛（区 3） |
+| `GET /admin/kong/ticket/probes/:verification_id` | 一次验证的各份探测明细 |
+| `POST /admin/kong/ticket/accounts/:id/refresh` | **人工干预**：对指定模型立刻取票/验票 |
+
+人工触发的语义与自动路径刻意不同：
+
+- **跳过静默与冷却**。那两条是给自动运行用的保守估计——系统只看得见自己产生的出口活动（§6.2），
+  真实静默常常更长，运维能据带外信息判断此刻可不可以取。代价由触发者承担（静默确实不足时会拿到
+  坏票、清零静默并进冷却）。
+- **不跳过结构性约束**：没配票据出口、出口失效或与流量出口合并、账号不可调度。那些不是调度规则，
+  而是物理上做不到或做了有害。
+- 先尝试**复位一张未过期的已拒票**再走决策。改过白名单或阈值之后这一步最有价值：同一张票的证据在
+  新判据下可能就合格了，而重验走流量出口、不消耗票据出口的静默。
+- 同步返回结论，且**不下发票原值**——那是可注入的凭据，只回 `allowed` / `ticket_id` /
+  `deny_reason` / `retry_after`。
 
 ⚠️ 不要沿用上游 `proxy_id` 那个「提交 `0` 表示清除」的约定（前端把 `null` 转成 `0` 发出）。
 `ticket_egress` 是显式枚举，空值语义不靠哨兵数字表达——那正是 §3.1 要避免的歧义。
@@ -854,7 +868,7 @@ Create / Edit 两个模板之间保持字段同步。
 | `min_ticket_age` | **observed** 票入缓存后至少等多久才验证（fetch 票不受此限，见 §4.2） | 300s |
 | `observe_probe_interval` | `observe` 模式的探测周期 | 3600s |
 | `state_len_denylist` | 已知的坏票长度 | `[312]` |
-| `accept_extra` | 各门控模型额外接受的归因结果（自接受由代码补齐，见 §4.1） | `gpt-5.6-sol:gpt-6-astra` |
+| `accept_extra` | 各门控模型额外接受的归因结果（自接受由代码补齐，见 §4.1） | `gpt-5.6-sol:gpt-6-astra,gpt-5.5` |
 
 门控模型集合走环境变量 `KONG_TICKET_GATED_MODELS`，**默认 `gpt-6-astra,gpt-5.6-sol`**；
 **未设置取该默认、显式设成空串则整个功能不装配**（区分这两者的理由与时间参数一致：把"配了个
@@ -871,7 +885,15 @@ Create / Edit 两个模板之间保持字段同步。
 `accept_extra` 在
 上游 config 结构里，键路径 `gateway.kong_codex_ticket.accept_extra`，因此也可用
 `GATEWAY_KONG_CODEX_TICKET_ACCEPT_EXTRA` 设定（viper 的 env 绑定）。格式
-`model:accepted[,accepted…][;model:…]`。**没有热更新**——上游没有配置文件监视，config 只在启动时
+`model:accepted[,accepted…][;model:…]`；**显式设成空串即没有任何额外接受关系**。
+
+⚠️ 那个空串语义要靠一处显式覆盖兑现：viper 的 `AutomaticEnv` **忽略空环境变量**，只靠它的话
+"设成空串"会被当成未设置、仍取默认值——而那个方向是放宽判据。覆盖在
+`internal/config/kong_ticket_config.go`，与上游对 `SERVER_TRUSTED_PROXIES` 的处理同一范式。
+
+⚠️ 白名单里指向**不在门控集合的模型**或**库外模型**的条目会被忽略并打 `slog.Warn`，**不让启动
+失败**。那两类都是死配置，忽略只会让白名单比预期更小（方向是拒服而非放行降智），而拒绝启动会把
+配置笔误升级成整个网关不可用。格式错误（缺冒号）仍然让启动失败。**没有热更新**——上游没有配置文件监视，config 只在启动时
 读一次，改了要重启。
 
 ### 7.1 为什么 `refresh_before` 要小

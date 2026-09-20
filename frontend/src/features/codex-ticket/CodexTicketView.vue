@@ -131,6 +131,22 @@
                       <p v-if="m.unverified_count > 0" class="text-xs text-gray-500 dark:text-dark-400">
                         候选 {{ m.unverified_count }} 张待验
                       </p>
+                      <!-- 人工干预：立刻走一遍取票/验票，**跳过静默与冷却**（那两条是自动运行用的
+                           保守估计，系统只看得见自己产生的出口活动）。结构性约束仍然生效。 -->
+                      <div class="mt-1 flex items-center gap-2">
+                        <button
+                          type="button"
+                          class="btn-secondary px-2 py-0.5 text-xs"
+                          :disabled="readOnly || busy || refreshingKey !== null || row.mode !== 'full'"
+                          :title="row.mode !== 'full' ? '只有 full 模式会主动取票' : '人工干预：立刻取票/验票，跳过静默与冷却'"
+                          @click="triggerRefresh(row, m.model)"
+                        >
+                          {{ refreshingKey === refreshKey(row.account_id, m.model) ? '执行中…' : '立即取票验票' }}
+                        </button>
+                        <span v-if="refreshNote(row.account_id, m.model)" class="text-xs" :class="refreshNoteClass(row.account_id, m.model)">
+                          {{ refreshNote(row.account_id, m.model) }}
+                        </span>
+                      </div>
                       <!-- 诊断与当前票分开显示：旧票还在服务、而最近一次探测已归因为别的档位，
                            正是「该开 full」的信号，混在一起会把它藏起来。 -->
                       <p v-if="m.diagnosis" class="text-xs" :class="diagnosisClass(m.diagnosis)">
@@ -322,11 +338,18 @@ const overview = ref<TicketOverview | null>(null)
 // 所以单独记错误，那一格退化成「只剩已配的那一项可选」。
 const proxies = ref<Proxy[]>([])
 const proxiesError = ref('')
+// refreshingKey 非空表示有一次手工触发在执行。全页只允许一次：触发是同步的、且会占用该账号的
+// 出口槽，并发点几个只会让后面的都得到「已有在途任务」。
+const refreshingKey = ref<string | null>(null)
+// 每个 (账号, 模型) 的上次触发结果，成功与拒服都要显示——拒服不是错误，是正常结论。
+const refreshNotes = reactive<Record<string, { text: string; ok: boolean }>>({})
 const loading = ref(false)
 const loadError = ref('')
 const savingID = ref<number | null>(null)
 // 保存与刷新互斥：两者并发时，较早发出的 GET 可能在保存之后返回，把页面显示恢复成旧配置。
-const busy = computed(() => loading.value || savingID.value !== null)
+// busy 必须**含手工触发**：它同步执行、最长等 5 分钟，期间若允许保存或整页刷新，较早发出的
+// 那一方晚到的响应会把本行覆盖回旧状态（三个入口都是无条件写回该行）。三者互斥是最省的时序保护。
+const busy = computed(() => loading.value || savingID.value !== null || refreshingKey.value !== null)
 // 让页面每秒重算一次剩余时间，而不去重新拉 overview（那会清掉未保存的草稿）。
 const nowTick = ref(Date.now())
 // loadedAt 是最近一次拿到 overview 的本地时刻，作为倒计时的默认基准。
@@ -603,6 +626,56 @@ async function loadProxies(): Promise<void> {
   }
 }
 
+function refreshKey(accountID: number, model: string): string {
+  return `${accountID}::${model}`
+}
+
+function refreshNote(accountID: number, model: string): string {
+  return refreshNotes[refreshKey(accountID, model)]?.text ?? ''
+}
+
+function refreshNoteClass(accountID: number, model: string): string {
+  const ok = refreshNotes[refreshKey(accountID, model)]?.ok
+  return ok ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-300'
+}
+
+// triggerRefresh 手工走一遍取票/验票。
+//
+// 拿到票与被拒都算正常结果，区别只在提示文案；只有请求本身失败（未启用、模型不在门控集合、
+// 账号不存在）才是错误。
+async function triggerRefresh(row: TicketAccountStatus, model: string): Promise<void> {
+  const key = refreshKey(row.account_id, model)
+  refreshingKey.value = key
+  delete refreshNotes[key]
+  try {
+    const res = await codexTicketAPI.triggerRefresh(row.account_id, model)
+    const r = res.result
+    const parts: string[] = []
+    if (r?.revived_ticket_id) parts.push(`复用已拒票 #${r.revived_ticket_id} 重验`)
+    if (r?.allowed) {
+      parts.push(`已拿到票${r.ticket_id ? ` #${r.ticket_id}` : ''}`)
+      refreshNotes[key] = { text: parts.join('，'), ok: true }
+    } else {
+      parts.push(`未拿到票：${denyReasonText(r?.deny_reason)}`)
+      if (r?.retry_after) parts.push(`可再试于 ${formatTime(r.retry_after)}`)
+      refreshNotes[key] = { text: parts.join('，'), ok: false }
+    }
+    // 服务端把该行的最新状态一起回了，直接替换——重新拉 overview 会冲掉其它行未保存的草稿。
+    if (res.status) {
+      const list = overview.value?.accounts
+      if (list) {
+        const index = list.findIndex((item) => item.account_id === row.account_id)
+        if (index >= 0) list.splice(index, 1, res.status)
+      }
+      rowLoadedAt[row.account_id] = Date.now()
+    }
+  } catch (error) {
+    refreshNotes[key] = { text: extractApiErrorMessage(error, '触发失败'), ok: false }
+  } finally {
+    refreshingKey.value = null
+  }
+}
+
 async function loadEvents(offset: number): Promise<void> {
   eventsLoading.value = true
   eventsError.value = ''
@@ -647,6 +720,24 @@ const egressReasons: Record<string, string> = {
 
 function egressReasonText(reason: string): string {
   return egressReasons[reason] ?? reason
+}
+
+// 拒服原因的人话。多数不是故障：静默未满、模式不是 full 都是正常结论，文案要说清「等什么」。
+const denyReasons: Record<string, string> = {
+  account_unready: '账号当前不可调度',
+  egress_unusable: '票据出口失效，或与流量出口合并了',
+  no_ticket_source: '没配票据出口（egress=none），无法主动取票',
+  window_closed: '静默或冷却未满，还不能取票',
+  task_no_ticket: '本次取票/验票没有产出可用票——看诊断与事件（上游未下发、长度被挡、或归因不合格）',
+  mode_not_full: '该账号不是 full 模式，不参与注入',
+  egress_busy: '票据出口正被另一个账号占用',
+  wait_timeout: '在途任务未在等待期限内给出结果',
+  other_model_task: '在途任务属于另一个模型',
+}
+
+function denyReasonText(reason: string | null | undefined): string {
+  if (!reason) return '原因未给出'
+  return denyReasons[reason] ?? reason
 }
 
 function outcomeClass(outcome: string): string {

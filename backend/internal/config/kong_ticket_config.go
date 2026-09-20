@@ -1,5 +1,7 @@
 package config
 
+import "os"
+
 // Codex 票据功能的配置。字段定义单独放在本文件里，`GatewayConfig` 那边只留一行挂载点——
 // 本 fork 会长期 rebase 到新的上游基线，改动集中在自有文件里时冲突面最小。
 //
@@ -29,6 +31,23 @@ package config
 // 无解。最优只能接受空窗：把静默设到门槛之上，代价是每个模型每周期都有一段无票期。要真正同时
 // 覆盖两个模型，得让一张票跨模型复用——那要改票的身份定义，且"一张票能否跨模型用"尚未实测。
 const DefaultKongTicketAcceptExtra = "gpt-5.6-sol:gpt-6-astra,gpt-5.5"
+
+// KongTicketAcceptExtraEnv 是 AcceptExtra 对应的环境变量名（viper 的 `.` → `_` 映射结果）。
+const KongTicketAcceptExtraEnv = "GATEWAY_KONG_CODEX_TICKET_ACCEPT_EXTRA"
+
+// applyKongTicketEnvOverrides 在 Unmarshal 之后按环境变量覆盖票据配置。
+//
+// **为什么必须单独覆盖**：viper 的 `AutomaticEnv` 默认忽略**空**环境变量，所以把
+// `GATEWAY_KONG_CODEX_TICKET_ACCEPT_EXTRA` 显式设成空串时，解码结果仍是非空默认值——运维要求
+// "sol 只接受自己"却拿到了含 5.5 的默认白名单，而这个方向是**放宽**判据，不是收紧。
+//
+// 不开全局 `AllowEmptyEnv`：那会改变上游其它所有配置项对空值的语义。这里只覆盖这一个字段，与
+// 上游对 `SERVER_TRUSTED_PROXIES` 的处理同一范式。
+func applyKongTicketEnvOverrides(cfg *KongCodexTicketConfig) {
+	if raw, present := os.LookupEnv(KongTicketAcceptExtraEnv); present {
+		cfg.AcceptExtra = raw
+	}
+}
 
 // KongCodexTicketConfig 是 Codex 票据功能里需要运维调整的部分。
 type KongCodexTicketConfig struct {
