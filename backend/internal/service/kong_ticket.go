@@ -295,11 +295,13 @@ func KongNormalizeEventLimit(limit int) int {
 }
 
 // KongTicketEventFilter 是事件查询条件。
+// 三个多值条件都是**组内 OR、组间 AND**：空切片表示该维度不过滤。页面上的筛选器是多选的，
+// 而「一次看两个账号的同一类事件」正是排查时最常要的对照。
 type KongTicketEventFilter struct {
-	AccountID *int64
-	// Model 按最终上游模型过滤。诊断是 (account, model) 绑定的，不按它过滤会取到别的模型的事件。
-	Model     string
-	EventType string
+	AccountIDs []int64
+	// Models 按最终上游模型过滤。诊断是 (account, model) 绑定的，不按它过滤会取到别的模型的事件。
+	Models     []string
+	EventTypes []string
 	// FinalOnly 只取「最终事件」（detail.final = true）。
 	//
 	// 诊断必须带它：verify 事件流里既有最终结论，也有单份挑战失败这种非最终事件，不筛就会把

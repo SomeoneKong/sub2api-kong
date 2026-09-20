@@ -194,20 +194,27 @@
         <section class="card px-4 py-4 sm:px-6">
           <div class="mb-3 flex flex-wrap items-center gap-3">
             <h2 class="text-sm font-semibold text-gray-900 dark:text-white">事件</h2>
-            <select v-model="eventAccountFilter" class="input w-48" @change="loadEvents(0)">
-              <option value="">全部账号</option>
-              <option v-for="row in accounts" :key="row.account_id" :value="String(row.account_id)">
-                {{ row.name }}
-              </option>
-            </select>
-            <select v-model="eventModelFilter" class="input w-44" @change="loadEvents(0)">
-              <option value="">全部模型</option>
-              <option v-for="m in gatedModels" :key="m" :value="m">{{ m }}</option>
-            </select>
-            <select v-model="eventTypeFilter" class="input w-48" @change="loadEvents(0)">
-              <option value="">全部事件类型</option>
-              <option v-for="t in eventTypeOptions" :key="t.value" :value="t.value">{{ t.label }}</option>
-            </select>
+            <EventFilterSelect
+              v-model="eventAccountFilter"
+              class="w-48"
+              all-label="全部账号"
+              :options="accountFilterOptions"
+              @change="loadEvents(0)"
+            />
+            <EventFilterSelect
+              v-model="eventModelFilter"
+              class="w-44"
+              all-label="全部模型"
+              :options="modelFilterOptions"
+              @change="loadEvents(0)"
+            />
+            <EventFilterSelect
+              v-model="eventTypeFilter"
+              class="w-48"
+              all-label="全部事件类型"
+              :options="eventTypeOptions"
+              @change="loadEvents(0)"
+            />
             <button type="button" class="btn btn-secondary btn-sm" :disabled="eventsLoading" @click="loadEvents(0)">查询</button>
           </div>
 
@@ -326,6 +333,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { adminAPI } from '@/api/admin'
 import type { Proxy } from '@/types'
 import codexTicketAPI from './api'
+import EventFilterSelect from './EventFilterSelect.vue'
 import type {
   FingerprintProbe,
   TicketDiagnosis,
@@ -385,9 +393,15 @@ const eventsError = ref('')
 const eventTotal = ref(0)
 const eventOffset = ref(0)
 const eventLimit = 50
-const eventAccountFilter = ref('')
-const eventTypeFilter = ref('')
-const eventModelFilter = ref('')
+// 三个筛选条件都是多选：空数组即该维度不过滤（与后端一致）。
+const eventAccountFilter = ref<string[]>([])
+const eventTypeFilter = ref<string[]>([])
+const eventModelFilter = ref<string[]>([])
+
+const accountFilterOptions = computed(() =>
+  accounts.value.map((row) => ({ value: String(row.account_id), label: row.name })),
+)
+const modelFilterOptions = computed(() => gatedModels.value.map((m) => ({ value: m, label: m })))
 
 const expandedEventID = ref<number | null>(null)
 // 请求序号：只有最新一次请求的结果才写入状态。否则先展开 A 再展开 B、而 A 较晚返回时，
@@ -720,9 +734,9 @@ async function loadEvents(offset: number): Promise<void> {
   probesSeq++
   try {
     const page = await codexTicketAPI.listEvents({
-      account_id: eventAccountFilter.value ? Number(eventAccountFilter.value) : undefined,
-      model: eventModelFilter.value || undefined,
-      event_type: eventTypeFilter.value.trim() || undefined,
+      account_ids: eventAccountFilter.value.map(Number),
+      models: eventModelFilter.value,
+      event_types: eventTypeFilter.value,
       limit: eventLimit,
       offset: next,
     })

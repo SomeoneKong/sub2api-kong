@@ -284,9 +284,9 @@ func (s *KongTicketAdminService) statusOf(ctx context.Context, account *KongAcco
 // 上留下归因，但它们恰恰是运维要看的——「这个账号最近一直探不出结论」和「探出来是 sol」都要能看见。
 func (s *KongTicketAdminService) latestDiagnosis(ctx context.Context, accountID int64, model string) (*KongTicketDiagnosis, error) {
 	events, _, err := s.repo.ListEvents(ctx, &KongTicketEventFilter{
-		AccountID: &accountID,
-		Model:     model,
-		EventType: KongEventVerify,
+		AccountIDs: []int64{accountID},
+		Models:     []string{model},
+		EventTypes: []string{KongEventVerify},
 		// 只要最终事件。不筛的话，一条「第 2 份挑战失败」这种非最终事件会排在最前面，
 		// 把本次验证真正的结论盖掉——页面于是显示「未得出结论」，而库里明明有。
 		FinalOnly: true,
@@ -338,10 +338,10 @@ func (s *KongTicketAdminService) lastSample(ctx context.Context, accountID int64
 	var latest *KongTicketEvent
 	for _, eventType := range []string{KongEventObserve, KongEventProbeSkipped} {
 		events, _, err := s.repo.ListEvents(ctx, &KongTicketEventFilter{
-			AccountID: &accountID,
-			Model:     model,
-			EventType: eventType,
-			Limit:     1,
+			AccountIDs: []int64{accountID},
+			Models:     []string{model},
+			EventTypes: []string{eventType},
+			Limit:      1,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("查取样事件: %w", err)

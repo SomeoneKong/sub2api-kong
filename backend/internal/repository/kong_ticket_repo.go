@@ -10,8 +10,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lib/pq"
+
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
+
+// kongNonEmpty 去掉空白项。空切片与「只含空串的切片」都表示该维度不过滤——否则
+// `model = ANY('{""}')` 会筛成只剩空模型的事件，看起来像「一条都没有」。
+func kongNonEmpty(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
 
 // kongTicketRepository 是 Codex 票据子系统的仓储（raw SQL）。
 //
@@ -416,14 +430,14 @@ func (r *kongTicketRepository) ListEvents(ctx context.Context, filter *service.K
 		args = append(args, val)
 		conds = append(conds, fmt.Sprintf(cond, len(args)))
 	}
-	if filter.AccountID != nil {
-		add("account_id = $%d", *filter.AccountID)
+	if len(filter.AccountIDs) > 0 {
+		add("account_id = ANY($%d)", pq.Array(filter.AccountIDs))
 	}
-	if strings.TrimSpace(filter.Model) != "" {
-		add("model = $%d", strings.TrimSpace(filter.Model))
+	if models := kongNonEmpty(filter.Models); len(models) > 0 {
+		add("model = ANY($%d)", pq.Array(models))
 	}
-	if strings.TrimSpace(filter.EventType) != "" {
-		add("event_type = $%d", strings.TrimSpace(filter.EventType))
+	if types := kongNonEmpty(filter.EventTypes); len(types) > 0 {
+		add("event_type = ANY($%d)", pq.Array(types))
 	}
 	if filter.FinalOnly {
 		// 只认显式为真的 `final`。缺这个键的历史事件一律不算最终事件——把它们当成最终结论，

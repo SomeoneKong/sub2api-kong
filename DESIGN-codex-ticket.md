@@ -841,7 +841,7 @@ Create / Edit 两个模板之间保持字段同步。
 |---|---|
 | `GET /admin/kong/ticket/overview` | 账号列表 + 各自的配置与当前票状态（区 1、2） |
 | `PUT /admin/kong/ticket/accounts/:id` | 改 `codex_ticket_mode` / `ticket_egress` / `ticket_proxy_id` |
-| `GET /admin/kong/ticket/events` | 事件分页，按账号、类型、时间筛（区 3） |
+| `GET /admin/kong/ticket/events` | 事件分页，按账号、模型、类型、时间筛（区 3）。前三者多值，组内 OR、组间 AND，逗号分隔或重复同名参数皆可，空即不过滤 |
 | `GET /admin/kong/ticket/probes/:verification_id` | 一次验证的各份探测明细 |
 | `POST /admin/kong/ticket/accounts/:id/refresh` | **人工干预**：对指定模型立刻取票/验票 |
 

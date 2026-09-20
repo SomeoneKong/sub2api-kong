@@ -143,11 +143,12 @@ export interface TicketEventPage {
   offset: number
 }
 
+// 三个条件都是多值：组内 OR、组间 AND，空数组即该维度不过滤。
 export interface TicketEventQuery {
-  account_id?: number
+  account_ids?: number[]
   /** 按最终上游模型过滤。诊断与票都是 (account, model) 绑定的。 */
-  model?: string
-  event_type?: string
+  models?: string[]
+  event_types?: string[]
   limit?: number
   offset?: number
 }

@@ -31,9 +31,10 @@ export async function listEvents(query: TicketEventQuery = {}): Promise<TicketEv
     limit: query.limit ?? 50,
     offset: query.offset ?? 0,
   }
-  if (query.account_id !== undefined) params.account_id = query.account_id
-  if (query.model) params.model = query.model
-  if (query.event_type) params.event_type = query.event_type
+  // 多值条件用逗号拼一个参数，不用 axios 默认的 `key[]=` 数组序列化——后端读的是裸参数名。
+  if (query.account_ids?.length) params.account_id = query.account_ids.join(',')
+  if (query.models?.length) params.model = query.models.join(',')
+  if (query.event_types?.length) params.event_type = query.event_types.join(',')
   const { data } = await apiClient.get<TicketEventPage>(`${basePath}/events`, { params })
   return data
 }

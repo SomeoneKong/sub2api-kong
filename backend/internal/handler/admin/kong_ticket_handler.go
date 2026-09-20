@@ -145,16 +145,16 @@ func (h *KongTicketHandler) ListEvents(c *gin.Context) {
 		return
 	}
 	filter := &service.KongTicketEventFilter{
-		Model:     strings.TrimSpace(c.Query("model")),
-		EventType: strings.TrimSpace(c.Query("event_type")),
+		Models:     kongTicketQueryList(c, "model"),
+		EventTypes: kongTicketQueryList(c, "event_type"),
 	}
-	if raw := strings.TrimSpace(c.Query("account_id")); raw != "" {
+	for _, raw := range kongTicketQueryList(c, "account_id") {
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
 			response.BadRequest(c, "invalid account_id")
 			return
 		}
-		filter.AccountID = &id
+		filter.AccountIDs = append(filter.AccountIDs, id)
 	}
 	if raw := strings.TrimSpace(c.Query("since")); raw != "" {
 		t, err := time.Parse(time.RFC3339, raw)
@@ -232,6 +232,20 @@ func (h *KongTicketHandler) ListProbes(c *gin.Context) {
 		items = append(items, item)
 	}
 	response.Success(c, gin.H{"items": items})
+}
+
+// kongTicketQueryList 读一个多值查询条件。同名参数重复出现与逗号分隔两种写法都接受——
+// 前端用逗号拼，重复参数是 curl 排查时更顺手的写法；空白项一律丢掉，所以「显式传空」等于不过滤。
+func kongTicketQueryList(c *gin.Context, key string) []string {
+	var out []string
+	for _, raw := range c.QueryArray(key) {
+		for _, part := range strings.Split(raw, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
 }
 
 func kongTicketQueryInt(c *gin.Context, key string, fallback int) int {
