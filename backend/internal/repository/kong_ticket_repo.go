@@ -152,6 +152,24 @@ func (r *kongTicketRepository) OldestCandidate(ctx context.Context, accountID in
 	return t, nil
 }
 
+// NewestCandidate 返回最新的一张可验证候选（人工「立即验票」用，顺序与上面相反的理由见接口注释）。
+// 同样不选 skip_until_new 的：那些是「未被上游接受」留下的，重选只会重复同一个无效尝试。
+func (r *kongTicketRepository) NewestCandidate(ctx context.Context, accountID int64, model string, now time.Time) (*service.KongTicket, error) {
+	query := `SELECT ` + kongTicketColumns + ` FROM kong_ticket_cache
+		WHERE account_id = $1 AND model = $2 AND status = $3
+		  AND expires_at > $4 AND NOT skip_until_new
+		ORDER BY captured_at DESC LIMIT 1`
+	t, err := scanKongTicket(r.db.QueryRowContext(ctx, query,
+		accountID, model, service.KongTicketStatusUnverified, now))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query newest candidate: %w", err)
+	}
+	return t, nil
+}
+
 func (r *kongTicketRepository) InsertTicket(ctx context.Context, t *service.KongTicket) (int64, bool, error) {
 	// ON CONFLICT DO NOTHING + 回查：靠唯一约束原子地区分「新票」与「重复票」。
 	//

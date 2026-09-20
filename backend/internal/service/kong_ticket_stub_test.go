@@ -17,7 +17,7 @@ type kongStubRepo struct {
 	mu sync.Mutex
 
 	current      map[string][]*KongTicket
-	candidate    map[string]*KongTicket
+	candidates   map[string][]*KongTicket
 	nextID       int64
 	inserted     []*KongTicket
 	events       []*KongTicketEvent
@@ -73,7 +73,7 @@ type kongStubStatusSet struct {
 func newKongStubRepo() *kongStubRepo {
 	return &kongStubRepo{
 		current:     map[string][]*KongTicket{},
-		candidate:   map[string]*KongTicket{},
+		candidates:  map[string][]*KongTicket{},
 		lastEventAt: map[string]*time.Time{},
 		byState:     map[string]int64{},
 		tickets:     map[int64]*kongStubTicketState{},
@@ -102,9 +102,11 @@ func (r *kongStubRepo) poolOf(accountID int64, model string) []*KongTicket {
 			out = append(out, t)
 		}
 	}
-	if t := r.candidate[key]; t != nil && !seen[t.ID] {
-		seen[t.ID] = true
-		out = append(out, t)
+	for _, t := range r.candidates[key] {
+		if t != nil && !seen[t.ID] {
+			seen[t.ID] = true
+			out = append(out, t)
+		}
 	}
 	// 本轮 InsertTicket 插进来的票同样要在池子里：生产侧 VerifiedTickets 查的是表，刚插入的行
 	// 当然查得到。少了这一支，「取票 → 验证 → 回读当前票」这条链路在测试里永远断在最后一步
@@ -165,9 +167,11 @@ func (r *kongStubRepo) ticketByID(id int64) *KongTicket {
 			}
 		}
 	}
-	for _, t := range r.candidate {
-		if t != nil && t.ID == id {
-			return t
+	for _, list := range r.candidates {
+		for _, t := range list {
+			if t != nil && t.ID == id {
+				return t
+			}
 		}
 	}
 	// 也要找本轮插入的票：否则「取票 → 验证 → 归因回写 → 按当前白名单授予资格」这条链路断在
@@ -187,6 +191,29 @@ func (r *kongStubRepo) stateOf(t *KongTicket) *kongStubTicketState {
 		return nil
 	}
 	return r.tickets[t.ID]
+}
+
+func (r *kongStubRepo) NewestCandidate(_ context.Context, accountID int64, model string, now time.Time) (*KongTicket, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// 生产条件：unverified、未过期、未被跳过；**不筛来源、不看 minAge**，从整池里挑最晚采集的
+	// 那张，与生产的 ORDER BY captured_at DESC 一致。
+	var best *KongTicket
+	var bestCaptured time.Time
+	for _, t := range r.poolOf(accountID, model) {
+		st := r.stateOf(t)
+		status, expires, skip, captured := t.Status, t.ExpiresAt, t.SkipUntilNew, t.CapturedAt
+		if st != nil {
+			status, expires, skip, captured = st.Status, st.ExpiresAt, st.SkipUntilNew, st.CapturedAt
+		}
+		if status != KongTicketStatusUnverified || skip || !expires.After(now) {
+			continue
+		}
+		if best == nil || captured.After(bestCaptured) {
+			best, bestCaptured = t, captured
+		}
+	}
+	return best, nil
 }
 
 func (r *kongStubRepo) OldestCandidate(_ context.Context, accountID int64, model string, minAge time.Duration, now time.Time) (*KongTicket, error) {

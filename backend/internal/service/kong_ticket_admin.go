@@ -422,7 +422,7 @@ func (s *KongTicketAdminService) TriggerRefresh(ctx context.Context, accountID i
 	return result, status, nil
 }
 
-// TriggerVerify 立即重验当前票；验不成功即作废。触发后同样回一份新状态。
+// TriggerVerify 验现有的票（当前票 + 真降档后的一张最新候选），永不取票。触发后回一份新状态。
 func (s *KongTicketAdminService) TriggerVerify(ctx context.Context, accountID int64, model string) (*KongManualVerify, *KongTicketAccountStatus, error) {
 	if s.svc == nil {
 		return nil, nil, fmt.Errorf("票据功能未启用，无法手工验票")

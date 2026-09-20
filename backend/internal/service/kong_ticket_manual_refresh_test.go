@@ -26,11 +26,11 @@ func TestKongTriggerRefreshRevivesRejectedTicket(t *testing.T) {
 		ExpiresAt: time.Now().Add(30 * time.Minute), CapturedAt: time.Now().Add(-time.Minute),
 		Source: KongTicketSourceFetch,
 	}
-	repo.candidate[kongStubKey(1, "gpt-6-astra")] = &KongTicket{
+	repo.candidates[kongStubKey(1, "gpt-6-astra")] = []*KongTicket{{
 		ID: 7, AccountID: 1, Model: "gpt-6-astra", State: strings.Repeat("a", 292),
 		Status: KongTicketStatusRejected, Source: KongTicketSourceFetch,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
-	}
+	}}
 
 	out, err := svc.TriggerRefresh(context.Background(), 1, "gpt-6-astra")
 	if err != nil {
@@ -209,7 +209,7 @@ func TestKongManualRevivedTicketBecomesUsable(t *testing.T) {
 		Status: KongTicketStatusRejected, Source: KongTicketSourceFetch,
 		ExpiresAt: now.Add(40 * time.Minute), CapturedAt: now.Add(-2 * time.Minute),
 	}
-	repo.candidate[kongStubKey(1, model)] = rejected
+	repo.candidates[kongStubKey(1, model)] = []*KongTicket{rejected}
 	repo.tickets[7] = &kongStubTicketState{
 		AccountID: 1, Model: model, Status: KongTicketStatusRejected,
 		ExpiresAt: rejected.ExpiresAt, CapturedAt: rejected.CapturedAt, Source: KongTicketSourceFetch,

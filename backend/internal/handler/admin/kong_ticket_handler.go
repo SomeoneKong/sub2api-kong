@@ -139,7 +139,8 @@ func (h *KongTicketHandler) TriggerRefresh(c *gin.Context) {
 	response.Success(c, gin.H{"result": result, "status": status})
 }
 
-// TriggerVerify 立即重验当前票。验不成功即作废，那同样不是错误——页面靠 revoked / reason 说明。
+// TriggerVerify 验现有的票：当前票，以及它真降档后的一张最新候选。验不通过不是错误——页面靠
+// steps 逐条说明（作废 / 未得出结论 / 通过各不相同）。
 func (h *KongTicketHandler) TriggerVerify(c *gin.Context) {
 	if !h.ready(c) {
 		return

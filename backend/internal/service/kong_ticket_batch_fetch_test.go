@@ -369,7 +369,7 @@ func TestKongBulkSkipSparesFetchCandidate(t *testing.T) {
 		Status: KongTicketStatusUnverified, Source: KongTicketSourceObserved,
 		ExpiresAt: now.Add(40 * time.Minute), CapturedAt: now.Add(-30 * time.Minute),
 	}
-	repo.candidate[kongStubKey(1, kongBatchAstra)] = observed
+	repo.candidates[kongStubKey(1, kongBatchAstra)] = []*KongTicket{observed}
 	repo.tickets[observed.ID] = &kongStubTicketState{
 		AccountID: 1, Model: kongBatchAstra, Status: KongTicketStatusUnverified,
 		ExpiresAt: observed.ExpiresAt, CapturedAt: observed.CapturedAt, Source: KongTicketSourceObserved,

@@ -230,7 +230,7 @@ func TestKongStubRepoHonorsProductionConditions(t *testing.T) {
 
 	// observed 候选要满足最小年龄；fetch 不受限。
 	fresh := &KongTicket{ID: 900, AccountID: 5, Model: "gpt-6-astra", Source: KongTicketSourceObserved}
-	repo.candidate[kongStubKey(5, "gpt-6-astra")] = fresh
+	repo.candidates[kongStubKey(5, "gpt-6-astra")] = []*KongTicket{fresh}
 	repo.tickets[900] = &kongStubTicketState{
 		AccountID: 5, Model: "gpt-6-astra", Status: KongTicketStatusUnverified,
 		ExpiresAt: now.Add(time.Hour), CapturedAt: now, Source: KongTicketSourceObserved,

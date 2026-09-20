@@ -396,7 +396,7 @@ func (s *KongTicketService) runTask(ctx context.Context, account *Account, model
 
 	switch decision.Action {
 	case KongActionVerifyCandidate:
-		id, verr := s.verifyExistingCandidate(ctx, fresh, freshCfg, model, taskStartedAt)
+		id, verr := s.verifyExistingCandidate(ctx, fresh, freshCfg, model, taskStartedAt, manual)
 		return id, revivedID, verr
 	case KongActionFetch, KongActionInjectAndPrefetch:
 		// InjectAndPrefetch 必须**真的取票**：预取正是在这个决策下启动的，重算必然又得到它，
@@ -584,6 +584,15 @@ func (s *KongTicketService) releaseTask(accountID int64, task *kongTicketTask) {
 // 前者该作废票，后者只能保留旧结论（否则一次网络抖动就白扔一张好票，而重新取票要等约 34 分钟
 // 静默——那是无谓拒服）。
 var ErrKongTicketNotAccepted = errors.New("候选票未被上游接受")
+
+// ErrKongTicketDowngraded 表示**本次验证自己测出并成功提交了"归因不合格"**这个结论。
+//
+// 它与"读库发现票已是 rejected"必须分开：后者可能是**别的路径**刚把票撤销掉（业务请求拿到上游
+// 重发的票就会撤销当前票），而那时本次验证可能什么都没测出来。凭读库状态推断"真降档"，会在
+// 那种并发下继续验第二张——白烧一整张票的额度（最多三份真实挑战）。
+//
+// 只在 CommitVerification 返回 committed=true 且归因不合格时包上它：没提交成功的结论不算结论。
+var ErrKongTicketDowngraded = errors.New("归因不合格，已判为降档")
 
 // kongFetchOne 是一次取票的结果。只有触发模型（leader）的这一份会回传给调用方——其余成员的
 // 成败全部在 fetchStore 内部记进事件，调用方不据此改变行为（见 fetchAndVerify 的注释）。
@@ -832,8 +841,18 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 }
 
 // verifyExistingCandidate 验证缓存里已有的候选。
-func (s *KongTicketService) verifyExistingCandidate(ctx context.Context, account *Account, cfg KongTicketConfig, model string, taskStartedAt time.Time) (int64, error) {
-	candidate, err := s.repo.OldestCandidate(ctx, account.ID, model, s.params.MinTicketAge, time.Now())
+//
+// manual 只改**挑哪一张**：人工触发挑最新的（剩余 TTL 最长，且批量取票下它通常就是刚在 292
+// 窗口里取回的那张），自动触发挑最老的（在清一个队列，先验快过期的才有机会用上它）。挑法之外
+// 两条路径完全相同——验证本身没有"人工版"。
+func (s *KongTicketService) verifyExistingCandidate(ctx context.Context, account *Account, cfg KongTicketConfig, model string, taskStartedAt time.Time, manual bool) (int64, error) {
+	var candidate *KongTicket
+	var err error
+	if manual {
+		candidate, err = s.repo.NewestCandidate(ctx, account.ID, model, time.Now())
+	} else {
+		candidate, err = s.repo.OldestCandidate(ctx, account.ID, model, s.params.MinTicketAge, time.Now())
+	}
 	if err != nil {
 		return 0, fmt.Errorf("查候选票: %w", err)
 	}
@@ -1322,6 +1341,9 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 		// 提交之后这张票已是 rejected，不在 `SkipCandidatesFor` 的 unverified 范围内，只有别的
 		// 旧候选会被标掉，正是想要的效果。
 		skipDrySpell("not_target_model")
+		// 结论已落库，这才是"本次测出的真降档"。包上 sentinel 供人工路径辨识（见
+		// ErrKongTicketDowngraded），文本原样保留——调用方与页面都按文本显示原因。
+		retErr = fmt.Errorf("%w：%w", ErrKongTicketDowngraded, retErr)
 	}
 	return grantedID, retErr
 }
@@ -1738,6 +1760,16 @@ type KongManualVerify struct {
 	// Inconclusive 为真表示**没能完成测量**（超时、429、前提失效、写库失败），旧票与旧结论保留。
 	// 它与 Revoked 互斥，两者都为假且 Accepted 为假时说明压根没开始验（见 DenyReason）。
 	Inconclusive bool `json:"inconclusive"`
+	// Candidate 为真表示验的是一张**候选**，不是正在服务的票。调用方据它措辞：候选通过是
+	// "升为当前票"、被拒是"从候选池排除"，与作废一张在服务的票不是一回事。
+	Candidate bool `json:"candidate"`
+	// BudgetExhausted 为真表示还有一张候选没验——本端点是同步的，余量不够再跑一张（最坏约 90s）
+	// 时宁可不开始，调用方据它提示"可以再点一次"。
+	BudgetExhausted bool `json:"budget_exhausted"`
+	// Steps 是本次实际验过的每一张票，按执行顺序。**顶层那几个字段等于最后一步**——最后一步决定
+	// 最终局面，但只看它会漏掉过程中发生的事（比如当前票已被作废、随后候选补上了），而"当前票
+	// 被作废"恰恰是调用方最需要看到的。
+	Steps []KongManualVerifyStep `json:"steps"`
 	// Reason 是没通过的原因，取 verifyTicket 的错误文本。
 	Reason string `json:"reason"`
 	// NotApplicable 表示压根没票可验，或该账号已退出保护（mode=off）。
@@ -1746,15 +1778,37 @@ type KongManualVerify struct {
 	DenyReason string `json:"deny_reason"`
 }
 
-// TriggerVerify 立即重验**当前票**，同步返回结果；**验不成功就把它作废**。
+// KongManualVerifyStep 是「立即验票」序列里一张票的结果，三态语义与 KongManualVerify 顶层相同。
+type KongManualVerifyStep struct {
+	TicketID int64 `json:"ticket_id"`
+	// Candidate 区分"正在服务的票"与"候选"：失败后果不同（作废 vs 从候选池排除）。
+	Candidate    bool   `json:"candidate"`
+	Accepted     bool   `json:"accepted"`
+	Revoked      bool   `json:"revoked"`
+	Inconclusive bool   `json:"inconclusive"`
+	Reason       string `json:"reason"`
+}
+
+// kongManualVerifyBudgetFloor 是开始验下一张之前要求的剩余期限。
 //
-// 与 TriggerRefresh 的分工：那个是"想办法拿到一张可用票"（可以取新票），这个只针对当前正在服务
-// 的那一张，回答"它现在还是合格档位吗"。
+// 生产实测单份挑战 27–31s、一张票用满三份约 87s，所以要留 100s 才不会把第二张掐断在中途——
+// 掐断的代价是额度已经烧掉、结论却没落，两头都亏。
+const kongManualVerifyBudgetFloor = 100 * time.Second
+
+// TriggerVerify 人工验票：验**现有的票**，同步返回结果。本端点**永不取票**——那是 TriggerRefresh
+// 的职责，这条分界是两个按钮的全部区别。
 //
-// **不成功即失效**是刻意的，与整套设计的立场一致——宁可拒服也不接受降智输出。归因不合格时
-// verifyTicket 自己就会把票标成 rejected；这里额外覆盖的是**没能得出结论**的那些终点（前提失效、
-// 没有有效回答、证据写失败）：那时票还是 verified，留着就等于让一张没能自证的票继续被注入。
-// 代价是一次网络抖动可能白扔一张好票，但这是人工按下的按钮、且随后可以手工取票补回来。
+// 一次最多验两张，顺序固定：**先正在服务的那一张，再一张未验候选**。
+//
+//   - 先验当前票是安全优先而不是效率优先：它正在被注入，降智输出正在流出，哪怕它马上就要过期。
+//   - 候选只验**一张**，取最新的那张（剩余 TTL 最长，批量取票下它通常正是刚在 292 窗口里取回的）。
+//     不往更老的翻，是因为候选都来自同一条出口、入库时已过长度黑名单：最新那张归因不合格，基本
+//     就说明账号当前档位低，更老的多半同样不合格，而每张的代价是最多三份真实挑战。
+//
+// 结论分三态，**只在"真验出问题"时作废**：证据完整而归因不合格（真降档）、或上游明确重发了票
+// （ErrKongTicketNotAccepted，我们那张注入已不作数）→ 作废；重新自证合格 → 通过；超时、429、
+// 前提失效、写库失败 → 未得出结论，旧票与旧结论都保留。第三类刻意不作废——那些结果没有证伪原
+// 结论，而重新取票要等约 34 分钟静默，据此扔掉一张仍在 TTL 内的好票就是无谓拒服。
 //
 // 验证走**流量出口**，不消耗票据出口的静默（那是全系统最稀缺的资源），所以不受静默与冷却约束。
 func (s *KongTicketService) TriggerVerify(ctx context.Context, accountID int64, model string) (*KongManualVerify, error) {
@@ -1767,8 +1821,8 @@ func (s *KongTicketService) TriggerVerify(ctx context.Context, accountID int64, 
 	}
 	out := &KongManualVerify{}
 	cfg, _ := ParseKongTicketConfig(account.Extra)
-	// off 连不上这条路：recheckVerify 会以「已退出保护」立刻作废结论，那时再按"不成功即失效"
-	// 作废票就纯属误伤。
+	// off 连不上这条路：`recheckVerify` 会以「已退出保护」中止，于是这次验证**必然**以"未得出
+	// 结论"收尾——不是会误伤票（三态已经不会了），而是压根问不出答案，没有让人点的理由。
 	if cfg.Mode == KongTicketModeOff {
 		out.NotApplicable = true
 		out.DenyReason = KongDenyModeNotFull
@@ -1778,24 +1832,29 @@ func (s *KongTicketService) TriggerVerify(ctx context.Context, accountID int64, 
 		out.DenyReason = KongDenyAccountUnready
 		return out, nil
 	}
-	ticket, err := kongPickCurrent(ctx, s.repo, s.accept, s.confidence, accountID, model)
+
+	current, err := kongPickCurrent(ctx, s.repo, s.accept, s.confidence, accountID, model)
 	if err != nil {
 		return nil, err
 	}
-	if ticket == nil {
-		// 没有当前票就没有"验它"这回事。**不要顺手去验候选**——那是 TriggerRefresh 的事，
-		// 在这里做会让一个按钮有两种语义。
-		out.NotApplicable = true
-		return out, nil
+	// 先确认有东西可验再占槽位：没有的话占了也只是白挡住别的调用。
+	if current == nil {
+		candidate, cerr := s.repo.NewestCandidate(ctx, accountID, model, time.Now())
+		if cerr != nil {
+			return nil, cerr
+		}
+		if candidate == nil {
+			out.NotApplicable = true
+			return out, nil
+		}
 	}
-	out.TicketID = ticket.ID
 
 	// 占账号槽位而不是票据出口槽位：验证走流量出口，与出口静默无关（同 kongVerifyOnlySlot 的理由）。
 	// 争的是"同一账号别同时发两拨挑战"。
 	task, outcome := s.claimTask(accountID, model, kongVerifyOnlySlot(accountID))
 	if outcome != kongClaimFresh {
-		// 已有在途任务时不等它：那个任务可能在取新票，与"验这一张"不是同一件事，等来的结论
-		// 挂到这张票上是错的。
+		// 已有在途任务时不等它：那个任务可能在取新票，与"验这几张"不是同一件事，等来的结论
+		// 挂到这些票上是错的。
 		out.DenyReason = KongDenyOtherModelTask
 		if outcome == kongClaimEgressBusy {
 			out.DenyReason = KongDenyEgressBusy
@@ -1808,24 +1867,103 @@ func (s *KongTicketService) TriggerVerify(ctx context.Context, accountID int64, 
 	//
 	// 期限取 kongWaitBudget 而不是 kongTaskBudget：这个端点是**同步**的，调用方的超时是 330s，
 	// 给它 15 分钟等于让页面必然先报失败、而后台还在改票的状态，最终结论无人看见。
-	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kongWaitBudget)
-	defer cancel()
-	granted, verifyErr := s.verifyTicket(tctx, account, cfg, model, ticket.ID, ticket.State,
-		ticket.Source, ticket.ExpiresAt, kongCaptureOf(ticket), time.Now(), true)
-	if granted != 0 && verifyErr == nil {
-		out.Accepted = true
-		return out, nil
-	}
-	if verifyErr != nil {
-		out.Reason = verifyErr.Error()
+	// **占到槽位之后重读当前票**：上面那次读只用来判断"有没有东西可验"。槽位只保证不同时执行，
+	// 挡不住先后交错——刚释放槽位的自动任务可能已经换掉或撤销了当前票，按旧快照验等于验一张
+	// 已经不在服务的票，而结论会被挂到它身上。
+	if current != nil {
+		fresh, ferr := kongPickCurrent(ctx, s.repo, s.accept, s.confidence, accountID, model)
+		if ferr != nil {
+			return nil, ferr
+		}
+		// 当前票没了（被撤销或过期）：不回退去验候选。那是另一件事，由调用方再点一次决定——
+		// 悄悄改掉验证对象，页面报的结论就挂错了票。
+		if fresh == nil {
+			out.NotApplicable = true
+			return out, nil
+		}
+		current = fresh
 	}
 
-	// 三态判定。**只在"真验出问题"时作废**——把"没能完成测量"也算作失效，等于一次 429 或一次网络
-	// 抖动就白扔一张仍在 TTL 内的好票，而重新取票要等约 34 分钟静默：那是无谓拒服，与放行降智同级。
-	//
-	//  1. 上游明确重发了票（ErrKongTicketNotAccepted）→ 注入已失效，撤销；
-	//  2. 证据完整但归因不合格 → verifyTicket 自己已经把票提交成 rejected，这里只需报告；
-	//  3. 其余（超时、429、前提失效、写库失败、本端点的期限用尽）→ **保留旧票与旧结论**。
+	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kongWaitBudget)
+	defer cancel()
+	deadline, _ := tctx.Deadline()
+
+	verifyCandidate := true
+	if current != nil {
+		step, verifyErr, fatal := s.verifyOneManually(ctx, tctx, account, cfg, model, current, true)
+		out.Steps = append(out.Steps, step)
+		if fatal != nil {
+			return kongFinishManualVerify(out), fatal
+		}
+		// **只有"本次测出的真降档"才值得再花一张候选的额度**，其余一律到此为止：
+		//   - 通过：票好着，没有替代需求；
+		//   - 上游重发了票：我们注入的票**一律**不被接受，候选必然同样被拒，验它纯属白烧；
+		//   - 未得出结论：旧票与旧结论都还在，**并不缺票**；那类失败（429、超时）多半会在候选上
+		//     原样重演。
+		//
+		// 判据用 ErrKongTicketDowngraded 而**不是** step.Revoked：后者读的是票此刻的库状态，而
+		// 那个状态可能是**别的路径**刚撤销的（业务请求拿到上游重发的票就会撤销当前票）。那种并发
+		// 下本次验证其实什么都没测出来，凭库状态往下走就会白烧一整张票的额度。
+		verifyCandidate = errors.Is(verifyErr, ErrKongTicketDowngraded)
+	}
+
+	if verifyCandidate {
+		if time.Until(deadline) < kongManualVerifyBudgetFloor {
+			// 余量不够再验一张就别开始：开了也是烧掉额度、在中途被掐断。如实说出来，让调用方
+			// 知道还有一张没验、可以再点一次。
+			out.BudgetExhausted = true
+			return kongFinishManualVerify(out), nil
+		}
+		candidate, cerr := s.repo.NewestCandidate(ctx, accountID, model, time.Now())
+		if cerr != nil {
+			return kongFinishManualVerify(out), cerr
+		}
+		if candidate != nil {
+			step, _, fatal := s.verifyOneManually(ctx, tctx, account, cfg, model, candidate, false)
+			out.Steps = append(out.Steps, step)
+			if fatal != nil {
+				return kongFinishManualVerify(out), fatal
+			}
+		}
+	}
+	return kongFinishManualVerify(out), nil
+}
+
+// kongFinishManualVerify 把最后一步的结果抬到顶层字段。最后一步决定最终局面，而 Steps 保留了
+// 过程——两者都需要：只看顶层会漏掉"当前票已被作废、随后候选补上了"这种事。
+func kongFinishManualVerify(out *KongManualVerify) *KongManualVerify {
+	if len(out.Steps) == 0 {
+		out.NotApplicable = true
+		return out
+	}
+	last := out.Steps[len(out.Steps)-1]
+	out.TicketID = last.TicketID
+	out.Candidate = last.Candidate
+	out.Accepted = last.Accepted
+	out.Revoked = last.Revoked
+	out.Inconclusive = last.Inconclusive
+	out.Reason = last.Reason
+	return out
+}
+
+// verifyOneManually 人工验一张票并按三态归档。
+//
+// reverify 为真表示这是正在服务的那一张（见 verifyTicket 的说明）。第三个返回值是**致命错误**
+// ——只有"该作废却没作废成"算致命：那时调用方以为票没了、实际下一个请求还会注入它，必须让它
+// 看见。验证本身失败不算致命，它是三态里的一种结果。
+func (s *KongTicketService) verifyOneManually(ctx, tctx context.Context, account *Account,
+	cfg KongTicketConfig, model string, ticket *KongTicket, reverify bool,
+) (KongManualVerifyStep, error, error) {
+	step := KongManualVerifyStep{TicketID: ticket.ID, Candidate: !reverify}
+	granted, verifyErr := s.verifyTicket(tctx, account, cfg, model, ticket.ID, ticket.State,
+		ticket.Source, ticket.ExpiresAt, kongCaptureOf(ticket), time.Now(), reverify)
+	if granted != 0 && verifyErr == nil {
+		step.Accepted = true
+		return step, nil, nil
+	}
+	if verifyErr != nil {
+		step.Reason = verifyErr.Error()
+	}
 	if errors.Is(verifyErr, ErrKongTicketNotAccepted) {
 		// 收尾用独立的短期限 context：上面那个 tctx 可能正是因为超时才走到这里，复用它的话
 		// 撤销的 SQL 必然失败，于是调用方以为票没了、下一个请求还在注入它。
@@ -1833,23 +1971,23 @@ func (s *KongTicketService) TriggerVerify(ctx context.Context, accountID int64, 
 		defer rcancel()
 		if err := s.repo.RevokeTicket(rctx, ticket.ID); err != nil {
 			s.logEventWith(rctx, &KongTicketEvent{
-				AccountID: accountID, Model: model, EventType: KongEventVerify,
+				AccountID: account.ID, Model: model, EventType: KongEventVerify,
 				Outcome: KongOutcomeFailure, TicketID: &ticket.ID,
 				Detail: map[string]any{"error": err.Error(), "phase": "manual_revoke"},
 			})
-			return out, fmt.Errorf("上游未接受该票，但作废它失败: %w", err)
+			return step, verifyErr, fmt.Errorf("上游未接受该票，但作废它失败: %w", err)
 		}
-		out.Revoked = true
-		return out, nil
+		step.Revoked = true
+		return step, verifyErr, nil
 	}
 	// 重读票的状态，区分"已被判不合格"与"没得出结论"。读不到就按"没得出结论"报——那是保守的
 	// 一侧（不谎称票已作废）。
 	if st, err := s.repo.TicketStatus(ctx, ticket.ID); err == nil && st == KongTicketStatusRejected {
-		out.Revoked = true
-		return out, nil
+		step.Revoked = true
+		return step, verifyErr, nil
 	}
-	out.Inconclusive = true
-	return out, nil
+	step.Inconclusive = true
+	return step, verifyErr, nil
 }
 
 // TriggerRefresh 手工触发一次取票/验票，同步返回结果。这是**人工干预手段**，不是自动路径。

@@ -196,9 +196,19 @@ export interface TicketRefreshResult {
   retry_after: string | null
 }
 
-// 立即验票的结果。与取票分开：那个可能取新票，这个只认当前这一张。
+// 立即验票序列里的一张。
+export interface TicketManualVerifyStep {
+  ticket_id: number
+  candidate: boolean
+  accepted: boolean
+  revoked: boolean
+  inconclusive: boolean
+  reason: string
+}
+
+// 立即验票的结果。与取票分开：那个可能取新票，这个只验现有的票（当前票 + 最多一张候选）。
 export interface TicketVerifyResult {
-  /** 被验的那张票；没有当前票时为 0。 */
+  /** 最后一步验的那张票；一张都没验时为 0。 */
   ticket_id: number
   /** 重新自证合格，仍可用。 */
   accepted: boolean
@@ -206,6 +216,12 @@ export interface TicketVerifyResult {
   revoked: boolean
   /** 没能完成测量（超时、429、前提失效、写库失败）；旧票与旧结论保留。与 revoked 互斥。 */
   inconclusive: boolean
+  /** 验的是一张候选，不是正在服务的票——失败后果不同，文案要分开。 */
+  candidate: boolean
+  /** 还有一张候选没验：同步端点余量不够再跑一张，提示可以再点一次。 */
+  budget_exhausted: boolean
+  /** 本次实际验过的每一张，按执行顺序；顶层字段等于最后一步。 */
+  steps: TicketManualVerifyStep[]
   reason: string
   /** 压根没票可验，或该账号已退出保护（mode=off）。 */
   not_applicable: boolean

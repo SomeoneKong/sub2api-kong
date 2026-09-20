@@ -36,6 +36,23 @@ func kongSeedCurrentTicket(repo *kongStubRepo, model string, now time.Time) *Kon
 	return t
 }
 
+// kongSeedCandidate 放一张未验候选。capturedAgo 越小越新——「挑最新」那条规则靠它区分。
+func kongSeedCandidate(repo *kongStubRepo, model string, id int64, capturedAgo time.Duration) *KongTicket {
+	now := time.Now()
+	t := &KongTicket{
+		ID: id, AccountID: 1, Model: model, State: strings.Repeat("c", 292),
+		Status: KongTicketStatusUnverified, Source: KongTicketSourceFetch,
+		ExpiresAt: now.Add(40 * time.Minute), CapturedAt: now.Add(-capturedAgo),
+	}
+	key := kongStubKey(1, model)
+	repo.candidates[key] = append(repo.candidates[key], t)
+	repo.tickets[id] = &kongStubTicketState{
+		AccountID: 1, Model: model, Status: KongTicketStatusUnverified,
+		ExpiresAt: t.ExpiresAt, CapturedAt: t.CapturedAt, Source: KongTicketSourceFetch,
+	}
+	return t
+}
+
 // kongStillCurrent 报告这张票此刻还能不能被选成当前票。
 func kongStillCurrent(t *testing.T, repo *kongStubRepo, svc *KongTicketService, model string) *KongTicket {
 	t.Helper()
@@ -217,39 +234,136 @@ func TestKongTriggerVerifyRevokesOnProvenDowngrade(t *testing.T) {
 	}
 }
 
-// 没有当前票时什么都不做——尤其**不能顺手去验候选**，那是 TriggerRefresh 的职责，
-// 一个按钮两种语义会让运维分不清自己触发了什么。
-func TestKongTriggerVerifyNoCurrentTicket(t *testing.T) {
+// 没有当前票时验候选，而且验的是**最新**那张——不是自动路径那个最老的。
+//
+// 这一条同时锁住两件事：本端点会验候选（批量取票之后"有票但未验"是常态，藏起来就只能等该模型
+// 自己来请求），以及挑的是最新那张（剩余 TTL 最长）。把 NewestCandidate 换回 OldestCandidate
+// 会让它红。
+func TestKongTriggerVerifyVerifiesNewestCandidate(t *testing.T) {
 	repo := newKongStubRepo()
 	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
 	accounts.set(kongVerifyTestAccount())
 	up := &kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}, answers: kongVerifyAnswers()}
 	svc := kongTestService(t, repo, up, accounts)
+	// 合成回答归因到 sol，白名单接受 sol → 这次候选验证会通过。
 	const model = "gpt-5.6-sol"
-	// 只有一张候选（unverified），没有当前票。
-	repo.candidate[kongStubKey(1, model)] = &KongTicket{
-		ID: 5, AccountID: 1, Model: model, State: strings.Repeat("b", 292),
-		Status: KongTicketStatusUnverified, Source: KongTicketSourceObserved,
-		ExpiresAt: time.Now().Add(30 * time.Minute), CapturedAt: time.Now().Add(-time.Hour),
-	}
+	svc.accept = KongTicketAccept{model: []string{model}}
+	// 没有当前票，池里两张候选：一张一小时前采的，一张刚采的。
+	kongSeedCandidate(repo, model, 5, time.Hour)
+	newest := kongSeedCandidate(repo, model, 6, time.Minute)
 
 	out, err := svc.TriggerVerify(context.Background(), 1, model)
 	if err != nil {
 		t.Fatalf("立即验票: %v", err)
 	}
-	if !out.NotApplicable || out.TicketID != 0 {
-		t.Fatalf("没有当前票应报 not_applicable，实得 %+v", out)
+	if len(out.Steps) != 1 {
+		t.Fatalf("只该验一张候选，实得 %d 步：%+v", len(out.Steps), out.Steps)
 	}
-	if up.challengeCall != 0 {
-		t.Errorf("不该对候选发起挑战，实际发了 %d 份", up.challengeCall)
+	step := out.Steps[0]
+	if !step.Candidate || step.TicketID != newest.ID {
+		t.Fatalf("该验最新那张候选 #%d，实得 %+v", newest.ID, step)
 	}
-	if len(repo.revoked) != 0 {
-		t.Errorf("不该撤销任何票，实际撤销了 %v", repo.revoked)
+	if !step.Accepted || !out.Accepted || !out.Candidate {
+		t.Fatalf("候选合格时应报通过，实得 step=%+v out=%+v", step, out)
+	}
+	if cur := kongStillCurrent(t, repo, svc, model); cur == nil || cur.ID != newest.ID {
+		t.Fatalf("验过的候选应当成为当前票 #%d，实得 %+v", newest.ID, cur)
 	}
 }
 
-// off 模式不走这条路：recheckVerify 会以「已退出保护」立刻作废结论，那时再按"验不成功"处置就是
-// 纯粹的误伤。
+// 当前票**真降档**（证据完整、归因不合格）之后才继续验候选：那时当前票已被作废，确实缺票。
+func TestKongTriggerVerifyFallsToCandidateAfterProvenDowngrade(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	accounts.set(kongVerifyTestAccount())
+	up := &kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}, answers: kongVerifyAnswers()}
+	svc := kongTestService(t, repo, up, accounts)
+	// 回答归因到 sol，白名单只接受 astra → 当前票与候选都会被判不合格。
+	const model = "gpt-6-astra"
+	svc.accept = KongTicketAccept{model: []string{model}}
+	current := kongSeedCurrentTicket(repo, model, time.Now())
+	candidate := kongSeedCandidate(repo, model, 7, time.Minute)
+
+	out, err := svc.TriggerVerify(context.Background(), 1, model)
+	if err != nil {
+		t.Fatalf("立即验票: %v", err)
+	}
+	if len(out.Steps) != 2 {
+		t.Fatalf("当前票真降档后应接着验一张候选，实得 %d 步：%+v", len(out.Steps), out.Steps)
+	}
+	if out.Steps[0].TicketID != current.ID || out.Steps[0].Candidate || !out.Steps[0].Revoked {
+		t.Fatalf("第一步该是作废当前票 #%d，实得 %+v", current.ID, out.Steps[0])
+	}
+	if out.Steps[1].TicketID != candidate.ID || !out.Steps[1].Candidate {
+		t.Fatalf("第二步该是验候选 #%d，实得 %+v", candidate.ID, out.Steps[1])
+	}
+}
+
+// 「没得出结论」时**不再验候选**：旧票与旧结论都还在、并不缺票，而 429/超时那类故障多半会在候选
+// 上原样重演——继续验就是白烧一张票的额度（最多三份真实挑战）。
+func TestKongTriggerVerifyStopsAtInconclusive(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	accounts.set(kongVerifyTestAccount())
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		answers:    kongVerifyAnswers(),
+		answerErr:  errors.New("上游 429"),
+	}
+	svc := kongTestService(t, repo, up, accounts)
+	const model = "gpt-5.6-sol"
+	svc.accept = KongTicketAccept{model: []string{model}}
+	current := kongSeedCurrentTicket(repo, model, time.Now())
+	kongSeedCandidate(repo, model, 8, time.Minute)
+
+	out, err := svc.TriggerVerify(context.Background(), 1, model)
+	if err != nil {
+		t.Fatalf("立即验票: %v", err)
+	}
+	if len(out.Steps) != 1 || out.Steps[0].Candidate {
+		t.Fatalf("没得出结论时不该再动候选，实得 %+v", out.Steps)
+	}
+	if !out.Inconclusive || out.Revoked {
+		t.Fatalf("应报未得出结论且不作废，实得 %+v", out)
+	}
+	if cur := kongStillCurrent(t, repo, svc, model); cur == nil || cur.ID != current.ID {
+		t.Fatalf("旧票必须留着，实得 %+v", cur)
+	}
+	if up.challengeCall > len(KongFingerprintChallenges()) {
+		t.Errorf("只该为一张票发起挑战，实际发了 %d 份", up.challengeCall)
+	}
+}
+
+// 上游重发票时也**不再验候选**：那说明我们注入的票一律不被接受，候选必然同样被拒。
+func TestKongTriggerVerifyStopsWhenUpstreamReissued(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	accounts.set(kongVerifyTestAccount())
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		answers:    []*KongUpstreamAnswer{{Text: "1,2,3", EchoedState: strings.Repeat("z", 292)}},
+	}
+	svc := kongTestService(t, repo, up, accounts)
+	const model = "gpt-5.6-sol"
+	svc.accept = KongTicketAccept{model: []string{model}}
+	current := kongSeedCurrentTicket(repo, model, time.Now())
+	candidate := kongSeedCandidate(repo, model, 9, time.Minute)
+
+	out, err := svc.TriggerVerify(context.Background(), 1, model)
+	if err != nil {
+		t.Fatalf("立即验票: %v", err)
+	}
+	if len(out.Steps) != 1 || out.Steps[0].TicketID != current.ID {
+		t.Fatalf("上游重发票后不该再验候选，实得 %+v", out.Steps)
+	}
+	if !out.Revoked {
+		t.Fatalf("注入不被接受时该作废当前票，实得 %+v", out)
+	}
+	if st, _ := repo.TicketStatus(context.Background(), candidate.ID); st != KongTicketStatusUnverified {
+		t.Errorf("候选应原样留着，实为 %s", st)
+	}
+}
+
 func TestKongTriggerVerifyOffModeNotApplicable(t *testing.T) {
 	repo := newKongStubRepo()
 	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}

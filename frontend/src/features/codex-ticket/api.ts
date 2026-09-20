@@ -10,7 +10,7 @@ import type {
   TicketOverview,
 } from './types'
 
-// 本页面的四个端点。路由注册在 backend/internal/server/routes/admin_kong_ticket.go。
+// 本功能的管理端点。路由注册在 backend/internal/server/routes/admin_kong_ticket.go。
 
 const basePath = '/admin/kong/ticket'
 
@@ -66,8 +66,9 @@ export async function triggerRefresh(
   return data
 }
 
-// triggerVerify 立即重验当前票。**真验出问题时服务端会把它作废**（证据完整而归因不合格，或上游
-// 明确重发了票），所以这是一次有副作用的调用；探测失败只报「未得出结论」，旧票保留。
+// triggerVerify 验现有的票：当前票，以及它**真降档**之后的一张最新候选（最多两张，永不取票）。
+// **真验出问题时服务端会作废那张票**（证据完整而归因不合格，或上游明确重发了票），所以这是一次
+// 有副作用的调用；探测失败只报「未得出结论」，旧票保留。结果按 steps 逐条读。
 //
 // 330s 是刻意比服务端大一档：那边的同步验证上限是 kongWaitBudget(300s)，客户端留 30 秒余量，
 // 于是调用方总能拿到真实结论——不会出现"页面报失败、后台还在改票状态"。

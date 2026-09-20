@@ -159,14 +159,16 @@
                         >
                           {{ refreshingKey === refreshKey(row.account_id, m.model) ? '执行中…' : '立即取票验票' }}
                         </button>
-                        <!-- 立即验票只针对当前那张票，没票就没有可验的。验证走流量出口，不消耗票据
-                             出口的静默，所以不受 canFetch 那几条约束。**验不通过即作废**。 -->
+                        <!-- 立即验票针对**现有的票**：有当前票就重验它，没有就验最新的那张候选
+                             （批量取票之后"有票但未验"是常态）。本端点永不取票，那是上一个按钮的事。
+                             验证走流量出口，不消耗票据出口的静默，所以不受 canFetch 那几条约束。
+                             off 除外——那时验证流程必然以「已退出保护」中止，问不出答案。 -->
                         <button
-                          v-if="liveRemaining(m.current_ticket, row.account_id) > 0 && row.mode !== 'off'"
+                          v-if="canVerify(row, m)"
                           type="button"
                           class="btn-secondary px-2 py-0.5 text-xs"
                           :disabled="readOnly || busy || refreshingKey !== null"
-                          title="立刻重验这张票（走流量出口，不占票据出口静默）。真验出问题才作废；探测失败只报未得出结论、旧票保留"
+                          :title="verifyTitle(row, m)"
                           @click="triggerVerify(row, m.model)"
                         >
                           {{ refreshingKey === refreshKey(row.account_id, m.model) ? '执行中…' : '立即验票' }}
@@ -370,7 +372,9 @@ import type {
   TicketAccountStatus,
   TicketEgress,
   TicketEvent,
+  TicketManualVerifyStep,
   TicketMode,
+  TicketModelStatus,
   TicketOverview,
   TicketSampleNote,
 } from './types'
@@ -735,6 +739,23 @@ function canFetch(row: TicketAccountStatus): boolean {
   return row.mode === 'full' && row.ready
 }
 
+// 立即验票的判据：**手上有票可验**就行，与它验没验过、与票据出口能不能用都无关（验证走流量
+// 出口）。批量取票之后「有一张未验候选、但没有当前票」是常态局面——那时正是最需要人工把它验
+// 起来的时候，藏掉按钮等于只能干等该模型自己来一个请求。
+// off 是唯一例外：验证流程在那下面必然以「已退出保护」中止，点了也问不出答案。
+function canVerify(row: TicketAccountStatus, m: TicketModelStatus): boolean {
+  if (row.mode === 'off' || !row.ready) return false
+  return liveRemaining(m.current_ticket, row.account_id) > 0 || m.unverified_count > 0
+}
+
+function verifyTitle(row: TicketAccountStatus, m: TicketModelStatus): string {
+  const base = '走流量出口，不占票据出口静默；本端点永不取票。'
+  if (liveRemaining(m.current_ticket, row.account_id) > 0) {
+    return `重验正在服务的这张票。${base}真验出问题才作废，探测失败只报未得出结论、旧票保留`
+  }
+  return `验最新的那张待验候选（跳过 min_ticket_age）。${base}合格即进入可用集合`
+}
+
 function refreshKey(accountID: number, model: string): string {
   return `${accountID}::${model}`
 }
@@ -763,8 +784,9 @@ function applyRowStatus(accountID: number, status: TicketAccountStatus | null): 
   rowLoadedAt[accountID] = Date.now()
 }
 
-// 立即验票：只针对当前那张票，**验不成功服务端就把它作废**。所以这是个有副作用的按钮，
-// 文案要说清结果，不能只说"失败了"。
+// 立即验票：一次最多验两张——先正在服务的那一张，它真降档被作废后再验一张最新候选去补。
+// 每一步的后果不同（作废在服务的票 vs 把候选排出池子），所以按 steps 逐条讲：只报最后一步会
+// 把"当前票已经被作废"这件最要紧的事藏起来。
 async function triggerVerify(row: TicketAccountStatus, model: string): Promise<void> {
   const key = refreshKey(row.account_id, model)
   refreshingKey.value = key
@@ -772,17 +794,16 @@ async function triggerVerify(row: TicketAccountStatus, model: string): Promise<v
   try {
     const res = await codexTicketAPI.triggerVerify(row.account_id, model)
     const r = res.result
-    if (r?.accepted) {
-      refreshNotes[key] = { text: `票 #${r.ticket_id} 重验通过，仍可用`, ok: true }
-    } else if (r?.revoked) {
-      const why = r.reason ? `：${r.reason}` : ''
-      refreshNotes[key] = { text: `票 #${r.ticket_id} 未通过，已作废${why}`, ok: false }
-    } else if (r?.inconclusive) {
-      // 与"已作废"必须分开说：这时票还在服务，只是这次没测出结论。
-      const why = r.reason ? `：${r.reason}` : ''
-      refreshNotes[key] = { text: `未得出结论，票 #${r.ticket_id} 保留${why}`, ok: false }
+    const steps = r?.steps ?? []
+    if (steps.length > 0) {
+      const parts = steps.map(verifyStepText)
+      if (r?.budget_exhausted) {
+        // 说清"还有一张没验"，否则用户以为已经验完了。
+        parts.push('余量不足没再验下一张，可以再点一次')
+      }
+      refreshNotes[key] = { text: parts.join('；'), ok: steps[steps.length - 1].accepted }
     } else if (r?.not_applicable) {
-      refreshNotes[key] = { text: '没有当前票可验', ok: false }
+      refreshNotes[key] = { text: '没有票可验（当前票与候选都没有）', ok: false }
     } else {
       refreshNotes[key] = { text: `未能开始验票：${denyReasonText(r?.deny_reason)}`, ok: false }
     }
@@ -792,6 +813,23 @@ async function triggerVerify(row: TicketAccountStatus, model: string): Promise<v
   } finally {
     refreshingKey.value = null
   }
+}
+
+function verifyStepText(step: TicketManualVerifyStep): string {
+  const what = step.candidate ? `候选 #${step.ticket_id}` : `票 #${step.ticket_id}`
+  const why = step.reason ? `：${step.reason}` : ''
+  if (step.accepted) {
+    // 候选验过只是进入可用集合：当前票按剩余寿命最长的合格票选，一张更早过期的票不会顶替它。
+    return step.candidate ? `${what} 验证通过，已进入可用集合` : `${what} 重验通过，仍可用`
+  }
+  if (step.revoked) {
+    return `${what} 未通过，${step.candidate ? '已从候选池排除' : '已作废'}${why}`
+  }
+  if (step.inconclusive) {
+    // 与"已作废"必须分开说：这时票还留着，只是这次没测出结论。
+    return `${what} 未得出结论，保留${why}`
+  }
+  return `${what} 未验${why}`
 }
 
 async function triggerRefresh(row: TicketAccountStatus, model: string): Promise<void> {
