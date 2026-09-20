@@ -551,6 +551,13 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			if turn == 1 {
 				return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
 			}
+			// [kong] 票据拒服与交付拦截不是上游故障。`parseClientPayload` 那一次准入成功，不代表这一次
+			// 还成立——两者之间票可能过期或被并发撤销。走通用路径会同时坏三件事：给客户端发一帧
+			// `502 upstream_error`、把原始错误字符串化（类型丢了，调度上报的豁免与策略关闭都失效）、
+			// 于是一次本地拒服被记成账号故障。后续轮次不换号（会话状态活在这条上游连接里），按策略关闭。
+			if KongIsTicketDenied(err) || KongIsDeliveryBlocked(err) {
+				return nil, wrapOpenAIWSKongTicketError(err)
+			}
 			safeErr := sanitizeUpstreamErrorMessage(err.Error())
 			clientError := buildOpenAIWSHTTPBridgeErrorEvent(http.StatusBadGateway, "Upstream request failed")
 			if writeErr := writeClientMessage(clientError); writeErr == nil {

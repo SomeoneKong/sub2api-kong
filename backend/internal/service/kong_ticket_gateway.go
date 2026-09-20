@@ -7,9 +7,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+
+	"github.com/gin-gonic/gin"
 )
 
 // 票据功能在转发链路上的接入点。设计见 DESIGN-codex-ticket.md §2.4。
@@ -131,7 +134,7 @@ func (g *KongTicketGateway) PrepareUpstream(ctx context.Context, req *http.Reque
 	grant, err := g.svc.EnsureTicket(ctx, account.ID, model)
 	if err != nil {
 		// 准备阶段出错时也不放行：无法确认保障就等于没有保障。
-		return nil, &KongErrTicketDenied{Reason: "ensure_failed: " + err.Error()}
+		return nil, kongEnsureDenial(ctx, err)
 	}
 	if grant.NotApplicable {
 		// 该账号没开 full。哪个账号要保护是人工按观察结果配的，没配的照常服务——
@@ -325,7 +328,7 @@ func (g *KongTicketGateway) PrepareWSTurn(ctx context.Context, account *Account,
 	// EnsureTicketNoHandoff）。
 	grant, err := g.svc.EnsureTicketNoHandoff(ctx, account.ID, model)
 	if err != nil {
-		return payload, nil, &KongErrTicketDenied{Reason: "ensure_failed: " + err.Error()}
+		return payload, nil, kongEnsureDenial(ctx, err)
 	}
 	if grant.NotApplicable {
 		// 该账号没开 full，照常服务：不注入、不判定。
@@ -514,49 +517,174 @@ func kongExtractTopLevelModelString(raw string) kongGatedModelResult {
 	return kongGatedModelResult{Model: strings.TrimSpace(value.String()), Determinable: true}
 }
 
-// KongTicketPreparing 报告这次拒服是否为「票据正在准备」，以及该不该在同一账号上先等一等。
+// KongTicketFailover 判定一次票据拒服能否换账号，以及该不该先在同一账号上等一等。
 //
-// 这是**唯一可以 failover 的票据拒服**：本账号的票据任务已在后台跑，而别的账号此刻有可用票，换过去
-// 比等几十秒更快。其余拒服（静默未满、出口不可用、真降档）换号救不了——那些情况下换号只是把同一个
-// 结论在每个账号上重演一遍，还会把每个账号都记进失败列表。
+// **几乎所有票据拒服都能换号**，因为它们全是**账号级**的条件：
 //
-// 第二个返回值是"是否先在同账号重试"。**注意它不阻止换号**：框架会先在同账号重试若干次（每次有
-// 递增延时、封顶几秒），耗尽后照样换号。所以它真正的含义是"先给本账号一点时间"。
+//   - `window_closed`——静默与冷却是按**该账号的票据出口**累积的，与别的账号的出口无关；
+//   - `egress_unusable` / `egress_busy` / `no_ticket_source`——就是这个账号自己的出口配置或占用；
+//   - `account_unready`——本来就是单账号不可调度；
+//   - `task_no_ticket` / `wait_timeout`——这个账号的任务没拿到票，别的账号有自己的票；
+//   - 真降档——账号 A 被降智不说明账号 B 也被降智。
 //
-// 判据本应是"这个请求有没有绑定粘性会话"：绑定了先等（换号会让上下文缓存失效、粘性计费被强制），
-// 没绑定就直接换（换号对它没有代价）。但**当前只有部分入口会把绑定事实写进 context**——通用 Gateway
-// 与 Gemini handler 写 `WithPrefetchedStickySession`，而 OpenAI Responses/Messages 主路径不写，它的
-// 绑定命中只体现在调度决策的 `StickySessionHit` / `StickyPreviousHit` 里。
+// ⚠️ 这里曾经只放行 `preparing`，理由是"其余换号只是把同一个结论在每个账号上重演"。**那个推理是
+// 错的**，它把账号级条件当成了全局条件。生产实测（2026-09-20）：一个账号因 window_closed 拒服期间，
+// 同分组另一个账号已经有合格票，64 个请求仍被直接拒掉、一个都没切过去——那是无谓拒服，与放行降智
+// 同级。真正全局的情况（所有账号都没票）由 failover 框架自然耗尽，不需要在票据层提前判定。
 //
-// 所以这里**读不到就按"可能绑定了"处理**（返回 true），两种猜错的后果不对称：
+// 第二个返回值是"是否先在同账号重试"，**它不阻止换号**：框架先在同账号重试若干次（递增延时、封顶
+// 几秒），耗尽后照样换。所以它的含义是"先给本账号一点时间"，只在**短期内状态可能变**时才值得：
 //
-//   - 该换却先等 → 多花几秒重试延时，但一定能服务；
-//   - 该等却直接换 → 会话连续性被破坏，而且可能换到一个同样没票的账号、最终拒服。
+//   - 值得等：`preparing`（本账号的任务正在跑，产物就是本账号要的票）、`other_model_task`
+//     （本账号的在途任务在给别的模型跑；它可能是候选验证——走 kongVerifyOnlySlot、不碰票据出口
+//     ——完成后本模型确实可能可取）；
+//   - 不值得等：`window_closed`（静默要到某个时刻才满，几秒钟不会变）、`egress_unusable` /
+//     `no_ticket_source`（配置问题，等不会变）、`task_no_ticket` / `wait_timeout`（任务已结束且
+//     没拿到票）、`egress_busy`（见下）。对这些先等本号纯属浪费重试次数，还会延后真正能服务的
+//     那次换号。
 //
-// 代价是"新请求本可以立刻换号"这个优化暂时拿不到。要拿到它，得让 OpenAI 调度把真实绑定事实写进
-// 当前 attempt 的 context——见 DESIGN §4.6 的遗留。
-func KongTicketPreparing(ctx context.Context, err error) (preparing bool, retrySameAccount bool) {
+// ⚠️ `egress_busy` 曾被算作"值得等"，理由是"别的任务占着，马上释放"。**那个理由不成立**：占着
+// 出口的是**另一个账号**的任务，它产出的票属于那个账号；更要紧的是那次取票会 `noteEgressUse` 把
+// 这条**共享**出口的静默清零（见 fetchStore），于是它一释放，本账号立刻需要等满整个 min_idle
+// ——状态从 `egress_busy` 变成 `window_closed`，而那正是"不值得等"的那一类。
+//
+// 值得等的那几种还要看**这个请求有没有绑定粘性会话**：绑定了先等（换号会让上下文缓存失效、粘性
+// 计费被强制），没绑定直接换。但当前只有部分入口把绑定事实写进 context（通用 Gateway 与 Gemini
+// 写 `WithPrefetchedStickySession`，OpenAI Responses/Messages 主路径不写），所以**读不到就按"可能
+// 绑定了"处理**——两种猜错的后果不对称：该换却先等只多花几秒重试延时，该等却直接换会破坏会话。
+func KongTicketFailover(ctx context.Context, err error) (canFailover bool, retrySameAccount bool) {
 	var denied *KongErrTicketDenied
-	if !errors.As(err, &denied) || denied.Reason != KongDenyPreparing {
+	if !errors.As(err, &denied) || denied == nil {
 		return false, false
 	}
-	if boundID, ok := PrefetchedStickyAccountIDFromContext(ctx); ok && boundID > 0 {
-		return true, true
-	}
-	// 读不到绑定信息：保守地先等本号。见上面的不对称说明。
-	return true, true
+	return true, kongDenyWorthSameAccountWait(denied.Reason)
 }
 
-// KongIsPreparingFailover 报告这个 failover 错误是不是「票据正在准备」那一种。
+// kongDenyWorthSameAccountWait 报告这个拒服原因在**几秒之内**是否可能自行好转。
 //
-// 调度上报要用它：那不是账号的故障，账号本身是好的、只是这一刻没票，几十秒后就补上了。计进错误率
-// EWMA 会让"票越缺、账号越被判坏"，与事实相反。
-func KongIsPreparingFailover(err error) bool {
-	var failoverErr *UpstreamFailoverError
-	if !errors.As(err, &failoverErr) || failoverErr == nil {
+// 只有会好转的才值得先在同账号重试。其余的先等等于把重试次数花在一个确定不会变的状态上，而那些
+// 次数本该用来换到一个真正有票的账号。
+func kongDenyWorthSameAccountWait(reason string) bool {
+	switch reason {
+	case KongDenyPreparing, KongDenyOtherModelTask:
+		return true
+	default:
 		return false
 	}
-	return failoverErr.Reason == GatewayFailureReason(KongDenyPreparing)
+}
+
+// kongEnsureDenial 把 Ensure* 的失败翻成一次拒服。
+//
+// **调用方 context 已经中断时算账号级 `wait_timeout`**，不是系统级 `ensure_failed`。准入这一路上到处
+// 都在读库（账号、当前票、候选、出口活动、冷却，任务完成后还要再读一次票），HTTP 侧的首输出守卫一
+// 取消，其中任何一处都会返回 context 错误。按 `ensure_failed` 归类会带上 `NextAccountStop`，于是
+// "这个账号没来得及、别的账号有票"变成整个请求终止——那是无谓拒服。**只补某一个数据库调用没有用**，
+// 落点太多，所以判在这个共同边界上。
+//
+// 不按"是谁取消的"区分：守卫用 `WithCancel`，拿到的是 `Canceled`，与客户端断开不可分。客户端真走了
+// 那一路另有判据——上层在换号之前先查 `failoverClientGone`。
+func kongEnsureDenial(ctx context.Context, err error) *KongErrTicketDenied {
+	if ctx.Err() != nil {
+		return &KongErrTicketDenied{Reason: KongDenyWaitTimeout}
+	}
+	return &KongErrTicketDenied{Reason: "ensure_failed: " + err.Error()}
+}
+
+// kongTicketDenyReasonPrefix 是票据拒服在 failover 错误 `Reason` 上占的命名空间。
+//
+// **身份不能靠枚举一张原因清单**：`*KongErrTicketDenied` 有十几个构造点，其中六种原因带自由文本
+// （`ensure_failed: <err>` 这类），维护一张反查表必然漏项——漏一项就是把一次本地拒服当成账号故障
+// 计入健康度 EWMA（实测 `ensure_failed` 让 EWMA 从 0 跳到 0.20）。前缀是本 fork 自己控制的命名
+// 空间，新增拒服原因不需要同步任何清单。
+const kongTicketDenyReasonPrefix = "kong_ticket_denied:"
+
+// KongTicketDenyFailoverReason 把一个拒服原因翻成 failover 错误上带命名空间的 `Reason`。
+//
+// 导出是因为呈现在 handler 包、构造在本包，而两侧必须用同一个编码——各写一份字面量就等于把跨包
+// 契约拆成两处，改一处不报错、只是票据拒服又变回 502。
+func KongTicketDenyFailoverReason(denyReason string) GatewayFailureReason {
+	return GatewayFailureReason(kongTicketDenyReasonPrefix + kongTicketDenyCategory(denyReason))
+}
+
+// kongTicketDenyCategory 把拒服原因规范成稳定分类：自由文本形态取冒号前那一段。
+//
+// 除了稳定，这一步还挡住一条泄漏：`ensure_failed: ` 后面接的是 `err.Error()`，可能带库连接串、
+// 代理地址这类细节，而 `Reason` 会一路流进给客户端的文案。**拒服原因是给人看的分类，不是错误详情
+// 的搬运通道**——详情留在原始错误与日志里。
+func kongTicketDenyCategory(reason string) string {
+	if idx := strings.IndexByte(reason, ':'); idx >= 0 {
+		return strings.TrimSpace(reason[:idx])
+	}
+	return strings.TrimSpace(reason)
+}
+
+// kongTicketDenyFailover 把一次票据拒服包成 failover 错误，同时**保留原始拒服错误**。
+//
+// 多值 Unwrap 让 `errors.As` 两侧都取得到：handler 取 `*UpstreamFailoverError` 去换号，调度上报取
+// `*KongErrTicketDenied` 去豁免健康度。转换时丢掉原类型正是上一版的缺陷——那时豁免只能靠 reason
+// 字符串反查，带自由文本的原因一律漏掉。
+type kongTicketDenyFailover struct {
+	failover *UpstreamFailoverError
+	denied   *KongErrTicketDenied
+}
+
+func (e *kongTicketDenyFailover) Error() string { return e.denied.Error() }
+
+func (e *kongTicketDenyFailover) Unwrap() []error { return []error{e.failover, e.denied} }
+
+// newKongTicketDenyFailover 构造票据拒服的 failover 错误。
+//
+//   - RequestScopedTransient：**不得据此临时封禁账号**。账号本身是好的，只是这一刻没票可注入。
+//   - Scope=account：换一个账号确实有帮助——票是按账号持有的。
+func newKongTicketDenyFailover(denied *KongErrTicketDenied, retrySameAccount bool) error {
+	return &kongTicketDenyFailover{
+		failover: &UpstreamFailoverError{
+			StatusCode:             0,
+			RequestScopedTransient: true,
+			RetryableOnSameAccount: retrySameAccount,
+			Scope:                  GatewayFailureScopeAccount,
+			Reason:                 KongTicketDenyFailoverReason(denied.Reason),
+		},
+		denied: denied,
+	}
+}
+
+// KongTicketDenyReasonOf 从一个**已经摘出来的** failover 错误反查票据拒服分类。
+//
+// 耗尽呈现那一层只拿得到 `*UpstreamFailoverError`（`errors.As` 已经把它从错误链里摘出来了），所以
+// 身份判定只能落在这个结构上。这样识别就**绑定当前终止错误**：换号过程中前一个账号的拒服不能用来
+// 解释后一个账号的真实故障——反过来记同样是归因错误，只是方向相反。
+func KongTicketDenyReasonOf(failoverErr *UpstreamFailoverError) (string, bool) {
+	if failoverErr == nil {
+		return "", false
+	}
+	reason := string(failoverErr.Reason)
+	if !strings.HasPrefix(reason, kongTicketDenyReasonPrefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(reason, kongTicketDenyReasonPrefix), true
+}
+
+// KongIsTicketDeniedFailover 报告这个错误是否为「已转成 failover 的票据拒服」。
+//
+// 调度上报要用它：票据拒服**都不是账号的故障**，账号本身是好的、只是此刻没票可注入。计进错误率
+// EWMA 会让"票越缺、账号越被判坏"，与事实相反；临时封禁更糟——那会把一个几十秒后就补上票的账号
+// 推出调度。
+//
+// **两种传参形态都要认**：多值 `Unwrap` 只能由外向内查找，所以一旦调用方已经用 `errors.As` 把
+// `*UpstreamFailoverError` 摘出来、再把那个指针单独传过来（WS 换号上报就是这样），从它反查不到并列的
+// `*KongErrTicketDenied`。那时靠 failover 错误自己的受控命名空间识别。
+func KongIsTicketDeniedFailover(err error) bool {
+	var wrapped *kongTicketDenyFailover
+	if errors.As(err, &wrapped) {
+		return true
+	}
+	var failoverErr *UpstreamFailoverError
+	if errors.As(err, &failoverErr) {
+		_, ok := KongTicketDenyReasonOf(failoverErr)
+		return ok
+	}
+	return false
 }
 
 // KongIsTicketDenied 报告错误是否为票据拒服，便于调用方映射状态码。
@@ -569,4 +697,61 @@ func KongIsTicketDenied(err error) bool {
 func KongIsDeliveryBlocked(err error) bool {
 	var blocked *KongErrDeliveryBlocked
 	return errors.As(err, &blocked)
+}
+
+// kongTicketDenyWaitKey 是「本次请求的票据恢复信息」的 context 键。
+const kongTicketDenyWaitKey = "kong_ticket_deny_wait"
+
+// KongTicketDenyWait 汇总**本次请求已尝试过的全部账号**的票据恢复信息。
+//
+// 按请求累计而不是只留最后一次：failover 会依次问好几个账号，最后那个不一定是最早能恢复的。拿它
+// 的恢复时刻当整池等待，客户端可能白等到最晚那个账号——A 一分钟后可重试、B 三十分钟后可重试，最后
+// 访问 B 就会让客户端多等二十九分钟。
+type KongTicketDenyWait struct {
+	// Earliest 是已尝试账号中**最早**的恢复时刻（RFC3339）。
+	Earliest string
+	// Unknown 为真表示至少有一个被拒账号没给出恢复时刻。
+	//
+	// **恢复时刻未知不等于很久**：那时不能拿别人的长等待当整池等待，宁可不给 Retry-After，让客户端
+	// 用自己的退避——给一个过长的值会让一个几十秒后就有票的池子被搁置二十分钟。
+	Unknown bool
+}
+
+// MarkKongTicketDenied 把这次拒服的恢复时刻并进本请求的累计等待信息。
+//
+// 只记恢复时刻、不记 reason：呈现时的 reason 取自**当前终止错误**（见 KongTicketDenyReasonOf），
+// 请求级地留一份 reason 只会给"上一个账号的拒服解释下一个账号的故障"开出口。
+func MarkKongTicketDenied(c *gin.Context, retryAfter string) {
+	if c == nil {
+		return
+	}
+	next := &KongTicketDenyWait{}
+	if prev := KongTicketDenyWaitFromContext(c); prev != nil {
+		*next = *prev
+	}
+	retryAfter = strings.TrimSpace(retryAfter)
+	at, err := time.Parse(time.RFC3339, retryAfter)
+	if retryAfter == "" || err != nil {
+		// 空值与读不懂的值都算"不知道"：不能当成"无需等待"，也不能拿去比较。
+		next.Unknown = true
+		c.Set(kongTicketDenyWaitKey, next)
+		return
+	}
+	if prevAt, perr := time.Parse(time.RFC3339, next.Earliest); next.Earliest == "" || perr != nil || at.Before(prevAt) {
+		next.Earliest = retryAfter
+	}
+	c.Set(kongTicketDenyWaitKey, next)
+}
+
+// KongTicketDenyWaitFromContext 取本次请求累计的票据恢复信息。没有则返回 nil。
+func KongTicketDenyWaitFromContext(c *gin.Context) *KongTicketDenyWait {
+	if c == nil {
+		return nil
+	}
+	if raw, ok := c.Get(kongTicketDenyWaitKey); ok {
+		if wait, ok := raw.(*KongTicketDenyWait); ok {
+			return wait
+		}
+	}
+	return nil
 }

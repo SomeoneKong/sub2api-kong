@@ -26,7 +26,7 @@ func (g *KongTicketGateway) PrepareWSMapPayload(ctx context.Context, account *Ac
 	// 原生 WS：不交接，理由同 PrepareWSTurn。
 	grant, err := g.svc.EnsureTicketNoHandoff(ctx, account.ID, model)
 	if err != nil {
-		return nil, &KongErrTicketDenied{Reason: "ensure_failed: " + err.Error()}
+		return nil, kongEnsureDenial(ctx, err)
 	}
 	if grant.NotApplicable {
 		return &KongUpstreamAttempt{Model: model}, nil

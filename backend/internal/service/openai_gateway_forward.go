@@ -1070,6 +1070,24 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		upstreamStart := time.Now()
 		resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+		// [kong] 票据判定要**先于**首输出超时判定。
+		//
+		// 首输出守卫的 context 也套在 doOpenAIUpstream 里的票据准入上，所以"等本账号的取票任务"超过
+		// 首输出期限时，守卫会先被触发。照原顺序走的话这次本地拒服被改写成
+		// `504 / first_output_timeout`：票据身份丢失、错误记到上游头上、账号健康度被罚，
+		// `HandleStreamTimeout` 那套处置甚至会把一个好账号停掉调度——而一个字节都没发给上游。
+		//
+		// 换号在这里是安全的：`startTime` 是**每次 Forward** 取的，下一个账号会拿到完整的首输出预算。
+		if err != nil && (KongIsTicketDenied(err) || KongIsDeliveryBlocked(err)) {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if headerGuard != nil {
+				headerGuard.stopHeaderWait()
+				headerGuard.close()
+			}
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
 		if headerGuard != nil && headerGuard.stopHeaderWait() {
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()

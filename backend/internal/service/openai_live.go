@@ -306,6 +306,12 @@ func (s *OpenAIGatewayService) createUpstreamLiveCall(
 
 	resp, err := s.doOpenAIUpstream(upstreamReq, resolveAccountProxyURL(account), account)
 	if err != nil {
+		// [kong] 票据拒服不是传输故障：交给统一转换以保住身份（调度豁免、耗尽呈现）。
+		// 这一层没有 gin.Context——转换函数在票据分支上不碰它（恢复时刻的累计是 nil-safe 的），
+		// 而它在任何 ops 写入之前就返回了。
+		if KongIsTicketDenied(err) || KongIsDeliveryBlocked(err) {
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, nil, account, err, false)
+		}
 		logLiveCreateStageFailure(ctx, account.ID, "upstream_transport", err)
 		return nil, err
 	}

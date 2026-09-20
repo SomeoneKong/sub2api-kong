@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -332,27 +333,135 @@ func TestKongWaitsWhenNoOtherAccountHasTicket(t *testing.T) {
 	}
 }
 
-// preparing 的 failover 错误：不得据它封禁账号或计入健康度——账号好着，只是这一刻没票。
-func TestKongPreparingFailoverIsNotAccountFault(t *testing.T) {
-	denied := &KongErrTicketDenied{Reason: KongDenyPreparing}
-	// 绑定了会话：先在同账号等——换号会让上下文缓存失效、粘性计费被强制。
+// 票据拒服**都要能换账号**：票是按账号持有的，一个账号取不到票不说明别的账号也取不到。
+//
+// ⚠️ 这条用例此前断言的**恰好相反**（只有 preparing 可 failover，其余"换号救不了"）。那个假设把
+// 账号级条件当成了全局条件：静默与冷却是按**该账号的票据出口**累积的，出口配置也是账号自己的。
+// 生产实测（2026-09-20）有 64 个请求在同分组另一账号已持有合格票的情况下被直接拒掉——无谓拒服，
+// 与放行降智同级。真正全局的情况（所有账号都没票）由 failover 框架自然耗尽，不在这一层判。
+func TestKongTicketDenyAlwaysAllowsFailover(t *testing.T) {
 	ctx := WithPrefetchedStickySession(context.Background(), 7, 1, false)
-	preparing, retrySame := KongTicketPreparing(ctx, denied)
-	if !preparing || !retrySame {
-		t.Fatalf("有会话时应当先等本账号，实得 preparing=%v retrySame=%v", preparing, retrySame)
+	allReasons := []string{
+		KongDenyPreparing, KongDenyWindowClosed, KongDenyEgressUnusable,
+		KongDenyNoTicketSource, KongDenyEgressBusy, KongDenyWaitTimeout,
+		KongDenyAccountUnready, KongDenyOtherModelTask, KongDenyTaskNoTicket,
 	}
-	// **读不到绑定信息时同样先等本号**：OpenAI 主路径目前不写那个 context 键，而两种猜错的后果不
-	// 对称——该换却先等只多花几秒重试延时，该等却直接换会破坏会话、还可能换到同样没票的账号。
-	// 注意这不阻止换号：框架重试耗尽后照样切。
-	preparing, retrySame = KongTicketPreparing(context.Background(), denied)
-	if !preparing || !retrySame {
-		t.Fatalf("绑定信息未知时应当保守先等本号，实得 preparing=%v retrySame=%v", preparing, retrySame)
-	}
-	// 其余拒服一律不 failover：换号救不了，只会把同一个结论在每个账号上重演。
-	for _, reason := range []string{KongDenyWindowClosed, KongDenyEgressUnusable, KongDenyWaitTimeout} {
-		if p, _ := KongTicketPreparing(ctx, &KongErrTicketDenied{Reason: reason}); p {
-			t.Errorf("%s 不该走 failover", reason)
+	for _, reason := range allReasons {
+		canFailover, _ := KongTicketFailover(ctx, &KongErrTicketDenied{Reason: reason})
+		if !canFailover {
+			t.Errorf("%s 必须允许换号——票是按账号持有的", reason)
 		}
+	}
+	// 非票据的错误不受影响。
+	if canFailover, _ := KongTicketFailover(ctx, errors.New("普通错误")); canFailover {
+		t.Error("非票据拒服不该走这条路")
+	}
+}
+
+// 转成 failover 之后，**每一种**拒服原因都必须仍能被认出来——包括带自由文本的技术原因。
+//
+// 上一版靠一张九个字符串的清单反查，于是 `PrepareUpstream` 产出的 `ensure_failed: <err>` /
+// `model_undeterminable: <reason>` 一律漏掉：调度豁免失效，本地拒服被计入账号错误率 EWMA
+// （实测 0 → 0.20），"票越缺、账号越被判坏"。身份因此改为认类型 + 受控前缀。
+func TestKongTicketDenyIdentitySurvivesFailoverConversion(t *testing.T) {
+	reasons := []string{
+		KongDenyPreparing, KongDenyWindowClosed, KongDenyEgressUnusable,
+		KongDenyNoTicketSource, KongDenyEgressBusy, KongDenyWaitTimeout,
+		KongDenyAccountUnready, KongDenyOtherModelTask, KongDenyTaskNoTicket,
+		// PrepareUpstream / WS 侧带自由文本的技术原因，清单形态的判据正是在这里漏的。
+		"ensure_failed: dial tcp 10.0.0.1:5432: connect: refused",
+		"model_undeterminable: duplicate_model_key",
+		"frame_undeterminable: duplicate_key:model",
+		"inject_failed: sjson: invalid path",
+		"inject_unverified: turn_state_mismatch",
+		"payload_missing",
+	}
+	for _, reason := range reasons {
+		wrapped := newKongTicketDenyFailover(&KongErrTicketDenied{Reason: reason}, false)
+		// 调度上报的两道判据都要认得它，否则这次本地拒服会被算成账号故障。
+		if !KongIsTicketDeniedFailover(wrapped) {
+			t.Errorf("%s: 转换后不再被识别成票据拒服", reason)
+		}
+		if !KongIsTicketDenied(wrapped) {
+			t.Errorf("%s: 转换后丢了原始拒服类型", reason)
+		}
+		// handler 只拿得到摘出来的 failover 错误，身份必须落在它自己身上。
+		var failoverErr *UpstreamFailoverError
+		if !errors.As(wrapped, &failoverErr) {
+			t.Fatalf("%s: 换号框架取不到 failover 错误", reason)
+		}
+		category, ok := KongTicketDenyReasonOf(failoverErr)
+		if !ok {
+			t.Errorf("%s: 耗尽呈现认不出票据拒服", reason)
+		}
+		// 自由文本只保留冒号前的分类：Reason 会一路流进客户端文案，不能搬运错误详情。
+		if strings.ContainsAny(category, ": ") {
+			t.Errorf("%s: 分类未规范化，实得 %q", reason, category)
+		}
+	}
+	// **三种传参形态都要认**：调用方可能传完整包装、可能先 errors.As 摘出 failover 指针再单独传它
+	// （WS 换号上报就是这样），也可能再 %w 包一层。多值 Unwrap 只能由外向内查找，所以摘出来的指针
+	// 反查不到并列的 *KongErrTicketDenied——那时必须靠受控命名空间认出来，否则这次本地拒服又会被
+	// 计进账号健康度 EWMA。
+	for _, reason := range []string{KongDenyWindowClosed, "ensure_failed: dial tcp: refused"} {
+		wrapped := newKongTicketDenyFailover(&KongErrTicketDenied{Reason: reason}, false)
+		var extracted *UpstreamFailoverError
+		if !errors.As(wrapped, &extracted) {
+			t.Fatalf("%s: 取不到 failover 错误", reason)
+		}
+		forms := map[string]error{
+			"完整包装":    wrapped,
+			"摘出的指针":   extracted,
+			"再包一层":    fmt.Errorf("websocket relay: %w", wrapped),
+			"摘出后再包一层": fmt.Errorf("websocket relay: %w", extracted),
+		}
+		for name, form := range forms {
+			if !KongIsTicketDeniedFailover(form) {
+				t.Errorf("%s / %s: 调度上报的豁免不命中，本地拒服会被计进账号健康度", reason, name)
+			}
+		}
+	}
+
+	// 真实上游故障不得被当成票据拒服——否则就是把归因错误反着犯一遍。
+	if _, ok := KongTicketDenyReasonOf(&UpstreamFailoverError{StatusCode: 500}); ok {
+		t.Error("普通上游故障被识别成票据拒服")
+	}
+	if KongIsTicketDeniedFailover(&UpstreamFailoverError{StatusCode: 500}) {
+		t.Error("普通上游故障被豁免了账号健康度")
+	}
+}
+
+// 「先在同账号等一等」只对**几秒内可能自行好转**的原因成立。
+//
+// 对 window_closed 这类"要等到某个时刻才满"的原因先等本号纯属浪费重试次数，还会延后真正能服务的
+// 那次换号。注意 retrySameAccount 为真也**不阻止**换号：框架重试耗尽后照样切。
+func TestKongTicketDenySameAccountWaitOnlyWhenItCanImprove(t *testing.T) {
+	ctx := WithPrefetchedStickySession(context.Background(), 7, 1, false)
+	worthWaiting := map[string]bool{
+		KongDenyPreparing:      true, // 本账号的任务正在跑，产物就是本账号要的票
+		KongDenyOtherModelTask: true, // 同账号别的模型的任务，可能是不碰票据出口的候选验证
+		// egress_busy 是**另一个账号**占着共享出口：它那次取票会把这条出口的静默清零，一释放本号
+		// 就变成 window_closed，先等等于把重试次数花在一个确定不会变的状态上。
+		KongDenyEgressBusy:     false,
+		KongDenyWindowClosed:   false,
+		KongDenyEgressUnusable: false,
+		KongDenyNoTicketSource: false,
+		KongDenyWaitTimeout:    false,
+		KongDenyTaskNoTicket:   false,
+		KongDenyAccountUnready: false,
+	}
+	for reason, want := range worthWaiting {
+		_, retrySame := KongTicketFailover(ctx, &KongErrTicketDenied{Reason: reason})
+		if retrySame != want {
+			t.Errorf("%s 的同账号重试判定 = %v, want %v", reason, retrySame, want)
+		}
+	}
+
+	// **读不到绑定信息时仍按"可能绑定了"处理**（对值得等的那几种）：OpenAI 主路径不写那个 context
+	// 键，而两种猜错的后果不对称——该换却先等只多花几秒重试延时，该等却直接换会破坏会话。
+	if _, retrySame := KongTicketFailover(context.Background(),
+		&KongErrTicketDenied{Reason: KongDenyPreparing}); !retrySame {
+		t.Error("绑定信息未知时应当保守先等本号")
 	}
 }
 

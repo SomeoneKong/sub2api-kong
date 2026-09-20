@@ -518,7 +518,7 @@ func (s *KongTicketService) handoffWorthIt(ctx context.Context, accountID int64,
 //
 // **粘性会话的差别不在这里**，在上层：`preparing` 被包成可 failover 的错误时，绑定了会话的请求会
 // 先在同账号重试（等于等这个任务），没绑定的直接换号。那一层才知道有没有会话（见
-// kong_ticket_gateway.go 的 KongTicketPreparing）。
+// kong_ticket_gateway.go 的 KongTicketFailover）。
 func (s *KongTicketService) prepareOrHandOff(ctx context.Context, account *Account, cfg KongTicketConfig, model, action string) (*KongTicketGrant, error) {
 	if !s.handoffWorthIt(ctx, account.ID, model) {
 		return s.runTaskAndWait(ctx, account, cfg, model, action, false, false)
@@ -535,14 +535,19 @@ func (s *KongTicketService) prepareOrHandOff(ctx context.Context, account *Accou
 	case kongClaimFresh:
 		s.startTask(ctx, task, account, model, action, false, false)
 	case kongClaimEgressBusy:
-		// 出口被别的账号占着，本账号这一轮压根起不了任务。仍然报 preparing——换号的判断不变，
-		// 而"等"在这里是白等（那个任务的票属于别的账号）。
+		// 出口被别的账号占着，本账号这一轮压根起不了任务。
+		//
+		// **必须报 egress_busy 而不是 preparing**：`preparing` 的含义是"本账号的任务正在跑，产物就是
+		// 本账号要的票"，那是唯一值得先在同账号等一等的原因。这里等是白等——那个任务的票属于别的账号，
+		// 而且它那次取票会把这条共享出口的静默清零，一释放本号立刻变成 window_closed。报成 preparing
+		// 会让上层把重试预算花在一个确定不会变的状态上，还延后真正能服务的那次换号。
 		s.logEvent(ctx, &KongTicketEvent{
 			AccountID: account.ID, Model: model,
 			EventType: KongEventEgressInvalid, Outcome: KongOutcomeSkipped,
 			TicketEgress: ticketEgress, TrafficEgress: KongTrafficEgressKey(account.ProxyID),
 			Detail: map[string]any{"reason": "egress_busy_other_account", "handoff": true},
 		})
+		return &KongTicketGrant{Allowed: false, DenyReason: KongDenyEgressBusy}, nil
 	}
 	// kongClaimSameAccount 什么都不用做：已有在途任务，它的产物正是本账号要的票。
 	return &KongTicketGrant{Allowed: false, DenyReason: KongDenyPreparing}, nil
@@ -607,7 +612,14 @@ func (s *KongTicketService) awaitTask(ctx context.Context, task *kongTicketTask,
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		// 等待被调用方的 context 中断：这不是"票不合格"，也不是系统故障，而是**这个账号这次没能及时
+		// 拿到票**——换一个此刻有票的账号完全可能立刻服务。报成错误会让上层包成 `ensure_failed`
+		// （系统级、带 NextAccountStop），于是别的账号有票也用不上，那是无谓拒服。
+		//
+		// **不按 ctx.Err() 区分"是谁取消的"**：HTTP 侧的首输出守卫用 WithCancel + AfterFunc 取消，
+		// 拿到的是 Canceled，与客户端断开没有区别。而客户端真的走了那一路另有判据——上层在 failover
+		// 之前先查 `failoverClientGone`，那时这次拒服不会被用来重试。
+		return &KongTicketGrant{Allowed: false, DenyReason: KongDenyWaitTimeout}, nil
 	case <-timer.C:
 		return &KongTicketGrant{Allowed: false, DenyReason: KongDenyWaitTimeout}, nil
 	case <-task.done:
@@ -952,11 +964,22 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 	if err != nil {
 		extra["error"] = err.Error()
 		extra["phase"] = "store_ticket"
+		// **按既定规则拒收不是故障**：取到 312（长度黑名单）说明上游给的是降智档票，我们照规则不收
+		// ——那是预期结果。记成 store_ticket_failed 会让排查往"数据库/存储坏了"的方向走，而真实原因
+		// 是上游给了什么。判据用既有的 KongIsExpectedTicketRejection（observe 路径已经在用它）。
+		//
+		// fetch 事件本身仍记 failure：这次取票确实没拿到可用票，而成功率统计要算这一次。
+		reason := "store_ticket_failed"
+		if KongIsExpectedTicketRejection(err) {
+			extra["phase"] = "ticket_rejected"
+			reason = "ticket_rejected"
+		}
 		event.Outcome = KongOutcomeFailure
 		event.Detail = detail(extra)
 		s.logEvent(ctx, event)
-		// 网络活动已经发生，退避必须推进：否则下一个请求立刻再取一次，同一个故障被无限重试。
-		cooldown("store_ticket_failed")
+		// 退避照样推进，两种情况都要：网络活动已经发生，否则下一个请求立刻再取一次——预期拒收更需要
+		// 退避，因为上游正在发降智档票，立刻重试只会再拿一张 312。
+		cooldown(reason)
 		out.err = err
 		return out
 	}

@@ -110,26 +110,31 @@ func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Co
 	// 必须在任何 ops 传输错误写入**之前**判掉，否则即使不停调度、不换号，也已经污染了上游故障
 	// 记录——那些记录会被当成账号健康度的证据。
 	//
-	// **唯一的例外是「票据正在准备」**：本账号的票据任务已在后台跑，而别的账号此刻有可用票，换过去
-	// 比等几十秒更快。包成 failover 错误让上层换号，但：
+	// **例外是票据拒服**：它们全是账号级条件（这个账号的出口静默不够、配置不对、任务没拿到票……），
+	// 换一个账号完全可能立刻有票。包成 failover 错误让上层换号，但：
 	//
-	//   - RequestScopedTransient：**不得据此临时封禁账号**。它本身是好的，只是这一刻没票，几十秒后
-	//     就补上了——封掉它等于把一个即将可用的账号推出调度。
-	//   - RetryableOnSameAccount 按**有没有绑定粘性会话**定：绑定了先在同账号等（换号会让上下文缓存
-	//     失效、粘性计费被强制），没绑定就直接换。
+	//   - RequestScopedTransient：**不得据此临时封禁账号**。账号本身是好的，只是这一刻没票可注入
+	//     ——封掉它等于把一个几十秒后就补上票的账号推出调度。
+	//   - RetryableOnSameAccount 只在**几秒内可能自行好转**时为真（见 kongDenyWorthSameAccountWait）。
+	//     对 window_closed 这类"要等到某个时刻"的原因先等本号纯属浪费重试次数，还会延后真正能服务的
+	//     那次换号。
+	//
+	// ⚠️ 这里曾经只放行 preparing，于是 window_closed 一律直接拒服、**从不尝试换号**。生产实测有
+	// 64 个请求在同分组另一账号已有合格票的情况下被拒——那是无谓拒服，与放行降智同级。
 	//
 	// 仍然不写 ops 传输错误，理由同上：一个字节都没发出去。
-	if preparing, retrySame := KongTicketPreparing(ctx, err); preparing {
-		return &UpstreamFailoverError{
-			StatusCode:             0,
-			RequestScopedTransient: true,
-			RetryableOnSameAccount: retrySame,
-			// Scope=account 正是这里的语义：换一个账号确实有帮助（别家此刻有票，票据层已经确认过）。
-			Scope:  GatewayFailureScopeAccount,
-			Reason: GatewayFailureReason(KongDenyPreparing),
+	if canFailover, retrySame := KongTicketFailover(ctx, err); canFailover {
+		var denied *KongErrTicketDenied
+		if errors.As(err, &denied) && denied != nil {
+			// 恢复时刻并进请求级累计：failover 耗尽（所有账号都没票）时，耗尽呈现要靠它告诉客户端
+			// **最早**什么时候值得再来，而不是一句"上游请求失败"。取最早而不是最后一个账号的，
+			// 见 KongTicketDenyWait。
+			MarkKongTicketDenied(c, denied.RetryAfter)
+			// 包装错误同时保留原始拒服类型，调度上报据此豁免（见 newKongTicketDenyFailover）。
+			return newKongTicketDenyFailover(denied, retrySame)
 		}
 	}
-	if KongIsTicketDenied(err) || KongIsDeliveryBlocked(err) {
+	if KongIsDeliveryBlocked(err) {
 		return err
 	}
 

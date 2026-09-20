@@ -1582,6 +1582,10 @@ func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, 
 	if failoverErr != nil {
 		copyFailoverRetryAfter(c, failoverErr.ResponseHeaders)
 	}
+	// [kong] 同 handleFailoverExhausted：票据拒服不是上游故障，要在通用映射之前判掉。
+	if h.kongWriteTicketDenyExhausted(c, failoverErr, streamStarted, true) {
+		return
+	}
 	if failoverErr != nil && failoverErr.IsCredentialFailure() {
 		status, message := credentialFailoverClientResponse(failoverErr)
 		h.anthropicStreamingAwareError(c, status, "api_error", message, streamStarted)
@@ -3338,6 +3342,11 @@ func (h *OpenAIGatewayHandler) handleConcurrencyError(c *gin.Context, err error,
 func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverErr *service.UpstreamFailoverError, streamStarted bool) {
 	if failoverErr == nil {
 		h.handleFailoverExhaustedSimple(c, http.StatusBadGateway, streamStarted)
+		return
+	}
+	// [kong] 票据拒服必须在通用上游映射之前判掉：它的 StatusCode 是 0，落到 mapUpstreamError 的
+	// default 分支就是 `502 / "Upstream request failed"`——而这里压根没有上游交互。
+	if h.kongWriteTicketDenyExhausted(c, failoverErr, streamStarted, false) {
 		return
 	}
 	if failoverErr.IsOpenAIRequestBodyTooLarge() {

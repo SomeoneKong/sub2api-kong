@@ -335,7 +335,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	// （codex 客户端也是每个 response.create 都带）。判定用 mappedModel——那是实际上送的模型。
 	kongTicketAttempt, kongTicketErr := s.kongTicket.PrepareWSMapPayload(ctx, account, mappedModel, payload)
 	if kongTicketErr != nil {
-		return nil, kongTicketErr
+		// **客户端是 HTTP**，所以拒服要走 HTTP 那套统一转换：包成 failover 错误让上层换号，耗尽时由
+		// 耗尽 handler 给 503 + Retry-After。裸返回会让 `errors.As(*UpstreamFailoverError)` 不命中，
+		// 请求落进通用兜底的 502，而别的账号完全可能此刻就有票——那是无谓拒服。
+		//
+		// 此刻预热帧与正式生成帧都还没发出，换号是安全的。
+		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, kongTicketErr, false)
 	}
 
 	if err := s.performOpenAIWSGeneratePrewarm(

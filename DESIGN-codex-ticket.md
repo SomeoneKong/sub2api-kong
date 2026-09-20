@@ -1380,7 +1380,9 @@ refresh_before = 1900s  → 间隔 1700s（28 分钟静默）← 踩在实测门
 **票据层判一次、上层决定怎么等**，两层分工刻意分开：
 
 1. **票据层**（`handoffWorthIt`）：查"别的账号在同一模型上有没有一张**按当前白名单仍然合格**的票"。
-   - 有 → 起异步任务，报 `preparing`，不等。
+   - 有 → 起异步任务，报 `preparing`，不等。⚠️ 票据出口被**别的账号**占住、本账号这一轮压根起不了
+     任务时报 `egress_busy` 而不是 `preparing`：后者的含义是"本账号的任务正在跑"，那是唯一值得先在
+     同账号等一等的原因（见本节第 2 层）。
    - 没有 → 换号救不了，退回同步等（与此前行为一致）。
    - **必须按当前白名单重判**，不能只看 `status = verified`：那个状态只表示"按当时的白名单判过"，
      而白名单与阈值来自环境变量、随时可改。
@@ -1393,18 +1395,91 @@ refresh_before = 1900s  → 间隔 1700s（28 分钟静默）← 踩在实测门
    - **在途任务也走同一判定**：后到的请求不能直接进最长五分钟的同步等待，否则（一）无绑定的新请求
      明明能换号却原地等；（二）绑定请求首次拿到 `preparing`、重试一次就被这条路径吞掉，
      `pool_mode_retry_count` 再也控制不了等待。
-2. **上层**（`KongTicketPreparing`）：`preparing` 是**唯一可以 failover 的票据拒服**，其余（静默未满、
-   出口不可用、真降档）换号只是把同一个结论在每个账号上重演一遍，还会把每个账号都记进失败列表。
-   同账号先不先等，按**这个请求有没有绑定粘性会话**定：
-   - **绑定了** → 先在同账号重试（框架的同账号重试就是等），等不到再换。换号会让上下文缓存失效、
-     粘性计费被强制，代价比等几十秒大。
-   - **没绑定** → 本该直接换号。
+2. **上层**（`KongTicketFailover`）：**所有票据拒服都可以 failover**，因为它们全是**账号级**条件
+   ——静默与冷却按该账号的票据出口累积、出口配置是账号自己的、任务没拿到票也只是这个账号没拿到。
+   真正全局的情况（所有账号都没票）由 failover 框架自然耗尽，不在这一层提前判定。
 
-   ⚠️ **当前读不到绑定信息时按"可能绑定了"处理**（即也先等本号）。`WithPrefetchedStickySession` 只有
-   通用 Gateway 与 Gemini handler 会写，**OpenAI Responses/Messages 主路径不写**——它的绑定命中只体现在
-   调度决策的 `StickySessionHit` / `StickyPreviousHit` 里。两种猜错的后果不对称：该换却先等只多花几秒
-   重试延时（`RetryableOnSameAccount` **不阻止换号**，重试耗尽照样切），该等却直接换会破坏会话、还可能
-   换到同样没票的账号。代价是"新请求立刻换号"这个优化暂时拿不到。
+   ⚠️ **这里曾经只放行 `preparing`**，理由写的是"其余换号只是把同一个结论在每个账号上重演"。**那个
+   推理是错的**，它把账号级条件当成了全局条件。生产实测（2026-09-20）：一个账号因 `window_closed`
+   拒服期间，同分组另一账号已持有合格票，**64 个请求仍被直接拒掉、一个都没切过去**——那是无谓拒服，
+   与放行降智同级。实例见 `../INCIDENT-20260920-ticket-deny-as-502.md`。
+
+   ⚠️ **拒服身份靠错误类型认，不靠 reason 字符串**。`*KongErrTicketDenied` 有十几个构造点，其中六种
+   原因带自由文本（`ensure_failed: <err>`、`model_undeterminable: <reason>` 等），维护一张字符串清单
+   反查必然漏项——漏一项就是把一次本地拒服计进账号健康度 EWMA（实测 `ensure_failed` 让 EWMA 从 0
+   跳到 0.20）。所以转换时**保留原始错误**（多值 `Unwrap`），而 failover 错误自己的 `Reason` 落在
+   `kong_ticket_denied:<分类>` 这个受控命名空间里，供只拿得到 `*UpstreamFailoverError` 的呈现层认。
+   规范化同时挡住一条泄漏：`Reason` 会流进给客户端的文案，自由文本会把库连接串、代理地址一起带出去。
+
+   **身份判定要认两种传参形态**：多值 `Unwrap` 只能由外向内查找，所以调用方一旦先 `errors.As` 把
+   `*UpstreamFailoverError` 摘出来、再把那个指针单独传给调度上报（WS 换号就是这样），从它反查不到并列
+   的 `*KongErrTicketDenied`。那时靠受控命名空间识别。只认类型会在这类消费点上静默漏掉。
+
+   同账号先不先等（`RetryableOnSameAccount`）另按**这个原因在几秒内是否可能自行好转**定：
+   - **值得等**：`preparing`（本账号的任务正在跑，产物就是本账号要的票）、`other_model_task`（本账号
+     的在途任务在跑别的模型；它可能是候选验证——走 `kongVerifyOnlySlot`、不碰票据出口——完成后本模型
+     确实可能可取）。
+   - **不值得等**：`window_closed`（要到某个时刻才满）、`egress_unusable` / `no_ticket_source`（配置
+     问题，等不会变）、`task_no_ticket` / `wait_timeout`（任务已结束且没拿到票）、`egress_busy`。对这些
+     先等本号是把重试次数花在一个确定不会变的状态上，还会延后真正能服务的那次换号。
+
+   ⚠️ **`egress_busy` 曾被算作"值得等"**，理由是"别的任务占着，马上释放"。那个理由不成立：占着出口的
+   是**另一个账号**的任务，它产出的票属于那个账号；更要紧的是那次取票会把这条**共享**出口的静默清零
+   （`noteEgressUse`，§4.4），于是它一释放本账号立刻需要等满整个 `M`——状态从 `egress_busy` 变成
+   `window_closed`，正落在"不值得等"那一类。
+
+   值得等的那几种还要看**这个请求有没有绑定粘性会话**：绑定了先等（换号会让上下文缓存失效、粘性计费
+   被强制），没绑定直接换。⚠️ **当前读不到绑定信息时按"可能绑定了"处理**——`WithPrefetchedStickySession`
+   只有通用 Gateway 与 Gemini handler 会写，**OpenAI Responses/Messages 主路径不写**。两种猜错的后果
+   不对称：该换却先等只多花几秒重试延时（`RetryableOnSameAccount` **不阻止换号**），该等却直接换会破坏
+   会话。代价是"新请求立刻换号"这个优化暂时拿不到。
+
+3. **呈现**（`kongWriteTicketDenyExhausted`）：failover 耗尽后——即**所有账号都没票**——返回
+   **503 + `Retry-After`**，消息里带拒服分类与"最早可再来"的时刻。
+
+   ⚠️ 不能落进通用上游错误映射（`502 / upstream_error / "Upstream request failed"`）。票据拒服**一个
+   字节都没发给上游**，把它呈现成上游故障会同时带偏三处：排查方向指向上游与账号健康、供应商质量统计
+   被记一笔（`error_owner=provider` 而 `upstream_status_code` 是 NULL，自相矛盾）、客户端按"网关故障"
+   重试而不是按给定时刻等待。
+
+   **挂载点必须是真实的耗尽 handler**（`handleFailoverExhausted` / `handleAnthropicFailoverExhausted`），
+   不是通用兜底 `ensureForwardErrorResponse`。第 2 层把拒服包成了 failover 错误，它的终点就在耗尽
+   handler；⚠️ 初版挂在通用兜底上，**单测全绿而生产照旧 502**——那条兜底只接"根本没走 failover"的错误。
+
+   **识别绑定当前终止错误**，不读请求级的历史标记：A 因 `window_closed` 被拒、换到 B 后 B 真的 500，
+   终止错误是 B 的，这时呈现必须是上游故障。反过来记就是把归因错误反着犯一遍。
+
+   **等待时刻取已尝试账号中最早的那个**（`KongTicketDenyWait`），不是最后访问那个的：A 一分钟后可重试、
+   B 三十分钟后可重试，按 B 给会让客户端白等二十九分钟。**任一被拒账号恢复时刻未知时干脆不给
+   `Retry-After`**——未知不等于很久，拿别人的长等待去挡会把一个几十秒后就有票的池子搁置二十分钟。
+   文案说"最早可再来"而**不说"保证那时恢复"**：那个时刻只表示静默/冷却期满，届时能否取到合格票仍取决
+   于上游。
+
+   503 而不是 502 是因为语义：502 是"上游返回了无效响应"，而这里没有上游交互；503 + `Retry-After`
+   是"服务暂时不可用"的标准表达。`Retry-After` 给**秒数**不给日期——日期要求两端时钟一致，而它们可以
+   差好几分钟。
+
+**还有第三条传输通路**：客户端 HTTP 进来、上游是 WebSocket（`openai_ws_forwarder_v2.go` 的
+`PrepareWSMapPayload`）。它既不过 `doOpenAIUpstream` 也不过两条原生 WS 适配器，所以拒服要显式走 HTTP
+那套统一转换——客户端是 HTTP，终点应当是 HTTP 的耗尽呈现（503），不是 WS 的关闭错误。裸返回会让
+`errors.As(*UpstreamFailoverError)` 不命中、请求落进通用兜底的 502 且不换号。
+
+**首输出守卫不得盖住票据判定**。守卫的 context 也套在准入上，所以"等本账号的取票任务"超过首输出期限
+时它会先被触发。票据判定必须排在它前面，否则一次本地拒服会被改写成 `504 / first_output_timeout`：
+票据身份丢失、错误记到上游头上、账号健康度被罚，而一个字节都没发给上游。换号在那里是安全的——
+`startTime` 是每次 `Forward` 取的，下一个账号会拿到完整的首输出预算。
+
+**准入被调用方的 context 中断算账号级 `wait_timeout`**，不是系统级 `ensure_failed`：这个账号这次没能
+及时完成准入，换一个此刻有票的账号完全可能立刻服务。判据放在**准入的共同边界**（`kongEnsureDenial`），
+不是某一个数据库调用上——这一路到处在读库（账号、当前票、候选、出口活动、冷却，任务完成后还要再读一
+次票），守卫一取消，其中任何一处都会返回 context 错误，逐个补必然漏。不按 `ctx.Err()` 区分"是谁取消
+的"——守卫用 `WithCancel` 取消，拿到的是 `Canceled`，与客户端断开没有区别；客户端真的走了那一路另有
+判据（上层在 failover 之前先查 `failoverClientGone`）。
+
+**六个自行处理传输错误的 `doOpenAIUpstream` 调用点**（embeddings、responses input_tokens、Anthropic
+count_tokens、images、images_responses、live）在写 ops 传输错误之前先判票据拒服，交给统一转换。
+⚠️ **不要按入口的模型名推断"受控模型到不了这里"**：出站载荷的顶层模型可以由别的机制决定——
+images_responses 的驱动模型就来自 `SUB2API_IMAGES_MAIN_MODEL`，与入口的图片模型白名单无关。
 
 **原生 WebSocket 不参与交接**（`EnsureTicketNoHandoff`）。那条路上的拒服落点是按策略关闭连接（1008），
 没有 failover 可走——返回 `preparing` 等于把一条只需等几十秒的连接直接断掉，而改动前它是同步等的。
@@ -1413,8 +1488,9 @@ refresh_before = 1900s  → 间隔 1700s（28 分钟静默）← 踩在实测门
 等待的自然终点是任务完成或重试次数用尽。
 
 **它不是账号的故障**，所以 failover 错误带 `RequestScopedTransient`，并在调度上报处显式豁免
-（`KongIsPreparingFailover`）。计进错误率 EWMA 会让"票越缺、账号越被判坏"，与事实相反；临时封禁更糟
-——那会把一个几十秒后就补上票的账号推出调度。
+（`KongIsTicketDeniedFailover` / `KongIsTicketDenied`，两道都走 `errors.As` 认类型，覆盖全部
+deny_reason，含带自由文本的技术原因）。计进错误率 EWMA 会让"票越缺、账号越被判坏"，与事实相反；临时
+封禁更糟——那会把一个几十秒后就补上票的账号推出调度。
 
 **并发**：`claimTask` 的 single-flight 不变——同一账号只有一个在途任务，后到的请求要么交接、要么等
 它。票不是独占资源，TTL 内可反复注入，换过去的请求不会互抢。
@@ -1424,8 +1500,9 @@ refresh_before = 1900s  → 间隔 1700s（28 分钟静默）← 踩在实测门
 1. 票据层只回一个布尔，没把**可接手的账号 id** 交给上层，所以上层无法与本请求的可调度集合取交集。
    别家账号全部不可调度时，failover 会耗尽而不是回来等。
 2. OpenAI 主路径不写绑定事实到 context，于是"新请求立刻换号"退化成"先等几次重试再换"。
-3. 原生 WS 完全不交接。接它需要区分首帧未上送（可安全切换）与已建立会话（须保持本号），并让 WS 的
-   同账号重试 helper 支持 `preparing`（当前只认 429 的 deadline）。
+3. 原生 WS 完全不交接，**也不参与本节第 2 层的 failover**——那条路上的票据拒服仍是按策略关闭连接
+   （1008）。接它需要区分首帧未上送（可安全切换）与已建立会话（须保持本号），并让 WS 的同账号重试
+   helper 支持票据拒服（当前只认 429 的 deadline）。
 
 ## 8. 风险与退出
 
@@ -1441,14 +1518,20 @@ refresh_before = 1900s  → 间隔 1700s（28 分钟静默）← 踩在实测门
 **退出条件**：若上游变更使注入失效且无法在合理成本内恢复，**放弃该特性**而不是层层加码
 绕过——继续对抗只会把风险推到账号上。
 
-⚠️ **已知缺陷：票据拒服在呈现与归因上与上游故障混为一谈。** `window_closed` 这类不可 failover 的
-拒服会掉进 `gateway_handler.go` 的 `ensureForwardErrorResponse` 兜底，变成
-`502 / upstream_error / "Upstream request failed"`，并在 `ops_error_logs` 里被记成
-`error_owner = provider`、`error_source = upstream_http`，而 `upstream_status_code` 是 NULL
-（自相矛盾）。后果是排查方向被引向上游、供应商质量统计被污染、客户端拿不到"该等到几点"这个唯一
-可操作的信息。实例与最小改法方向见 `../INCIDENT-20260920-ticket-deny-as-502.md`。
+⚠️ **残留缺陷：`ops_error_logs` 仍把票据拒服归因给上游。** 换号、响应与调度健康度三件已经修了
+（§4.6 第 2、3 层），但看板那一侧还会把这类记成 `error_owner = provider` /
+`error_source = upstream_http`，而同一行的 `upstream_status_code` 是 NULL——三者自相矛盾，供应商质量
+统计因此被污染。**在改之前，排查这类问题的判据是：`upstream_status_code` 为 NULL 即"压根没有上游
+响应"**。
 
-改它时要守住：`full` 拿不到合格票**仍然必须拒服**。那条缺陷是关于怎么把拒服告诉调用方，不是
+⚠️ **另一条残留：六个 `doOpenAIUpstream` 调用点不经过票据拒服的转换**（embeddings、responses
+input_tokens、Anthropic count_tokens、images、images_responses、live），它们自己写 ops 传输错误，于是
+那几条路上的拒服既不换号、也不按 503 呈现。真正可达的是 count_tokens 两条——顺带的问题是 count_tokens
+本不产出模型输出、**门控它只会带来无谓拒服**。
+
+两条实例与待办均见 `../INCIDENT-20260920-ticket-deny-as-502.md`。
+
+改它时要守住：`full` 拿不到合格票**仍然必须拒服**。这条缺陷是关于怎么把拒服告诉调用方与看板，不是
 该不该拒服。
 
 ## 9. 待定

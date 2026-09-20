@@ -639,6 +639,13 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 	if err != nil {
+		// [kong] 票据拒服与交付拦截不是上游故障：一个字节都没发给上游。必须在写 ops 传输错误与
+		// 字符串化之前交给统一转换，否则这条路上的拒服会丢掉类型（换不了号、到不了 503 呈现），
+		// 还会在错误看板上记一笔指向供应商的假证据。**不按入口的模型名推断"到不了这里"**——出站
+		// 载荷的顶层模型可以由别的机制决定（例如 SUB2API_IMAGES_MAIN_MODEL）。
+		if KongIsTicketDenied(err) || KongIsDeliveryBlocked(err) {
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
 		safeErr := sanitizeUpstreamErrorMessage(err.Error())
 		setOpsUpstreamError(c, 0, safeErr, "")
 		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{

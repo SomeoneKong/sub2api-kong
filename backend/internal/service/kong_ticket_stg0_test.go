@@ -454,6 +454,61 @@ func TestKongStg0StatsSerializesEmptyListAsArray(t *testing.T) {
 	}
 }
 
+// 取到降智档票（312，长度黑名单）是**按规则拒收**，不是存储故障。
+//
+// 两者都要推进退避（网络活动已发生，而且上游正在发 312，立刻重试只会再拿一张），但归因必须分开：
+// 记成 store_ticket_failed 会让排查往"数据库坏了"的方向走，而真实原因是上游给了什么。
+//
+// observe 路径一直用 KongIsExpectedTicketRejection 做这个区分，fetch 路径此前没做——同一件事在两条
+// 路径上归因不一致。
+func TestKongDenylistedTicketIsRejectionNotStoreFailure(t *testing.T) {
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		// 312 在长度黑名单里。
+		fetchState: strings.Repeat("a", 312),
+		answers:    kongVerifyAnswers(),
+	}
+	svc, repo := kongBatchSetup(t, up, false)
+
+	if _, err := svc.EnsureTicket(context.Background(), 1, kongBatchAstra); err == nil {
+		// 拿不到票是预期的；这里只要求它别静默成功。
+		t.Log("取票未返回错误，继续检查事件归因")
+	}
+
+	var cooldownReasons []string
+	for _, ev := range repo.events {
+		if ev.EventType == KongEventCooldown && ev.Detail != nil {
+			if r, ok := ev.Detail["reason"].(string); ok {
+				cooldownReasons = append(cooldownReasons, r)
+			}
+		}
+	}
+	if len(cooldownReasons) == 0 {
+		t.Fatal("取到 312 之后必须推进退避，否则下一个请求立刻再取一张 312")
+	}
+	for _, r := range cooldownReasons {
+		if r == "store_ticket_failed" {
+			t.Error("按规则拒收被记成存储故障——那会让排查方向指向数据库，而真实原因是上游给了降智档票")
+		}
+		if r != "ticket_rejected" {
+			t.Errorf("冷却原因 = %q, want ticket_rejected", r)
+		}
+	}
+	// 长度黑名单那条 observe 事件照旧要有：它带着 state_len，是"上游给了什么"的直接证据。
+	var sawDenylist bool
+	for _, ev := range repo.events {
+		if ev.Detail != nil && ev.Detail["reason"] == "state_len_denylisted" {
+			sawDenylist = true
+			if ev.StateLen == nil || *ev.StateLen != 312 {
+				t.Error("那条事件要带上票长度，否则看不出上游给的是哪一档")
+			}
+		}
+	}
+	if !sawDenylist {
+		t.Error("缺少 state_len_denylisted 事件")
+	}
+}
+
 // 详情页要能区分"结论来自哪一层"：stg0 是上游自己回报的 model，不是一次指纹测量。
 //
 // stg0 判死票时会把回报值当归因结果写进票行（p=1、单点分布），那是为了让下游统一按概率工作。但页面
