@@ -129,7 +129,12 @@
                            过期票会一直显示成有效的当前票。 -->
                       <p v-if="liveRemaining(m.current_ticket, row.account_id) > 0" class="text-xs text-gray-500 dark:text-dark-400">
                         当前票剩 {{ liveRemaining(m.current_ticket, row.account_id) }}s · 来源 {{ m.current_ticket?.source }}
+                        <!-- off 不注入，这张票只是上次开着 full 时留下的合格票。不标出来会被读成
+                             「有当前票」＝「还在受保护」。 -->
+                        <span v-if="row.mode === 'off'" class="text-gray-400">· off 不注入</span>
                       </p>
+                      <!-- off 本就不该有服务中的票，缺票不是异常，别用警示色。 -->
+                      <p v-else-if="row.mode === 'off'" class="text-xs text-gray-500 dark:text-dark-400">无当前票（off 不取票）</p>
                       <p v-else class="text-xs text-amber-700 dark:text-amber-300">无可用当前票</p>
                       <p v-if="m.unverified_count > 0" class="text-xs text-gray-500 dark:text-dark-400">
                         候选 {{ m.unverified_count }} 张待验
@@ -166,10 +171,14 @@
                     </div>
                   </td>
                   <td class="px-3 py-3 text-xs text-gray-600 dark:text-dark-300">
-                    <p>{{ row.egress_idle_seconds === null ? '本系统未用过该出口' : `本系统记录 ${row.egress_idle_seconds}s` }}</p>
-                    <p v-if="row.next_fetch_allowed_at" class="text-gray-500 dark:text-dark-400">
-                      {{ formatTime(row.next_fetch_allowed_at) }} 起
-                    </p>
+                    <!-- off 从不取票，静默与「下次可取票」对它没有意义，后端也不查。 -->
+                    <span v-if="row.mode === 'off'" class="text-gray-500 dark:text-dark-400">—</span>
+                    <template v-else>
+                      <p>{{ row.egress_idle_seconds === null ? '本系统未用过该出口' : `本系统记录 ${row.egress_idle_seconds}s` }}</p>
+                      <p v-if="row.next_fetch_allowed_at" class="text-gray-500 dark:text-dark-400">
+                        {{ formatTime(row.next_fetch_allowed_at) }} 起
+                      </p>
+                    </template>
                   </td>
                   <td class="px-3 py-3">
                     <button

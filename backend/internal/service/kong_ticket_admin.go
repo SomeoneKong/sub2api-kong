@@ -221,12 +221,12 @@ func (s *KongTicketAdminService) statusOf(ctx context.Context, account *KongAcco
 	}
 	status.EgressUsable, status.EgressReason = KongEvaluateEgress(cfg, account.ProxyID, proxyState, now)
 
-	if cfg.Mode == KongTicketModeOff {
-		return status, nil
-	}
-
-	// 出口的空闲与下一次可取票时刻只在配了票据出口时有意义。
-	if cfg.Egress != KongTicketEgressNone {
+	// 出口的空闲与下一次可取票时刻只在**会取票**且配了票据出口时才有意义：off 从不取票，报一个
+	// 「下次可取票时刻」等于陈述一件不会发生的事。
+	//
+	// 但下面的逐模型信息 off 照样输出——off 与 observe 的差别只是不主动探测/取票，票仍然被动
+	// 收下（§2.3），候选数、取样长度、历史诊断都已经在库里，不显示只是把已有的信息藏起来。
+	if cfg.Mode != KongTicketModeOff && cfg.Egress != KongTicketEgressNone {
 		lastUsed, err := s.repo.LastEgressActivity(ctx, status.TicketEgress)
 		if err != nil {
 			return nil, fmt.Errorf("查出口活动: %w", err)
