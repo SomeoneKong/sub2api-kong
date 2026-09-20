@@ -110,15 +110,20 @@
                   </td>
                   <td class="px-3 py-3">
                     <span v-if="row.mode === 'off'" class="text-xs text-gray-500 dark:text-dark-400">—</span>
+                    <!-- egress=none 是一个明确的配置选择，不是故障，所以不标成「不可用」，也不必
+                         再解释一遍——左边那一列就写着「不设置」。 -->
+                    <template v-else-if="row.egress === 'none'">
+                      <span class="badge badge-gray">未配置</span>
+                      <!-- 但 full + 没有票据出口是真的会持续拒服：这个组合看起来配好了，实际只能等
+                           业务响应偶然带回一张好票，系统自己无法恢复。 -->
+                      <p v-if="row.mode === 'full'" class="mt-1 text-xs text-red-600 dark:text-red-400">
+                        full 但没有票据出口：只能等业务响应偶然带回合格票，无自主恢复能力
+                      </p>
+                    </template>
                     <span v-else-if="row.egress_usable" class="badge badge-success">可用</span>
                     <template v-else>
                       <span class="badge badge-warning">不可用</span>
                       <p class="mt-1 text-xs text-gray-500 dark:text-dark-400">{{ egressReasonText(row.egress_reason) }}</p>
-                      <!-- full + 没有票据出口 = 只能等业务响应偶然带回一张好票，系统自己无法恢复。
-                           这个组合看起来配好了，实际会持续拒服，必须写明。 -->
-                      <p v-if="row.mode === 'full' && row.egress === 'none'" class="mt-1 text-xs text-red-600 dark:text-red-400">
-                        full 但没有票据出口：只能等业务响应偶然带回合格票，无自主恢复能力
-                      </p>
                     </template>
                   </td>
                   <td class="px-3 py-3">
@@ -785,8 +790,8 @@ function accountName(id: number): string {
 }
 
 // 键取自后端的 KongEgressReason* 常量，改那边要同步这里——对不上只会退化成显示原始串。
+// not_configured 不在表里：egress=none 由上面那一格直接显示成「未配置」，走不到这个映射。
 const egressReasons: Record<string, string> = {
-  not_configured: '未配置票据出口，不会主动取票',
   both_direct: '票据出口与流量出口都是直连，同一个本机 IP',
   same_as_traffic: '票据出口与流量出口是同一个代理',
   proxy_missing: '配置指向的代理不存在（已被删除，或没给代理 ID）',
