@@ -2252,7 +2252,7 @@ func setDefaults() {
 	viper.SetDefault("image_storage.public_base_url", "")
 	// 同一个理由（viper 只解码 AllKeys() 里的键）：本 fork 的票据配置没有 config 文件可依，
 	// 现网全靠 GATEWAY_KONG_CODEX_TICKET_* 环境变量，不注册空默认值就永远读不到。
-	viper.SetDefault("gateway.kong_codex_ticket.accept_extra", "")
+	viper.SetDefault("gateway.kong_codex_ticket.accept_extra", DefaultKongTicketAcceptExtra)
 
 	// Ops (vNext)
 	viper.SetDefault("ops.enabled", true)

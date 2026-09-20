@@ -5,6 +5,8 @@ package service
 import (
 	"math"
 	"testing"
+
+	"github.com/Wei-Shaw/sub2api/internal/config"
 )
 
 // 采纳判据的两条要点：自接受不靠配置写对；概率按白名单求和而不是只看 argmax。
@@ -71,5 +73,62 @@ func TestKongTicketAcceptRejectsNonPositiveConfidence(t *testing.T) {
 	var nilAccept KongTicketAccept
 	if nilAccept.Accepts("gpt-6-astra", probs, 0) {
 		t.Error("未启用装配（accept=nil, confidence=0）不得放行")
+	}
+}
+
+// 内置默认必须自成一致：门控集合里的每个模型都在校准资料里，且默认白名单能被这个集合接受。
+//
+// 两者分处 service 与 config 两个包，改一处忘另一处不会编译失败，只会表现成启动报错（键不在
+// 门控集合里）或 sol 侧间歇拒服（归因给 astra 却不被接受）。
+func TestKongDefaultsAreConsistent(t *testing.T) {
+	bank, err := KongFingerprintBankLoad()
+	if err != nil {
+		t.Fatalf("加载校准资料: %v", err)
+	}
+	for _, m := range KongDefaultGatedModels {
+		if !bank.HasModel(m) {
+			t.Errorf("默认门控模型 %q 不在校准资料里，准入判定不成立", m)
+		}
+	}
+	accept, err := KongParseTicketAccept(KongDefaultGatedModels, config.DefaultKongTicketAcceptExtra, bank)
+	if err != nil {
+		t.Fatalf("默认白名单与默认门控集合不自洽: %v", err)
+	}
+	// sol 接受自己、astra 与 gpt-5.5（后者因为指纹法分不开 sol 与 5.5）；astra 只接受自己。
+	sol := accept.Of("gpt-5.6-sol")
+	if len(sol) != 3 {
+		t.Errorf("sol 应接受自己、astra 与 gpt-5.5，得到 %v", sol)
+	}
+	if got := accept.Of("gpt-6-astra"); len(got) != 1 || got[0] != "gpt-6-astra" {
+		t.Errorf("astra 应只接受自己，得到 %v", got)
+	}
+	// 归因为 astra 的票：sol 放行、astra 也放行；归因为 luna 的票两边都拒。
+	astraProbs := map[string]float64{"gpt-6-astra": 0.97, "gpt-5.6-sol": 0.03}
+	if !accept.Accepts("gpt-5.6-sol", astraProbs, 0.9) {
+		t.Error("归因为 astra 的票必须能支持 sol 请求——这正是默认白名单的目的")
+	}
+	if !accept.Accepts("gpt-6-astra", astraProbs, 0.9) {
+		t.Error("归因为 astra 的票必须能支持 astra 请求")
+	}
+	// 实测分布（2026-09-20，为 sol 取的 292 票）：只看 argmax 是 0.8214 达不到 0.9，
+	// 计入 5.5 之后 0.9993 通过。这一条锁住"加 5.5"的实际效果。
+	measured := map[string]float64{
+		"gpt-5.6-sol": 0.8213532036796947,
+		"gpt-5.5":     0.17788932213595104,
+		"gpt-6-astra": 0.000016642761560881856,
+	}
+	if !accept.Accepts("gpt-5.6-sol", measured, 0.9) {
+		t.Errorf("实测分布应当通过，得到质量 %v", accept.Mass("gpt-5.6-sol", measured))
+	}
+	// 同一份分布对 astra 仍须拒绝：astra 不接受 sol / 5.5。
+	if accept.Accepts("gpt-6-astra", measured, 0.9) {
+		t.Error("astra 不得接受 sol / 5.5 的归因")
+	}
+
+	lunaProbs := map[string]float64{"gpt-5.6-luna": 0.99, "gpt-6-astra": 0.01}
+	for _, m := range KongDefaultGatedModels {
+		if accept.Accepts(m, lunaProbs, 0.9) {
+			t.Errorf("归因为 luna 的票不得支持 %q", m)
+		}
 	}
 }

@@ -131,15 +131,23 @@ func kongNotReadyReason(account *Account) string {
 	}
 }
 
-// NewKongTicketComponents 按环境变量装配本功能。
+// NewKongTicketComponents 按环境变量与 config 装配本功能。
 //
-// **留空门控模型集合即整个功能不生效**，这是默认状态：fork 的其它使用者不该因为这个定制而多
-// 承担任何行为变化。
+// 门控集合**未设置时取内置默认**（`KongDefaultGatedModels`）；**显式设成空串即整个功能不装配**。
+// 区分这两者的理由与时间参数一致（见 kongEnvDuration）：把"配了个空值"静默当成默认，等于运维
+// 以为关了、系统其实在跑。
+//
+// 默认开着门控不等于默认改变行为：账号级 `mode` 缺省是 off，此时每个请求都判 `NotApplicable`
+// ——照常服务、不注入也不拒服。真正的开关是账号级的 mode。
 //
 // 一旦启用，校准资料加载失败必须让启动失败（fail-closed）：启用了却验证不了，等于放行降智
 // 请求，那比启动失败糟得多。
 func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstream, accountRepo AccountRepository, proxyRepo ProxyRepository, ticketCfg config.KongCodexTicketConfig) (*KongTicketComponents, error) {
-	gated := kongSplitModels(os.Getenv(KongTicketGatedModelsEnv))
+	raw, present := os.LookupEnv(KongTicketGatedModelsEnv)
+	if !present {
+		raw = strings.Join(KongDefaultGatedModels, ",")
+	}
+	gated := kongSplitModels(raw)
 	if len(gated) == 0 {
 		// 功能不生效，但管理面照常装配：它只读状态，不需要校准资料。页面因此能明确显示
 		// 「未启用、原因是门控集合为空」，而不是把这个正常的默认状态呈现成服务故障

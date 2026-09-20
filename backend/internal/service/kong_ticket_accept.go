@@ -14,6 +14,12 @@ import (
 // GATEWAY_KONG_CODEX_TICKET_ACCEPT_EXTRA 设定。
 const kongTicketAcceptKey = "gateway.kong_codex_ticket.accept_extra"
 
+// KongDefaultGatedModels 是受保护的上游模型的内置默认。
+//
+// 两个都是**最终上游模型名**，不是客户端别名。sol 一并保护为什么要配白名单，见
+// config.DefaultKongTicketAcceptExtra 的注释（含"单出口供不上两个模型"那条推导）。
+var KongDefaultGatedModels = []string{"gpt-6-astra", "gpt-5.6-sol"}
+
 // KongTicketAccept 记录每个门控模型接受哪些归因结果。
 //
 // **每个模型永远接受自己的归因**，这一条由构造函数补齐，不依赖配置写对：漏写自己的后果是该
