@@ -109,6 +109,26 @@ func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Co
 	// [kong] codex 票据的拒服与交付拦截不是传输故障：账号本身是好的，是我们主动不发或不交付。
 	// 必须在任何 ops 传输错误写入**之前**判掉，否则即使不停调度、不换号，也已经污染了上游故障
 	// 记录——那些记录会被当成账号健康度的证据。
+	//
+	// **唯一的例外是「票据正在准备」**：本账号的票据任务已在后台跑，而别的账号此刻有可用票，换过去
+	// 比等几十秒更快。包成 failover 错误让上层换号，但：
+	//
+	//   - RequestScopedTransient：**不得据此临时封禁账号**。它本身是好的，只是这一刻没票，几十秒后
+	//     就补上了——封掉它等于把一个即将可用的账号推出调度。
+	//   - RetryableOnSameAccount 按**有没有绑定粘性会话**定：绑定了先在同账号等（换号会让上下文缓存
+	//     失效、粘性计费被强制），没绑定就直接换。
+	//
+	// 仍然不写 ops 传输错误，理由同上：一个字节都没发出去。
+	if preparing, retrySame := KongTicketPreparing(ctx, err); preparing {
+		return &UpstreamFailoverError{
+			StatusCode:             0,
+			RequestScopedTransient: true,
+			RetryableOnSameAccount: retrySame,
+			// Scope=account 正是这里的语义：换一个账号确实有帮助（别家此刻有票，票据层已经确认过）。
+			Scope:  GatewayFailureScopeAccount,
+			Reason: GatewayFailureReason(KongDenyPreparing),
+		}
+	}
 	if KongIsTicketDenied(err) || KongIsDeliveryBlocked(err) {
 		return err
 	}

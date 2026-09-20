@@ -287,3 +287,160 @@ func TestKongTicketDetailModePolicies(t *testing.T) {
 		})
 	}
 }
+
+// 别的账号此刻有可用票时，本账号的请求**不等**票据任务——报 preparing 让上层换号，而任务照常在
+// 后台起（否则本账号永远补不上票）。
+func TestKongHandsOffWhenAnotherAccountHasTicket(t *testing.T) {
+	const model = "gpt-6-astra"
+	repo, up, svc := kongManualFixture(t, model)
+	up.fetchState = strings.Repeat("a", 292)
+	// 出口已静默过门槛，于是决策会选择取票。
+	idleSince := time.Now().Add(-40 * time.Minute)
+	repo.lastEgressUsed = &idleSince
+	// 另一个账号有一张可用票，且**按当前白名单仍然合格**——判据要求重判，所以归因分布必须给。
+	kongSeedElsewhereTicket(repo, 2, model, 99, map[string]float64{model: 0.97})
+
+	grant, err := svc.EnsureTicket(context.Background(), 1, model)
+	if err != nil {
+		t.Fatalf("准备票: %v", err)
+	}
+	if grant.Allowed || grant.DenyReason != KongDenyPreparing {
+		t.Fatalf("别家有票时该报 preparing 让上层换号，实得 %+v", grant)
+	}
+}
+
+// 别家也没票时退回同步等：换号救不了，等是唯一出路。
+func TestKongWaitsWhenNoOtherAccountHasTicket(t *testing.T) {
+	const model = "gpt-6-astra"
+	repo, up, svc := kongManualFixture(t, model)
+	up.fetchState = strings.Repeat("a", 292)
+	up.answers = kongVerifyAnswers()
+	idleSince := time.Now().Add(-40 * time.Minute)
+	repo.lastEgressUsed = &idleSince
+	// 库里只有本账号，没有别家的票。
+
+	grant, err := svc.EnsureTicket(context.Background(), 1, model)
+	if err != nil {
+		t.Fatalf("准备票: %v", err)
+	}
+	// 同步等意味着这次请求会拿到结果（票或明确的拒服原因），而不是 preparing。
+	if grant.DenyReason == KongDenyPreparing {
+		t.Fatalf("别家没票时不该让上层换号，换过去也没票：%+v", grant)
+	}
+	if up.fetchCalls == 0 {
+		t.Fatal("应当在本请求上同步取票")
+	}
+}
+
+// preparing 的 failover 错误：不得据它封禁账号或计入健康度——账号好着，只是这一刻没票。
+func TestKongPreparingFailoverIsNotAccountFault(t *testing.T) {
+	denied := &KongErrTicketDenied{Reason: KongDenyPreparing}
+	// 绑定了会话：先在同账号等——换号会让上下文缓存失效、粘性计费被强制。
+	ctx := WithPrefetchedStickySession(context.Background(), 7, 1, false)
+	preparing, retrySame := KongTicketPreparing(ctx, denied)
+	if !preparing || !retrySame {
+		t.Fatalf("有会话时应当先等本账号，实得 preparing=%v retrySame=%v", preparing, retrySame)
+	}
+	// **读不到绑定信息时同样先等本号**：OpenAI 主路径目前不写那个 context 键，而两种猜错的后果不
+	// 对称——该换却先等只多花几秒重试延时，该等却直接换会破坏会话、还可能换到同样没票的账号。
+	// 注意这不阻止换号：框架重试耗尽后照样切。
+	preparing, retrySame = KongTicketPreparing(context.Background(), denied)
+	if !preparing || !retrySame {
+		t.Fatalf("绑定信息未知时应当保守先等本号，实得 preparing=%v retrySame=%v", preparing, retrySame)
+	}
+	// 其余拒服一律不 failover：换号救不了，只会把同一个结论在每个账号上重演。
+	for _, reason := range []string{KongDenyWindowClosed, KongDenyEgressUnusable, KongDenyWaitTimeout} {
+		if p, _ := KongTicketPreparing(ctx, &KongErrTicketDenied{Reason: reason}); p {
+			t.Errorf("%s 不该走 failover", reason)
+		}
+	}
+}
+
+// kongSeedElsewhereTicket 给**别的账号**放一张可用票。probs 为 nil 时模拟"白名单收紧后已不合格"。
+func kongSeedElsewhereTicket(repo *kongStubRepo, accountID int64, model string, id int64,
+	probs map[string]float64,
+) {
+	now := time.Now()
+	t := &KongTicket{
+		ID: id, AccountID: accountID, Model: model, State: strings.Repeat("e", 292),
+		Status: KongTicketStatusVerified, Source: KongTicketSourceFetch,
+		ExpiresAt: now.Add(30 * time.Minute), CapturedAt: now,
+		FingerprintProbs: probs,
+	}
+	key := kongStubKey(accountID, model)
+	repo.current[key] = append(repo.current[key], t)
+	repo.tickets[id] = &kongStubTicketState{
+		AccountID: accountID, Model: model, Status: KongTicketStatusVerified,
+		ExpiresAt: t.ExpiresAt, CapturedAt: t.CapturedAt, Source: KongTicketSourceFetch,
+	}
+}
+
+// 别家那张票**按当前白名单已经不合格**时不交接：据它换号会让本账号被记进失败列表，而它即将补上的
+// 那张票再也用不上——代价不是"多换一次号"，是把一个可恢复的请求拒掉。
+func TestKongDoesNotHandOffForStaleWhitelistTicket(t *testing.T) {
+	const model = "gpt-6-astra"
+	repo, up, svc := kongManualFixture(t, model)
+	up.fetchState = strings.Repeat("a", 292)
+	up.answers = kongVerifyAnswers()
+	idleSince := time.Now().Add(-40 * time.Minute)
+	repo.lastEgressUsed = &idleSince
+	// 别家有一张 verified 票，但它的归因按当前白名单不合格（白名单收紧后的常见局面）。
+	kongSeedElsewhereTicket(repo, 2, model, 98, map[string]float64{"gpt-5.5": 0.99})
+
+	grant, err := svc.EnsureTicket(context.Background(), 1, model)
+	if err != nil {
+		t.Fatalf("准备票: %v", err)
+	}
+	if grant.DenyReason == KongDenyPreparing {
+		t.Fatalf("别家的票按当前白名单不合格，不该交接：%+v", grant)
+	}
+	if up.fetchCalls == 0 {
+		t.Fatal("应当退回同步取票")
+	}
+}
+
+// 已有在途任务时后到的请求也要判交接，不能直接进最长五分钟的同步等待。
+func TestKongHandsOffWhileTaskInFlight(t *testing.T) {
+	const model = "gpt-6-astra"
+	repo, _, svc := kongManualFixture(t, model)
+	idleSince := time.Now().Add(-40 * time.Minute)
+	repo.lastEgressUsed = &idleSince
+	kongSeedElsewhereTicket(repo, 2, model, 97, map[string]float64{model: 0.97})
+	// 预置一个在途任务：决策会给出 Wait。
+	task, outcome := svc.claimTask(1, model, KongEgressKey(KongTicketEgressDirect, nil))
+	if outcome != kongClaimFresh {
+		t.Fatal("构造在途任务失败")
+	}
+	defer svc.releaseTask(1, task)
+
+	grant, err := svc.EnsureTicket(context.Background(), 1, model)
+	if err != nil {
+		t.Fatalf("准备票: %v", err)
+	}
+	if grant.DenyReason != KongDenyPreparing {
+		t.Fatalf("有在途任务且别家有票时该交接，而不是原地等：%+v", grant)
+	}
+}
+
+// 原生 WS 路径**不交接**：那条路上的拒服会直接关闭连接，没有 failover 可走，返回 preparing 等于
+// 把一条只需等几十秒的连接断掉（改动前它是同步等的）。
+func TestKongWSPathNeverHandsOff(t *testing.T) {
+	const model = "gpt-6-astra"
+	repo, up, svc := kongManualFixture(t, model)
+	up.fetchState = strings.Repeat("a", 292)
+	up.answers = kongVerifyAnswers()
+	idleSince := time.Now().Add(-40 * time.Minute)
+	repo.lastEgressUsed = &idleSince
+	kongSeedElsewhereTicket(repo, 2, model, 96, map[string]float64{model: 0.97})
+
+	grant, err := svc.EnsureTicketNoHandoff(context.Background(), 1, model)
+	if err != nil {
+		t.Fatalf("准备票: %v", err)
+	}
+	if grant.DenyReason == KongDenyPreparing {
+		t.Fatalf("WS 路径不该交接：%+v", grant)
+	}
+	if up.fetchCalls == 0 {
+		t.Fatal("WS 路径应当同步取票")
+	}
+}

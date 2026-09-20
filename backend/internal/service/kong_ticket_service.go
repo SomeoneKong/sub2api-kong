@@ -124,14 +124,29 @@ type KongTicketGrant struct {
 // 这是请求驱动的唯一入口：没有定时器，闲置期完全无活动。闲置本身也在为下一张好票做准备——
 // 票据出口因此积累静默，而静默是拿到 292 的前提。
 func (s *KongTicketService) EnsureTicket(ctx context.Context, accountID int64, model string) (*KongTicketGrant, error) {
-	return s.ensureTicket(ctx, accountID, model, false, false)
+	return s.ensureTicketOpts(ctx, accountID, model, true)
+}
+
+// EnsureTicketNoHandoff 与 EnsureTicket 相同，但**不返回 preparing**：拿不到票时同步等任务出结果。
+//
+// 给**原生 WebSocket** 路径用。那条路上的拒服落点是"按策略关闭连接"（1008），没有 failover 可走
+// ——返回 preparing 等于把一条本来只需等几十秒的连接直接断掉，而改动前它是同步等的。这是新引入的
+// 无谓拒服，必须挡在这里。
+//
+// 接上 WS 的 failover（首帧未上送时安全切换、已建立会话保持本号）是另一件事，见 DESIGN §4.6 的遗留。
+func (s *KongTicketService) EnsureTicketNoHandoff(ctx context.Context, accountID int64, model string) (*KongTicketGrant, error) {
+	return s.ensureTicketOpts(ctx, accountID, model, false)
+}
+
+func (s *KongTicketService) ensureTicketOpts(ctx context.Context, accountID int64, model string, allowHandoff bool) (*KongTicketGrant, error) {
+	return s.ensureTicket(ctx, accountID, model, false, false, allowHandoff)
 }
 
 // ensureTicket 是 EnsureTicket 的实现。
 //
 // manual 为真时跳过静默与冷却（见 KongScheduleInput.IgnoreWindow）；revive 为真时任务在持有槽位
 // 之后先尝试复位一张已拒票并以它为验证目标。两者都只由人工触发置真。
-func (s *KongTicketService) ensureTicket(ctx context.Context, accountID int64, model string, manual, revive bool) (*KongTicketGrant, error) {
+func (s *KongTicketService) ensureTicket(ctx context.Context, accountID int64, model string, manual, revive, allowHandoff bool) (*KongTicketGrant, error) {
 	account, err := s.accounts.GetByID(ctx, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("读账号 %d: %w", accountID, err)
@@ -178,9 +193,22 @@ func (s *KongTicketService) ensureTicket(ctx context.Context, accountID int64, m
 		s.startVerifyCandidate(ctx, account, model)
 		return s.grantExisting(ctx, accountID, model)
 	case KongActionWait:
+		// 已有在途任务。**这里同样要判一次交接**：不判的话后到的请求会直接进最长五分钟的同步等待，
+		// 于是（一）无绑定的新请求明明能换号却原地等；（二）绑定请求首次拿到 preparing、重试一次
+		// 就被这条路径吞掉，`pool_mode_retry_count` 再也控制不了等待。
+		//
+		// 人工触发例外：它就是为了拿结论按的，必须等。
+		if allowHandoff && !manual && s.handoffWorthIt(ctx, accountID, model) {
+			// 任务已经在跑，不必再起——直接让这次请求去别的账号。
+			return &KongTicketGrant{Allowed: false, DenyReason: KongDenyPreparing}, nil
+		}
 		return s.waitForTask(ctx, accountID, model)
 	case KongActionVerifyCandidate, KongActionFetch:
-		return s.runTaskAndWait(ctx, account, cfg, model, decision.Action, manual, revive)
+		// 人工触发必须真的跑一遍并等结论——它就是为了拿结论按的。
+		if manual || !allowHandoff {
+			return s.runTaskAndWait(ctx, account, cfg, model, decision.Action, manual, revive)
+		}
+		return s.prepareOrHandOff(ctx, account, cfg, model, decision.Action)
 	default:
 		if !in.AccountReady {
 			s.logEvent(ctx, &KongTicketEvent{
@@ -448,6 +476,70 @@ func (s *KongTicketService) startVerifyCandidate(ctx context.Context, account *A
 		return
 	}
 	s.startTask(ctx, task, account, model, KongActionVerifyCandidate, false, false)
+}
+
+// handoffWorthIt 报告"让给别的账号"是否值得：别的账号此刻有一张**按当前白名单仍然合格**的票。
+//
+// **必须按当前白名单重判**，不能只看 `status = verified`：那个状态只表示"按当时的白名单判过"，而
+// 白名单与阈值来自环境变量、随时可改。据一张现在已经不合格的票去交接，代价不是"多换一次号"——上层
+// 会把本账号加进失败列表，于是它即将补上的那张票再也用不上，请求最终被拒。
+//
+// 不确定时一律返回 false（退回等待）：等一定能服务，而错误的交接可能把一个可恢复的请求拒掉。查询
+// 出错、没有别家、别家的票都不合格，都走这一侧。
+//
+// ⚠️ 它仍然看不到别的账号的 mode 与调度资格（那在调度层）。所以返回 true 只是"值得一试"，上层
+// failover 找不到能接手的账号时仍会耗尽——这是已知的残余风险，见 DESIGN §4.6。
+func (s *KongTicketService) handoffWorthIt(ctx context.Context, accountID int64, model string) bool {
+	tickets, err := s.repo.VerifiedTicketsElsewhere(ctx, accountID, model)
+	if err != nil {
+		return false
+	}
+	for _, t := range tickets {
+		if t != nil && s.accept.Accepts(model, t.FingerprintProbs, s.confidence) {
+			return true
+		}
+	}
+	return false
+}
+
+// prepareOrHandOff 起票据任务，然后决定这次请求是**等它**还是**让给别的账号**。
+//
+// 判据只有一个：换号能不能更快拿到票。
+//
+//   - 别的账号此刻有可用票 → 不等，报 preparing 让上层 failover 换号。等一轮取票加验证要几十秒，
+//     而换号是立刻的。
+//   - 别家也没票 → 换号救不了，退回同步等（与改动前的行为一致）。
+//
+// **粘性会话的差别不在这里**，在上层：`preparing` 被包成可 failover 的错误时，绑定了会话的请求会
+// 先在同账号重试（等于等这个任务），没绑定的直接换号。那一层才知道有没有会话（见
+// kong_ticket_gateway.go 的 KongTicketPreparing）。
+func (s *KongTicketService) prepareOrHandOff(ctx context.Context, account *Account, cfg KongTicketConfig, model, action string) (*KongTicketGrant, error) {
+	if !s.handoffWorthIt(ctx, account.ID, model) {
+		return s.runTaskAndWait(ctx, account, cfg, model, action, false, false)
+	}
+
+	// 起异步任务：这次请求虽然让给别的账号，票还是要取的——否则本账号永远补不上票，而下一个请求
+	// 会再走一遍同样的判断。
+	ticketEgress := KongEgressKey(cfg.Egress, cfg.ProxyID)
+	if action == KongActionVerifyCandidate {
+		ticketEgress = kongVerifyOnlySlot(account.ID)
+	}
+	task, outcome := s.claimTask(account.ID, model, ticketEgress)
+	switch outcome {
+	case kongClaimFresh:
+		s.startTask(ctx, task, account, model, action, false, false)
+	case kongClaimEgressBusy:
+		// 出口被别的账号占着，本账号这一轮压根起不了任务。仍然报 preparing——换号的判断不变，
+		// 而"等"在这里是白等（那个任务的票属于别的账号）。
+		s.logEvent(ctx, &KongTicketEvent{
+			AccountID: account.ID, Model: model,
+			EventType: KongEventEgressInvalid, Outcome: KongOutcomeSkipped,
+			TicketEgress: ticketEgress, TrafficEgress: KongTrafficEgressKey(account.ProxyID),
+			Detail: map[string]any{"reason": "egress_busy_other_account", "handoff": true},
+		})
+	}
+	// kongClaimSameAccount 什么都不用做：已有在途任务，它的产物正是本账号要的票。
+	return &KongTicketGrant{Allowed: false, DenyReason: KongDenyPreparing}, nil
 }
 
 // runTaskAndWait 在当前请求上同步跑一次取票/验证。冷启动走这条路。
@@ -2204,7 +2296,7 @@ func (s *KongTicketService) TriggerRefresh(ctx context.Context, accountID int64,
 	// manual=true 跳过静默与冷却；revive=true 让任务在持有槽位之后先复位一张已拒票。**复位不在
 	// 这里做**——此刻还没拿到槽位，若有同模型任务在跑，它收尾时的批量跳过会把刚复位的票标成
 	// skip，那张票此后连人工触发都救不回来。
-	grant, err := s.ensureTicket(ctx, accountID, model, true, true)
+	grant, err := s.ensureTicket(ctx, accountID, model, true, true, false)
 	if err != nil {
 		return nil, err
 	}

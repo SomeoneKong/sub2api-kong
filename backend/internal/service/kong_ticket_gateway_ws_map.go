@@ -23,7 +23,8 @@ func (g *KongTicketGateway) PrepareWSMapPayload(ctx context.Context, account *Ac
 	if payload == nil {
 		return nil, &KongErrTicketDenied{Reason: "payload_missing"}
 	}
-	grant, err := g.svc.EnsureTicket(ctx, account.ID, model)
+	// 原生 WS：不交接，理由同 PrepareWSTurn。
+	grant, err := g.svc.EnsureTicketNoHandoff(ctx, account.ID, model)
 	if err != nil {
 		return nil, &KongErrTicketDenied{Reason: "ensure_failed: " + err.Error()}
 	}

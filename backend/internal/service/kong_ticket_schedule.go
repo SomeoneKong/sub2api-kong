@@ -43,6 +43,9 @@ const (
 	KongDenyModeNotFull    = "mode_not_full"    // 非 full 模式不参与注入
 	KongDenyEgressBusy     = "egress_busy"      // 票据出口正被另一个账号占用
 	KongDenyWaitTimeout    = "wait_timeout"     // 在途任务未在等待期限内产出结果
+	// KongDenyPreparing 表示票据任务已在后台跑，但这次请求不等它——换一个此刻有票的账号更快。
+	// **只有这一种拒服可以 failover**：其余拒服（静默未满、出口不可用、真降档）换号救不了。
+	KongDenyPreparing = "preparing"
 	// KongDenyOtherModelTask：等到的在途任务在给**另一个模型**取票。
 	//
 	// 任务按账号串行（票据出口的静默按 IP 积累，只按模型串行拦不住并发取票），所以一个模型的请求

@@ -321,7 +321,9 @@ func (g *KongTicketGateway) PrepareWSTurn(ctx context.Context, account *Account,
 		return payload, nil, nil
 	}
 	model = effective
-	grant, err := g.svc.EnsureTicket(ctx, account.ID, model)
+	// 原生 WS：**不交接**。这条路上的拒服落点是按策略关闭连接，没有 failover 可走（见
+	// EnsureTicketNoHandoff）。
+	grant, err := g.svc.EnsureTicketNoHandoff(ctx, account.ID, model)
 	if err != nil {
 		return payload, nil, &KongErrTicketDenied{Reason: "ensure_failed: " + err.Error()}
 	}
@@ -510,6 +512,51 @@ func kongExtractTopLevelModelString(raw string) kongGatedModelResult {
 		return kongGatedModelResult{Reason: "model_not_a_string"}
 	}
 	return kongGatedModelResult{Model: strings.TrimSpace(value.String()), Determinable: true}
+}
+
+// KongTicketPreparing 报告这次拒服是否为「票据正在准备」，以及该不该在同一账号上先等一等。
+//
+// 这是**唯一可以 failover 的票据拒服**：本账号的票据任务已在后台跑，而别的账号此刻有可用票，换过去
+// 比等几十秒更快。其余拒服（静默未满、出口不可用、真降档）换号救不了——那些情况下换号只是把同一个
+// 结论在每个账号上重演一遍，还会把每个账号都记进失败列表。
+//
+// 第二个返回值是"是否先在同账号重试"。**注意它不阻止换号**：框架会先在同账号重试若干次（每次有
+// 递增延时、封顶几秒），耗尽后照样换号。所以它真正的含义是"先给本账号一点时间"。
+//
+// 判据本应是"这个请求有没有绑定粘性会话"：绑定了先等（换号会让上下文缓存失效、粘性计费被强制），
+// 没绑定就直接换（换号对它没有代价）。但**当前只有部分入口会把绑定事实写进 context**——通用 Gateway
+// 与 Gemini handler 写 `WithPrefetchedStickySession`，而 OpenAI Responses/Messages 主路径不写，它的
+// 绑定命中只体现在调度决策的 `StickySessionHit` / `StickyPreviousHit` 里。
+//
+// 所以这里**读不到就按"可能绑定了"处理**（返回 true），两种猜错的后果不对称：
+//
+//   - 该换却先等 → 多花几秒重试延时，但一定能服务；
+//   - 该等却直接换 → 会话连续性被破坏，而且可能换到一个同样没票的账号、最终拒服。
+//
+// 代价是"新请求本可以立刻换号"这个优化暂时拿不到。要拿到它，得让 OpenAI 调度把真实绑定事实写进
+// 当前 attempt 的 context——见 DESIGN §4.6 的遗留。
+func KongTicketPreparing(ctx context.Context, err error) (preparing bool, retrySameAccount bool) {
+	var denied *KongErrTicketDenied
+	if !errors.As(err, &denied) || denied.Reason != KongDenyPreparing {
+		return false, false
+	}
+	if boundID, ok := PrefetchedStickyAccountIDFromContext(ctx); ok && boundID > 0 {
+		return true, true
+	}
+	// 读不到绑定信息：保守地先等本号。见上面的不对称说明。
+	return true, true
+}
+
+// KongIsPreparingFailover 报告这个 failover 错误是不是「票据正在准备」那一种。
+//
+// 调度上报要用它：那不是账号的故障，账号本身是好的、只是这一刻没票，几十秒后就补上了。计进错误率
+// EWMA 会让"票越缺、账号越被判坏"，与事实相反。
+func KongIsPreparingFailover(err error) bool {
+	var failoverErr *UpstreamFailoverError
+	if !errors.As(err, &failoverErr) || failoverErr == nil {
+		return false
+	}
+	return failoverErr.Reason == GatewayFailureReason(KongDenyPreparing)
 }
 
 // KongIsTicketDenied 报告错误是否为票据拒服，便于调用方映射状态码。

@@ -216,6 +216,40 @@ func (r *kongStubRepo) snapshotOf(id int64) *KongTicket {
 	return &clone
 }
 
+// VerifiedTicketsElsewhere 与生产同条件：别的账号、同模型、verified、未过期、未 skip，每账号取
+// 最晚过期的一张，且**带回归因分布**（调用方要按当前白名单重判）。
+func (r *kongStubRepo) VerifiedTicketsElsewhere(_ context.Context, excludeAccountID int64, model string) ([]*KongTicket, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	best := map[int64]*KongTicket{}
+	for id := range r.tickets {
+		st := r.tickets[id]
+		if st == nil || st.AccountID == excludeAccountID || st.Model != model {
+			continue
+		}
+		if st.Status != KongTicketStatusVerified || st.SkipUntilNew || !st.ExpiresAt.After(now) {
+			continue
+		}
+		snap := r.snapshotOf(id)
+		if snap == nil {
+			// 只登记了状态、没有票对象的用例：按生产口径补一个最小快照，归因分布留空——那正是
+			// "按当前白名单判不合格"的情形。
+			snap = &KongTicket{ID: id, AccountID: st.AccountID, Model: st.Model,
+				Status: st.Status, ExpiresAt: st.ExpiresAt, CapturedAt: st.CapturedAt}
+		}
+		if cur, ok := best[st.AccountID]; !ok || snap.ExpiresAt.After(cur.ExpiresAt) {
+			best[st.AccountID] = snap
+		}
+	}
+	out := make([]*KongTicket, 0, len(best))
+	for _, t := range best {
+		out = append(out, t)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].AccountID < out[j].AccountID })
+	return out, nil
+}
+
 // TicketByID 按 (账号, id) 找。**account_id 参与匹配**是生产侧的权限边界，桩不照做就测不出
 // "换个 id 去验别人的票"这条。
 func (r *kongStubRepo) TicketByID(_ context.Context, accountID, id int64) (*KongTicket, error) {

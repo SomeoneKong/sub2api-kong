@@ -364,6 +364,16 @@ type KongTicketRepository interface {
 	// InsertTicket 插入一张票。第二个返回值为假表示这张票原值已经存在——重复出现不是新信息，
 	// 调用方不得据此延长期限、解除候选跳过标记或触发诊断探测。
 	InsertTicket(ctx context.Context, t *KongTicket) (int64, bool, error)
+	// VerifiedTicketsElsewhere 返回**别的账号**在同一模型上此刻可用的票（每个账号最多一张，取最晚
+	// 过期的那张），供调用方按当前接受白名单重判。
+	//
+	// 用途只有一个：本账号的票据任务刚起、这次请求要不要换号。**必须重判**——`status = verified`
+	// 只表示"按当时的白名单判过"，白名单收紧之后那张票已经不合格，据它换号会白跑一趟；而代价不是
+	// "多换一次"，是本账号被加进失败列表、失去它即将补上的票（见 §4.6）。
+	//
+	// ⚠️ 口径：它查的是票表，**看不到账号的 mode 与调度资格**。所以返回非空也不等于"那个账号一定
+	// 能接手"，调用方要自己把这些账号与本请求的可调度集合取交集。
+	VerifiedTicketsElsewhere(ctx context.Context, excludeAccountID int64, model string) ([]*KongTicket, error)
 	// TicketByID 按 (账号, 票 id) 读一张票，含票原值。**账号必须参与匹配**——否则换个 id 就能让
 	// 一个账号去验别人的票。不存在或不属于该账号时返回 nil。
 	TicketByID(ctx context.Context, accountID, id int64) (*KongTicket, error)

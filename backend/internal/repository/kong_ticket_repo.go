@@ -222,6 +222,36 @@ func (r *kongTicketRepository) InsertTicket(ctx context.Context, t *service.Kong
 //
 // 返回值为假表示条件不满足（票已过期、已被改写或已被跳过），此时事务回滚、事件也不写，由调用方
 // 另记一条作废事件。
+// VerifiedTicketsElsewhere 列别的账号在同一模型上此刻可用的票，每个账号取最晚过期的那一张。
+//
+// 条件与 VerifiedTickets 一致（verified、未过期、未被 skip），只是把本账号排除掉，并且**带回归因
+// 分布**——调用方要按当前白名单重判，`status = verified` 只代表"按当时的白名单判过"。
+//
+// 每账号一张就够：调用方只需要知道"这个账号能不能接手"，不需要它的全部票。
+func (r *kongTicketRepository) VerifiedTicketsElsewhere(ctx context.Context, excludeAccountID int64, model string) ([]*service.KongTicket, error) {
+	query := `SELECT DISTINCT ON (account_id) ` + kongTicketColumns + ` FROM kong_ticket_cache
+		WHERE account_id <> $1 AND model = $2 AND status = $3
+		  AND expires_at > now() AND skip_until_new = FALSE
+		ORDER BY account_id, expires_at DESC`
+	rows, err := r.db.QueryContext(ctx, query, excludeAccountID, model, service.KongTicketStatusVerified)
+	if err != nil {
+		return nil, fmt.Errorf("query verified tickets elsewhere: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*service.KongTicket
+	for rows.Next() {
+		t, err := scanKongTicket(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate verified tickets elsewhere: %w", err)
+	}
+	return out, nil
+}
+
 // TicketByID 按 (账号, 票 id) 读一张票。account_id 进 WHERE 是**权限边界**，不是优化。
 func (r *kongTicketRepository) TicketByID(ctx context.Context, accountID, id int64) (*service.KongTicket, error) {
 	query := `SELECT ` + kongTicketColumns + ` FROM kong_ticket_cache WHERE id = $1 AND account_id = $2`

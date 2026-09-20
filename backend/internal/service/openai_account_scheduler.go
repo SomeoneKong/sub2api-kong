@@ -2438,7 +2438,10 @@ func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(account *Accoun
 	// 拦住了传输副作用，上报这一路是另一条。
 	if !success {
 		for _, observed := range observedErr {
-			if KongIsTicketDenied(observed) || KongIsDeliveryBlocked(observed) {
+			// KongIsPreparingFailover 也在此列：那一种会 failover 换号，但它同样不是账号的故障
+			// ——账号好着，只是这一刻没票。
+			if KongIsTicketDenied(observed) || KongIsDeliveryBlocked(observed) ||
+				KongIsPreparingFailover(observed) {
 				return false
 			}
 		}
