@@ -195,8 +195,24 @@ func (u *kongTicketUpstream) buildCodexRequest(ctx context.Context, account *Acc
 }
 
 func (u *kongTicketUpstream) send(req *http.Request, proxyURL string, account *Account) (*http.Response, error) {
+	return u.sendWith(req, proxyURL, account, account.Concurrency)
+}
+
+// kongFetchPoolFloor 是取票请求的连接池容量下限。
+//
+// 为什么需要它：账号隔离下 `resolvePoolSettings` 把 `MaxConnsPerHost` 直接设成
+// `account.Concurrency`。批量取票并发发出 N 个请求，而 `Concurrency=1` + HTTP/1.1（显式或自动
+// 回退）时它们在**传输层被串行化**——于是"并发所以不存在先后"这个前提悄悄不成立了，更糟的是
+// 非触发模型占着连接读完响应正文才释放，可能吃掉触发模型自己那 60 秒取票期限。
+//
+// 只抬取票这条路径，不动业务流量：票据出口按设计**必须**与流量出口不同（两者相同时
+// KongEvaluateEgress 判出口不可用、根本不会取票），而连接池按 (proxyURL, accountID) 分条，
+// 所以抬高它影响不到业务连接池。取值给足门控集合再翻倍的余量。
+const kongFetchPoolFloor = 8
+
+func (u *kongTicketUpstream) sendWith(req *http.Request, proxyURL string, account *Account, concurrency int) (*http.Response, error) {
 	var profile = u.tlsProfiles.ResolveTLSProfile(account)
-	return u.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, profile)
+	return u.httpUpstream.DoWithTLS(req, proxyURL, account.ID, concurrency, profile)
 }
 
 // FetchTurnState 只取响应头里的票。
@@ -211,7 +227,13 @@ func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Accoun
 		// 还没发包。调用方据此不推进出口活动 A——静默其实还在。
 		return nil, &KongErrUpstreamNotAttempted{Err: err}
 	}
-	resp, err := u.send(req, egressProxyURL, account)
+	// 批量取票要真的并发，见 kongFetchPoolFloor。验证挑战（下面那处 send）走流量出口，仍用账号
+	// 自己的并发值——那是业务连接池，不能被票据逻辑抬高。
+	concurrency := account.Concurrency
+	if concurrency < kongFetchPoolFloor {
+		concurrency = kongFetchPoolFloor
+	}
+	resp, err := u.sendWith(req, egressProxyURL, account, concurrency)
 	if err != nil {
 		// 传输层已经区分过「还没发包」：主机校验不通过、客户端池取不到连接都属于本地失败，
 		// 一个字节都没出去，不能推进出口活动 A。

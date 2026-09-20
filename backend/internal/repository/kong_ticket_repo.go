@@ -276,11 +276,21 @@ func (r *kongTicketRepository) SetTicketStatus(ctx context.Context, id int64, st
 func (r *kongTicketRepository) SkipCandidatesFor(ctx context.Context, accountID int64, model string, capturedBefore time.Time) error {
 	// 只淘汰 capturedBefore 之前收到的候选：验证期间新到的票属于新信息，误标它会封掉唯一的
 	// 恢复机会。
+	//
+	// **只淘汰 observed 候选。** 这条限制是批量取票之后必须有的：批内非触发模型的 fetch 票会常态
+	// 留在候选池里，而它们是用一整段出口静默换来的——旧 observed 候选验证失败时把它们一起标掉，
+	// 等于白扔那次取票，而出口刚被用过、约 34 分钟内补不回来。本函数的用途本来就是"这一段无票期
+	// 里的 observed 候选机会已经用掉"，fetch 票不在其语义内。
+	//
+	// 正在验证的那张 fetch 候选由调用方单独标（见 verifyTicket 的 no_valid_answer 分支），否则
+	// 下一个请求会把它再验一遍。
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE kong_ticket_cache SET skip_until_new = TRUE
 		 WHERE account_id = $1 AND model = $2 AND status = $3 AND skip_until_new = FALSE
+		   AND source = $5
 		   AND captured_at <= $4`,
-		accountID, model, service.KongTicketStatusUnverified, capturedBefore.UTC())
+		accountID, model, service.KongTicketStatusUnverified, capturedBefore.UTC(),
+		service.KongTicketSourceObserved)
 	if err != nil {
 		return fmt.Errorf("skip candidates: %w", err)
 	}

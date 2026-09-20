@@ -197,11 +197,17 @@ func TestKongStubRepoHonorsProductionConditions(t *testing.T) {
 		t.Error("撤销后不该再读到")
 	}
 
-	// 批量 skip 只影响同一 (账号, 模型)，且 clear 必须真的解除。
-	a := mk(2, "gpt-6-astra", "S-A", KongTicketSourceFetch, KongTicketStatusUnverified, now.Add(time.Hour), now.Add(-time.Minute))
-	b := mk(3, "gpt-6-astra", "S-B", KongTicketSourceFetch, KongTicketStatusUnverified, now.Add(time.Hour), now.Add(-time.Minute))
+	// 批量 skip 只影响同一 (账号, 模型)、且只影响 observed 候选，clear 必须真的解除。
+	a := mk(2, "gpt-6-astra", "S-A", KongTicketSourceObserved, KongTicketStatusUnverified, now.Add(time.Hour), now.Add(-time.Minute))
+	b := mk(3, "gpt-6-astra", "S-B", KongTicketSourceObserved, KongTicketStatusUnverified, now.Add(time.Hour), now.Add(-time.Minute))
+	// 同账号同模型下的 fetch 候选：批量跳过**不得**碰它——那是一整段出口静默换来的票，被旧
+	// observed 候选的失败连带标掉就等于白扔那次取票，而出口约 34 分钟内补不回来。
+	fetched := mk(5, "gpt-6-astra", "S-F", KongTicketSourceFetch, KongTicketStatusUnverified, now.Add(time.Hour), now.Add(-time.Minute))
 	if err := repo.SkipCandidatesFor(ctx, 2, "gpt-6-astra", now); err != nil {
 		t.Fatalf("批量跳过: %v", err)
+	}
+	if ok, _ := repo.CommitVerification(ctx, fetched, KongTicketStatusVerified, kongTestAttr(0.99), &KongTicketEvent{AccountID: 2}); !ok {
+		t.Error("批量跳过不该碰 fetch 候选")
 	}
 	if ok, _ := repo.CommitVerification(ctx, a, KongTicketStatusRejected, kongTestAttr(0.5), &KongTicketEvent{AccountID: 2}); ok {
 		t.Error("被跳过的票不得提交成功")

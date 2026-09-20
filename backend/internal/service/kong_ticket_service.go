@@ -29,6 +29,12 @@ type KongTicketService struct {
 	bank     *KongFingerprintBank
 	params   KongTicketParams
 
+	// gatedModels 是门控模型集合，只用于批量取票（要知道"还该给谁取票"）。准入判定不看它——
+	// 那是网关那一层的事。
+	gatedModels []string
+	// batchFetch 开启时，一次取票并发把所有门控模型的票一起取回来（见 config 里的说明）。
+	batchFetch bool
+
 	// accept 记录每个门控模型接受哪些归因结果（永远含自己）。采纳判据只此一份。
 	accept KongTicketAccept
 	// confidence 是采纳归因结论所需的概率；不够就再加一份挑战。
@@ -67,7 +73,7 @@ type kongTicketTask struct {
 }
 
 // NewKongTicketService 创建编排服务。
-func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream, accounts KongAccountLoader, bank *KongFingerprintBank, params KongTicketParams, accept KongTicketAccept, confidence float64) *KongTicketService {
+func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream, accounts KongAccountLoader, bank *KongFingerprintBank, params KongTicketParams, gatedModels []string, batchFetch bool, accept KongTicketAccept, confidence float64) *KongTicketService {
 	if confidence <= 0 || confidence >= 1 {
 		confidence = 0.9
 	}
@@ -77,6 +83,8 @@ func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream
 		accounts:         accounts,
 		bank:             bank,
 		params:           params,
+		gatedModels:      append([]string(nil), gatedModels...),
+		batchFetch:       batchFetch,
 		accept:           accept,
 		confidence:       confidence,
 		inflight:         make(map[int64]*kongTicketTask),
@@ -156,6 +164,15 @@ func (s *KongTicketService) ensureTicket(ctx context.Context, accountID int64, m
 			return s.runTaskAndWait(ctx, account, cfg, model, decision.Action, manual, revive)
 		}
 		s.startPrefetch(ctx, account, cfg, model)
+		return s.grantExisting(ctx, accountID, model)
+	case KongActionInjectAndVerifyCandidate:
+		if manual {
+			// 人工触发要真的跑一遍并等结论，理由同上（异步会按自动口径重算）。
+			return s.runTaskAndWait(ctx, account, cfg, model, KongActionVerifyCandidate, manual, revive)
+		}
+		// 当前票照常注入，候选在后台验。占**验证专用槽位**：验证走流量出口，与票据出口的静默无关，
+		// 不该把出口锁占住——否则同一条出口上别的账号会被拒成 egress_busy。
+		s.startVerifyCandidate(ctx, account, model)
 		return s.grantExisting(ctx, accountID, model)
 	case KongActionWait:
 		return s.waitForTask(ctx, accountID, model)
@@ -417,6 +434,19 @@ func (s *KongTicketService) startPrefetch(ctx context.Context, account *Account,
 	s.startTask(ctx, task, account, model, KongActionInjectAndPrefetch, false, false)
 }
 
+// startVerifyCandidate 起一个异步的候选验证：当前票还能用，但已进入刷新窗口而缓存里有候选。
+//
+// 与 startPrefetch 的差别只在槽位：这里占的是验证专用槽位（验证走流量出口），所以它既不消耗票据
+// 出口的静默，也不会把出口锁从别的账号手里抢走。
+func (s *KongTicketService) startVerifyCandidate(ctx context.Context, account *Account, model string) {
+	task, outcome := s.claimTask(account.ID, model, kongVerifyOnlySlot(account.ID))
+	if outcome != kongClaimFresh {
+		// 已有在途任务。候选验证同样是机会性的——当前票还能用，不必为此拒服。
+		return
+	}
+	s.startTask(ctx, task, account, model, KongActionVerifyCandidate, false, false)
+}
+
 // runTaskAndWait 在当前请求上同步跑一次取票/验证。冷启动走这条路。
 func (s *KongTicketService) runTaskAndWait(ctx context.Context, account *Account, cfg KongTicketConfig, model string, action string, manual, revive bool) (*KongTicketGrant, error) {
 	// 候选验证走**流量出口**，不占票据出口的静默，所以不该抢那个槽位——否则两个都配 `none`
@@ -555,10 +585,44 @@ func (s *KongTicketService) releaseTask(accountID int64, task *kongTicketTask) {
 // 静默——那是无谓拒服）。
 var ErrKongTicketNotAccepted = errors.New("候选票未被上游接受")
 
-// fetchAndVerify 经票据出口取一张票，立即验证。
+// kongFetchOne 是一次取票的结果。只有触发模型（leader）的这一份会回传给调用方——其余成员的
+// 成败全部在 fetchStore 内部记进事件，调用方不据此改变行为（见 fetchAndVerify 的注释）。
+type kongFetchOne struct {
+	model    string
+	ticketID int64
+	state    string
+	expires  time.Time
+	err      error
+}
+
+// otherGatedModels 返回除 exclude 之外的门控模型。
+func (s *KongTicketService) otherGatedModels(exclude string) []string {
+	out := make([]string, 0, len(s.gatedModels))
+	for _, m := range s.gatedModels {
+		if m != exclude {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// fetchAndVerify 经票据出口取票，然后立即验证**触发模型**那一张。
 //
 // fetch 票不受 MinTicketAge 限制：它是我们自己刚要来的唯一一张，等待毫无意义，否则冷启动要
 // 凭空多阻塞一个 MinTicketAge。
+//
+// 开了 batchFetch 时，**所有门控模型的票在同一瞬间并发取回**。三点要一起看才成立：
+//
+//  1. 依据是一条实测事实——292 窗口一旦打开约 4 分钟内有效，且窗口内的活动不会把它提前关闭。
+//     所以一次静默换来的是一个"可连续取票的窗口"，不是一张票。
+//  2. **并发而不是串行**：全部请求同一瞬间发出，于是不存在"窗口在批次中途关闭"这回事，也就不需要
+//     批次预算与顺序安排。
+//  3. **批内只取不验**：其余模型的票入库为候选，验证留给该模型的第一个请求。验证烧真实额度
+//     （每张三份挑战）却走流量出口、与出口静默无关，没有任何理由现在做；在这里逐个验完还会让
+//     触发请求一直等到整批验完。
+//
+// 非触发模型的失败**只记事件、不进冷却、不影响返回值**：冷却是给失败的取票路径退避用的，而触发
+// 模型本周期已经证明这条路是通的，罚出口只会把下一个正常周期也往后推。
 func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account, cfg KongTicketConfig, model string, taskStartedAt time.Time) (int64, error) {
 	ticketEgress := KongEgressKey(cfg.Egress, cfg.ProxyID)
 	trafficEgress := KongTrafficEgressKey(account.ProxyID)
@@ -580,8 +644,89 @@ func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account
 		egressProxyURL = url
 	}
 
+	// **静默值全批共用，且必须在发起任何取票之前算。** 取票自己就是该出口上的活动：第一发一落地
+	// noteEgressUse 就把"上次活动"推到了现在，之后再算就得到 idle≈0。那个数字字面为真，却把事实
+	// 记错了——全批骑的是同一个窗口，产生这个窗口的静默就是批前这一段。记 0 会让日后读事件的人
+	// 以为"静默 0 秒也能拿到 292"。
 	idle := s.idleSeconds(ctx, ticketEgress, time.Now())
-	probe, err := s.upstream.FetchTurnState(ctx, account, egressProxyURL, model)
+
+	models := []string{model}
+	if s.batchFetch {
+		models = append(models, s.otherGatedModels(model)...)
+	}
+	// leader 的结果单独走一个 channel。**只等 leader 就开始验证**：等齐全部成员会把非触发模型的
+	// 慢失败算进触发请求的等待时间——leader 取票 1s + 三份挑战 270s 本来 271s 就够，而一个 60s
+	// 才失败的非触发模型会把总耗时推到 330s，超过 kongWaitBudget(300s)，于是本来能服务的请求被
+	// 判成 wait_timeout。
+	leadCh := make(chan kongFetchOne, 1)
+	var wg sync.WaitGroup
+	for i := range models {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			out := s.fetchStore(ctx, account, kongFetchArgs{
+				ticketEgress: ticketEgress, trafficEgress: trafficEgress,
+				egressProxyURL: egressProxyURL, model: models[i],
+				idle: idle, batchIndex: i, batchTotal: len(models), leaderModel: model,
+			})
+			if i == 0 {
+				leadCh <- out
+			}
+			// 非触发模型的结果全部在 fetchStore 内部记完事件了，这里无须回传。
+		}(i)
+	}
+	lead := <-leadCh
+	// **槽位释放之前仍要等齐所有取票**：任务返回即释放出口锁，而此刻出口上可能还有在途请求，
+	// 别的账号这时开始取票会把静默算错。放 defer 里，于是它等在验证之后而不是验证之前。
+	defer wg.Wait()
+
+	if lead.err != nil {
+		return 0, lead.err
+	}
+	capture := &kongCaptureFacts{Egress: ticketEgress, IdleSeconds: idle}
+	return s.verifyTicket(ctx, account, cfg, model, lead.ticketID, lead.state, KongTicketSourceFetch,
+		lead.expires, capture, taskStartedAt, false)
+}
+
+// kongFetchArgs 是一次取票的入参。批内成员共用同一个出口、同一个静默值。
+type kongFetchArgs struct {
+	ticketEgress   string
+	trafficEgress  string
+	egressProxyURL string
+	model          string
+	idle           *int64
+	batchIndex     int
+	batchTotal     int
+	leaderModel    string
+}
+
+// fetchStore 取一张票并入库。不验证——验证由调用方对触发模型那一张单独发起。
+//
+// 只有触发模型（batchIndex == 0）的失败会推进冷却，理由见 fetchAndVerify 的注释。
+func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in kongFetchArgs) kongFetchOne {
+	out := kongFetchOne{model: in.model}
+	leader := in.batchIndex == 0
+	// batched 只在真的成批时才往事件里加字段：非批量路径的事件形状保持原样。
+	batched := in.batchTotal > 1
+	detail := func(extra map[string]any) map[string]any {
+		if !batched {
+			return extra
+		}
+		d := map[string]any{"batch": map[string]any{
+			"leader_model": in.leaderModel, "index": in.batchIndex, "total": in.batchTotal,
+		}}
+		for k, v := range extra {
+			d[k] = v
+		}
+		return d
+	}
+	cooldown := func(reason string) {
+		if leader {
+			s.enterCooldown(ctx, account.ID, in.model, in.ticketEgress, reason)
+		}
+	}
+
+	probe, err := s.upstream.FetchTurnState(ctx, account, in.egressProxyURL, in.model)
 	// 活动结束时刻在这里定死，后面存票、清标记、写事件的耗时都不再影响它。事件的 CreatedAt 与
 	// 内存事实用同一个值，两者才对得上——不固定的话持久化的 A 会比真实活动晚上百毫秒，而调度
 	// 判的是「距上次活动多久」。
@@ -589,18 +734,19 @@ func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account
 	if KongIsUpstreamNotAttempted(err) {
 		// 请求还没送出去就失败了（缺凭据这类本地错误）：没有清零任何静默，不能推进 A。
 		s.logEvent(ctx, &KongTicketEvent{
-			AccountID: account.ID, Model: model, EventType: KongEventFetchSkipped,
-			Outcome: KongOutcomeFailure, TicketEgress: ticketEgress, TrafficEgress: trafficEgress,
+			AccountID: account.ID, Model: in.model, EventType: KongEventFetchSkipped,
+			Outcome: KongOutcomeFailure, TicketEgress: in.ticketEgress, TrafficEgress: in.trafficEgress,
 			CreatedAt: sentAt,
-			Detail:    map[string]any{"error": err.Error(), "phase": "build_request"},
+			Detail:    detail(map[string]any{"error": err.Error(), "phase": "build_request"}),
 		})
-		return 0, err
+		out.err = err
+		return out
 	}
 	// 请求已经发出去了，成败都一样清零了这个出口的静默——必须在判成败之前记。
-	s.noteEgressUse(ticketEgress, sentAt)
+	s.noteEgressUse(in.ticketEgress, sentAt)
 	event := &KongTicketEvent{
-		AccountID: account.ID, Model: model, EventType: KongEventFetch,
-		TicketEgress: ticketEgress, TrafficEgress: trafficEgress, IdleSeconds: idle,
+		AccountID: account.ID, Model: in.model, EventType: KongEventFetch,
+		TicketEgress: in.ticketEgress, TrafficEgress: in.trafficEgress, IdleSeconds: in.idle,
 		CreatedAt: sentAt,
 	}
 	if probe != nil {
@@ -612,56 +758,77 @@ func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account
 	}
 	if err != nil {
 		event.Outcome = KongOutcomeFailure
-		event.Detail = map[string]any{"error": err.Error()}
+		event.Detail = detail(map[string]any{"error": err.Error()})
 		s.logEvent(ctx, event)
-		s.enterCooldown(ctx, account.ID, model, ticketEgress, "fetch_failed")
-		return 0, err
+		cooldown("fetch_failed")
+		out.err = err
+		return out
 	}
 	if probe.State == "" {
 		// 上游认为本次请求已带有效票，与我们「无票」的认知冲突——值得记，它意味着别处
 		// 还有一条在用同一账号的链路。
 		event.Outcome = KongOutcomeFailure
-		event.Detail = map[string]any{"reason": "no_state_returned"}
+		event.Detail = detail(map[string]any{"reason": "no_state_returned"})
 		s.logEvent(ctx, event)
-		s.enterCooldown(ctx, account.ID, model, ticketEgress, "no_state_returned")
-		return 0, fmt.Errorf("上游未下发票")
+		cooldown("no_state_returned")
+		out.err = fmt.Errorf("上游未下发票")
+		return out
+	}
+	// 成批时额外记票原值的指纹（长度 + 前 8 字符，与探测记录同一种表示，不是凭据本身）。
+	// 用途是回答一个开放问题：批内各模型拿到的是不是同一张票。若恒为同一张，就等于实测出"票与
+	// 模型无关"，跨模型复用可以直接落地，这套批量取票还能再简化一层。
+	extra := map[string]any{}
+	if batched {
+		extra["state_fingerprint"] = kongTicketFingerprint(probe.State)
 	}
 	// 事件在存票之后才写：这样它能带上票 id，验证记录与「这张票是怎么采到的」（出口、静默值）
 	// 才对得上——票缓存会随过期被删，只靠时间相邻去猜是猜不准的。
 	// 一次真实的网络取票**只记一条** fetch 事件，不论入库这一步结果如何：记两条的话成功率统计
 	// 会把同一次取票算两遍，而「取了几次」正是额度口径。入库的后处理结果一律进 detail。
-	capture := &kongCaptureFacts{Egress: ticketEgress, IdleSeconds: idle}
-	ticketID, expiresAt, inserted, err := s.storeTicket(ctx, account.ID, model, probe.State, KongTicketSourceFetch, capture)
+	capture := &kongCaptureFacts{Egress: in.ticketEgress, IdleSeconds: in.idle}
+	ticketID, expiresAt, inserted, err := s.storeTicket(ctx, account.ID, in.model, probe.State, KongTicketSourceFetch, capture)
 	if err != nil {
+		extra["error"] = err.Error()
+		extra["phase"] = "store_ticket"
 		event.Outcome = KongOutcomeFailure
-		event.Detail = map[string]any{"error": err.Error(), "phase": "store_ticket"}
+		event.Detail = detail(extra)
 		s.logEvent(ctx, event)
 		// 网络活动已经发生，退避必须推进：否则下一个请求立刻再取一次，同一个故障被无限重试。
-		s.enterCooldown(ctx, account.ID, model, ticketEgress, "store_ticket_failed")
-		return 0, err
+		cooldown("store_ticket_failed")
+		out.err = err
+		return out
 	}
 	event.TicketID = &ticketID
 	if !inserted {
 		// 主动取票拿回了一张我们已经有的票：那张票的结论（含 rejected）仍然有效，不该重新验证。
+		extra["reason"] = "duplicate_state"
 		event.Outcome = KongOutcomeFailure
-		event.Detail = map[string]any{"reason": "duplicate_state"}
+		event.Detail = detail(extra)
 		s.logEvent(ctx, event)
 		// 同样要推进退避。min_idle=0 是合法配置，不进冷却时两个相邻请求会各取一次、各拿回同一张
 		// 重复票，净效果是零收益的双倍网络活动。
-		s.enterCooldown(ctx, account.ID, model, ticketEgress, "duplicate_state")
-		return 0, fmt.Errorf("取到的票与库中已有的重复")
+		cooldown("duplicate_state")
+		out.err = fmt.Errorf("取到的票与库中已有的重复")
+		return out
 	}
-	// 一次成功的主动取票是「新信息」：解除本段无票期里的候选跳过标记。
+	// 一次成功的主动取票是「新信息」：解除本段无票期里的候选跳过标记。按各自模型解——跳过标记是
+	// (账号, 模型) 维度的。
 	//
 	// 放在写事件之前，失败原因随那一条事件走：解不掉标记只会让本可重试的候选继续被跳过，
 	// 不影响这张新票，所以不中止——但必须留痕，否则「为什么那几张候选再也没被选过」查不出来。
-	if clearErr := s.repo.ClearSkipMarks(ctx, account.ID, model); clearErr != nil {
-		event.Detail = map[string]any{"clear_skip_marks_error": clearErr.Error()}
+	if clearErr := s.repo.ClearSkipMarks(ctx, account.ID, in.model); clearErr != nil {
+		extra["clear_skip_marks_error"] = clearErr.Error()
 	}
 	event.Outcome = KongOutcomeSuccess
+	if len(extra) > 0 {
+		event.Detail = detail(extra)
+	}
 	s.logEvent(ctx, event)
 
-	return s.verifyTicket(ctx, account, cfg, model, ticketID, probe.State, KongTicketSourceFetch, expiresAt, capture, taskStartedAt, false)
+	out.ticketID = ticketID
+	out.state = probe.State
+	out.expires = expiresAt
+	return out
 }
 
 // verifyExistingCandidate 验证缓存里已有的候选。
@@ -1047,9 +1214,11 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	}
 
 	if result == nil {
-		// 淘汰本段无票期的全部现存候选——两种来源都要：这张票仍是 unverified，不标的话
-		// OldestCandidate 下一次照样选中它；而缓存里的其它旧候选同样会被逐张验证，
-		// 每次都绕过取票冷却。
+		// 淘汰本段无票期里的 observed 候选：它们会被逐张验证，每次都绕过取票冷却。
+		// fetch 候选**不在**批量淘汰范围内（见 SkipCandidatesFor 的注释），所以正在验的这张要
+		// 单独标——不标的话 OldestCandidate 下一次照样选中它，同一张票被无限重验。
+		// SkipCandidate 只对 unverified 生效，因此重验一张正在服务的票不会被它误伤。
+		skipCandidate("no_valid_answer")
 		skipDrySpell("no_valid_answer")
 		// 只有主动取来的票才进冷却：observed 候选失败应当立即升级为主动取票，把那种失败也算进
 		// F 会让升级白等一个冷却期。

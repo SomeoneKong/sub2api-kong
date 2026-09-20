@@ -215,7 +215,8 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 	}
 
 	access := NewKongAccountAccess(accountRepo, proxyRepo)
-	ticketService := NewKongTicketService(repo, upstream, accountRepo, bank, params, accept, confidence)
+	ticketService := NewKongTicketService(repo, upstream, accountRepo, bank, params,
+		gated, ticketCfg.BatchFetchAllModels, accept, confidence)
 	adminService := NewKongTicketAdminService(repo, access, params, gated, accept, confidence)
 	// 手工触发要走编排服务的正常决策路径，所以 Admin 需要它。
 	adminService.SetTicketService(ticketService)

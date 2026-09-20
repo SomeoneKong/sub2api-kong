@@ -21,6 +21,9 @@ type kongStubUpstream struct {
 	fetchState string
 	fetchErr   error
 	fetchCalls int
+	// 按模型覆盖取票结果，键是模型名；空表示按上面的全局值走。
+	fetchStateFor map[string]string
+	fetchErrFor   map[string]error
 	// fetchHook 在取票时被调用，用于构造并发时序。
 	fetchHook func()
 
@@ -43,16 +46,25 @@ func (u *kongStubUpstream) ProxyState(_ context.Context, _ *int64) (KongTicketPr
 	return u.proxyState, u.proxyErr
 }
 
-func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, _ string) (*KongUpstreamProbe, error) {
+func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, model string) (*KongUpstreamProbe, error) {
 	u.mu.Lock()
 	u.fetchCalls++
 	hook := u.fetchHook
+	// 按模型覆盖：批量取票要能构造「触发模型成功、另一个模型失败」这种局面。
+	modelErr, hasModelErr := u.fetchErrFor[model]
+	modelState, hasModelState := u.fetchStateFor[model]
 	u.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
+	if hasModelErr {
+		return &KongUpstreamProbe{StatusCode: 500}, modelErr
+	}
 	if u.fetchErr != nil {
 		return &KongUpstreamProbe{StatusCode: 500}, u.fetchErr
+	}
+	if hasModelState {
+		return &KongUpstreamProbe{State: modelState, StatusCode: 200}, nil
 	}
 	return &KongUpstreamProbe{State: u.fetchState, StatusCode: 200}, nil
 }
@@ -117,7 +129,10 @@ func kongTestService(t *testing.T, repo *kongStubRepo, up *kongStubUpstream, acc
 		t.Fatalf("加载校准资料: %v", err)
 	}
 	params := KongDefaultTicketParams()
+	// 默认关掉批量取票：绝大多数用例只关心单模型路径，开着会让它们凭空多发几次取票。
+	// 批量取票自己的用例显式打开（见 kong_ticket_batch_fetch_test.go）。
 	return NewKongTicketService(repo, up, accounts, bank, params,
+		[]string{"gpt-6-astra"}, false,
 		KongTicketAccept{"gpt-6-astra": []string{"gpt-6-astra"}}, 0.9)
 }
 

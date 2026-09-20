@@ -103,7 +103,17 @@ func (r *kongStubRepo) poolOf(accountID int64, model string) []*KongTicket {
 		}
 	}
 	if t := r.candidate[key]; t != nil && !seen[t.ID] {
+		seen[t.ID] = true
 		out = append(out, t)
+	}
+	// 本轮 InsertTicket 插进来的票同样要在池子里：生产侧 VerifiedTickets 查的是表，刚插入的行
+	// 当然查得到。少了这一支，「取票 → 验证 → 回读当前票」这条链路在测试里永远断在最后一步
+	// （表现成任务成功却拿不到票）。
+	for _, t := range r.inserted {
+		if t != nil && t.AccountID == accountID && t.Model == model && !seen[t.ID] {
+			seen[t.ID] = true
+			out = append(out, t)
+		}
 	}
 	return out
 }
@@ -156,6 +166,13 @@ func (r *kongStubRepo) ticketByID(id int64) *KongTicket {
 		}
 	}
 	for _, t := range r.candidate {
+		if t != nil && t.ID == id {
+			return t
+		}
+	}
+	// 也要找本轮插入的票：否则「取票 → 验证 → 归因回写 → 按当前白名单授予资格」这条链路断在
+	// 回写那一步，票会以空的归因分布留在库里，于是永远判不合格。
+	for _, t := range r.inserted {
 		if t != nil && t.ID == id {
 			return t
 		}
@@ -241,6 +258,11 @@ func (r *kongStubRepo) SkipCandidatesFor(_ context.Context, accountID int64, mod
 			continue
 		}
 		if st.Status != KongTicketStatusUnverified || st.CapturedAt.After(capturedBefore) {
+			continue
+		}
+		// 生产侧只淘汰 observed 候选：批内取回的 fetch 票是一整段出口静默换来的，不能被旧候选的
+		// 失败连带标掉（见 SkipCandidatesFor 的注释）。桩不筛来源就测不出那条损害。
+		if st.Source != KongTicketSourceObserved {
 			continue
 		}
 		st.SkipUntilNew = true

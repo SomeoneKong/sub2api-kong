@@ -1817,6 +1817,10 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	trustedProxiesConfigured := viper.InConfig("server.trusted_proxies") ||
 		viper.IsSet("server.trusted_proxies") || trustedProxiesEnvConfigured
 
+	// 必须在 Unmarshal 之前：票据的布尔项若拿到非法值会让整次解码失败、进而终止启动，
+	// 而那是个配置笔误不该有的后果（见 kong_ticket_config.go）。
+	normalizeKongTicketEnv()
+
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config error: %w", err)
@@ -2255,6 +2259,7 @@ func setDefaults() {
 	// 同一个理由（viper 只解码 AllKeys() 里的键）：本 fork 的票据配置没有 config 文件可依，
 	// 现网全靠 GATEWAY_KONG_CODEX_TICKET_* 环境变量，不注册空默认值就永远读不到。
 	viper.SetDefault("gateway.kong_codex_ticket.accept_extra", DefaultKongTicketAcceptExtra)
+	viper.SetDefault("gateway.kong_codex_ticket.batch_fetch_all_models", DefaultKongTicketBatchFetchAllModels)
 
 	// Ops (vNext)
 	viper.SetDefault("ops.enabled", true)

@@ -19,6 +19,13 @@ const (
 	KongActionInjectAndPrefetch = "inject_and_prefetch"
 	// KongActionVerifyCandidate 无可用票，但缓存里有候选：先验它，零采集成本。
 	KongActionVerifyCandidate = "verify_candidate"
+	// KongActionInjectAndVerifyCandidate：当前票还能用但已进入刷新窗口，而缓存里有一张够格的候选
+	// ——注入旧票，同时**异步**验证那张候选。
+	//
+	// 批量取票之后这条路径才有意义：非触发模型的票是在别的模型那一轮里顺带取回来的，作为候选躺在
+	// 池子里。不接这一步的话它要一直等到旧票过期，那时才**同步**验证，于是每个周期都有一个请求
+	// 白等一次验证（最坏三份挑战，足以超过等待预算变成拒服）。
+	KongActionInjectAndVerifyCandidate = "inject_and_verify_candidate"
 	// KongActionFetch 无可用票也无候选：经票据出口主动取。
 	KongActionFetch = "fetch"
 	// KongActionWait 已有在途的取票验证任务：加入等待，不另起一个。
@@ -140,7 +147,9 @@ type KongScheduleInput struct {
 
 // KongScheduleDecision 是决策结果。
 type KongScheduleDecision struct {
-	Action string
+	// CandidateID 只在 InjectAndVerifyCandidate 下有值：要异步验证的那张候选。
+	CandidateID int64
+	Action      string
 	// DenyReason 仅在 Action 为 deny 时有值。
 	DenyReason string
 	// TicketID 是本次要注入的票，或要验证的候选。
@@ -189,6 +198,15 @@ func KongDecideTicketAction(in KongScheduleInput) KongScheduleDecision {
 			// 预取已在路上，本次请求照常用当前票，不重复发起。single-flight 是兜底，
 			// 不该是唯一防线：这里就不产出第二个「去预取」的指令。
 			return KongScheduleDecision{Action: KongActionInject, TicketID: in.CurrentTicketID}
+		}
+		// 候选优先于预取：验证候选走**流量出口**，一点票据出口的静默都不消耗，而预取要花掉整段
+		// 静默。手上已经有一张够格的候选时去取新票，等于把最稀缺的资源用在已经有的东西上。
+		if in.HasCandidate {
+			return KongScheduleDecision{
+				Action: KongActionInjectAndVerifyCandidate,
+				// TicketID 仍是当前票——本次请求注入的是它；候选 id 单独给。
+				TicketID: in.CurrentTicketID, CandidateID: in.CandidateID,
+			}
 		}
 		if in.canStartTask() == "" {
 			return KongScheduleDecision{Action: KongActionInjectAndPrefetch, TicketID: in.CurrentTicketID}
