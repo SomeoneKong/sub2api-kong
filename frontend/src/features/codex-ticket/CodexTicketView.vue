@@ -853,9 +853,19 @@ function compactDetail(detail: Record<string, unknown>): string {
   return text.length > 160 ? `${text.slice(0, 160)}…` : text
 }
 
+// 当天的时间只显示时刻。事件表里绝大多数行都是今天的，一列重复的年月日会把真正在变的那部分
+// 挤到后面去。
+//
+// 今天取自 nowTick（每秒一跳）而不是 Date.now()：页面常驻过零点时，昨天的行要自己补上日期。
 function formatTime(value: string): string {
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+  if (Number.isNaN(date.getTime())) return value
+  const today = new Date(nowTick.value)
+  const sameDay =
+    date.getFullYear() === today.getFullYear() &&
+    date.getMonth() === today.getMonth() &&
+    date.getDate() === today.getDate()
+  return sameDay ? date.toLocaleTimeString() : date.toLocaleString()
 }
 
 onMounted(() => {
