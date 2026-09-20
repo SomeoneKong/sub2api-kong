@@ -63,7 +63,10 @@
                 <tr v-for="row in accounts" :key="row.account_id" class="align-top">
                   <td class="px-3 py-3">
                     <p class="font-medium text-gray-900 dark:text-white">{{ row.name }}</p>
-                    <p class="text-xs text-gray-500 dark:text-dark-400">#{{ row.account_id }} · 流量出口 {{ row.traffic_egress }}</p>
+                    <p class="text-xs text-gray-500 dark:text-dark-400">
+                      #{{ row.account_id }} · 流量出口
+                      <span :title="egressTitle(row.traffic_egress)">{{ egressLabel(row.traffic_egress) }}</span>
+                    </p>
                     <p v-if="!row.ready" class="mt-1 text-xs text-amber-700 dark:text-amber-300">诊断暂停：{{ row.not_ready }}</p>
                     <!-- 被拒的配置键必须露出来：静默纠正会让「为什么这个账号不取票」无从排查。 -->
                     <p v-if="row.config_rejected?.length" class="mt-1 text-xs text-red-600 dark:text-red-400">
@@ -235,13 +238,22 @@
                     <span v-if="ev.status_code" class="ml-1 text-xs text-gray-500 dark:text-dark-400">HTTP {{ ev.status_code }}</span>
                   </td>
                   <td class="px-3 py-2 text-xs text-gray-500 dark:text-dark-400">
-                    票 {{ ev.ticket_egress }} / 流量 {{ ev.traffic_egress }}
+                    票 <span :title="egressTitle(ev.ticket_egress)">{{ egressLabel(ev.ticket_egress) }}</span>
+                    / 流量 <span :title="egressTitle(ev.traffic_egress)">{{ egressLabel(ev.traffic_egress) }}</span>
                     <span v-if="ev.idle_seconds !== null"> · 本系统记录空闲 {{ ev.idle_seconds }}s</span>
                   </td>
                   <td class="px-3 py-2 text-xs text-gray-500 dark:text-dark-400">
                     <span v-if="ev.state_len !== null">len={{ ev.state_len }} </span>
-                    <span v-if="ev.fingerprint_model">归因 {{ ev.fingerprint_model }} </span>
-                    <span v-if="ev.detail" class="font-mono">{{ compactDetail(ev.detail) }}</span>
+                    <span v-if="topModelsOf(ev).length" class="whitespace-nowrap">
+                      归因
+                      <span
+                        v-for="(tm, i) in topModelsOf(ev)"
+                        :key="tm.model"
+                        :class="i === 0 ? 'font-medium text-gray-700 dark:text-dark-200' : ''"
+                      >{{ i > 0 ? ' · ' : ' ' }}{{ tm.model }} {{ tm.p.toFixed(3) }}</span>
+                    </span>
+                    <span v-else-if="ev.fingerprint_model">归因 {{ ev.fingerprint_model }} </span>
+                    <span v-if="ev.detail && compactDetail(ev.detail)" class="font-mono">{{ compactDetail(ev.detail) }}</span>
                     <button
                       v-if="verificationIDOf(ev)"
                       type="button"
@@ -602,6 +614,28 @@ async function loadOverview(): Promise<void> {
 
 // proxyLabel 与代理管理页同口径：名字 + 连接串；非 active 的标出来但**不过滤掉**——
 // 已配置的代理若被停用，隐藏它会让这一行的下拉变空白，反而看不出配的是哪个。
+// egressLabel 把出口键里的 `proxy:<id>` 显示成代理名。
+//
+// 只动这一种形态：`direct` / `none` / `proxy:unset` 是语义值，而 `verify:<账号>`、`observe:<账号>`
+// 是内部任务槽位键，都按原样显示。
+//
+// **查不到对应代理时保留原串**（代理被删了，或列表还没加载完）——换成"未知"会把那个 id 丢掉，而
+// 排查"配置指向哪个代理"恰恰需要它。
+function egressLabel(key: string): string {
+  const m = /^proxy:(\d+)$/.exec(key ?? '')
+  if (!m) return key
+  const proxy = proxies.value.find((p) => String(p.id) === m[1])
+  return proxy ? proxy.name : key
+}
+
+// egressTitle 给出口键配一个完整形态的 tooltip：代理名之外还要能看到 id 与连接串。
+function egressTitle(key: string): string {
+  const m = /^proxy:(\d+)$/.exec(key ?? '')
+  if (!m) return key
+  const proxy = proxies.value.find((p) => String(p.id) === m[1])
+  return proxy ? `${key} · ${proxy.protocol}://${proxy.host}:${proxy.port}` : key
+}
+
 function proxyLabel(p: Proxy): string {
   const base = `${p.name}（${p.protocol}://${p.host}:${p.port}）`
   return p.status === 'active' ? base : `${base} [${p.status}]`
@@ -747,8 +781,28 @@ function outcomeClass(outcome: string): string {
   return 'badge-gray'
 }
 
+// top_models 是归因分布的前三名，由验证事件写进 detail。只看 argmax（fingerprint_model）
+// 解释不了拒票：一张真 sol 票可能是 sol 0.82 / 5.5 0.18，看不见第二名就不知道该往白名单里
+// 加什么。**历史事件没有这个字段**，取不到时退回只显示 argmax。
+function topModelsOf(ev: TicketEvent): { model: string; p: number }[] {
+  const raw = ev.detail?.top_models
+  if (!Array.isArray(raw)) return []
+  const out: { model: string; p: number }[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const { model, p } = item as { model?: unknown; p?: unknown }
+    if (typeof model !== 'string' || !model) continue
+    out.push({ model, p: typeof p === 'number' ? p : 0 })
+  }
+  return out
+}
+
+// top_models 已在前面逐项展开，这里去掉以免同一份数据出现两次——它也是 detail 里最长的一项。
 function compactDetail(detail: Record<string, unknown>): string {
-  const text = JSON.stringify(detail)
+  const rest: Record<string, unknown> = { ...detail }
+  delete rest.top_models
+  if (!Object.keys(rest).length) return ''
+  const text = JSON.stringify(rest)
   return text.length > 160 ? `${text.slice(0, 160)}…` : text
 }
 

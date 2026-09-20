@@ -158,3 +158,40 @@ func TestKongDefaultsAreConsistent(t *testing.T) {
 		}
 	}
 }
+
+// top_models 是事后复核归因判断的唯一依据（票会随过期清理，事件长期保留），所以它必须按概率
+// 降序、并列时定序、不足 3 个也不报错。
+func TestKongTopModels(t *testing.T) {
+	got := kongTopModels(map[string]float64{
+		"gpt-5.6-sol":  0.5,
+		"gpt-5.5":      0.3,
+		"gpt-6-astra":  0.15,
+		"gpt-5.6-luna": 0.05,
+	}, 3)
+	want := []KongTopModel{
+		{Model: "gpt-5.6-sol", P: 0.5},
+		{Model: "gpt-5.5", P: 0.3},
+		{Model: "gpt-6-astra", P: 0.15},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("取前三应得 3 项，实得 %d：%v", len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("第 %d 项应为 %v，实为 %v", i, want[i], got[i])
+		}
+	}
+
+	// 并列按模型名定序：同一份分布每次都要产出同样的顺序，否则两条相同的记录看起来不同。
+	tie := kongTopModels(map[string]float64{"b": 0.5, "a": 0.5}, 2)
+	if len(tie) != 2 || tie[0].Model != "a" || tie[1].Model != "b" {
+		t.Fatalf("并列应按模型名升序，实得 %v", tie)
+	}
+
+	if got := kongTopModels(map[string]float64{"a": 1}, 3); len(got) != 1 {
+		t.Fatalf("少于 n 项时应原样返回，实得 %v", got)
+	}
+	if got := kongTopModels(nil, 3); got != nil {
+		t.Fatalf("空分布应返回 nil，实得 %v", got)
+	}
+}

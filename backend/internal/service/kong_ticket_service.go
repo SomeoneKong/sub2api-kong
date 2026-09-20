@@ -1075,6 +1075,12 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 		// 只记后者解释不了「argmax 概率不够却仍然放行」。
 		"accept_models": s.accept.Of(model),
 		"accept_mass":   s.accept.Mass(model, probs),
+		// 前三名连概率一起记。只留 argmax 解释不了拒票：一张真的 sol 票可能是
+		// sol 0.82 / 5.5 0.18，看不见第二名就不知道该往白名单里加什么，还是该换校准资料。
+		//
+		// 记在事件里而不是只靠票行的 fingerprint_probs：票会随过期被清理，事件长期保留，而
+		// 「当时归因成什么」正是事后唯一能复核的依据。
+		"top_models": kongTopModels(probs, 3),
 	}
 	outcome := KongOutcomeSuccess
 	var retErr error

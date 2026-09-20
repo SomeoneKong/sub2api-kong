@@ -165,3 +165,33 @@ func kongPickCurrent(ctx context.Context, repo KongTicketRepository, accept Kong
 	}
 	return nil, nil
 }
+
+// KongTopModel 是归因分布里的一项。
+type KongTopModel struct {
+	Model string  `json:"model"`
+	P     float64 `json:"p"`
+}
+
+// kongTopModels 取归因分布里概率最高的前 n 个，按概率降序。
+//
+// 并列时按模型名排序，让同一份分布每次产出同样的顺序——事件是事后复核的依据，顺序不稳定会让
+// 两条记录看起来不同而其实相同。
+func kongTopModels(probs map[string]float64, n int) []KongTopModel {
+	if len(probs) == 0 || n <= 0 {
+		return nil
+	}
+	out := make([]KongTopModel, 0, len(probs))
+	for m, p := range probs {
+		out = append(out, KongTopModel{Model: m, P: p})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].P != out[j].P {
+			return out[i].P > out[j].P
+		}
+		return out[i].Model < out[j].Model
+	})
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
