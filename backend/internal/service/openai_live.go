@@ -507,6 +507,12 @@ func (s *OpenAIGatewayService) ProxyLiveSideband(
 	if err != nil {
 		return err
 	}
+	// [kong] 逐帧守卫在建连前解析一次账号（避免每帧读库），装配失败即不转发——这条通路上它是唯一的
+	// 保护点，读失败时放行等于把保护关掉。放在占用控制权之前，失败就不会留下要回收的状态。
+	guardLiveFrame, guardErr := s.kongTicket.LiveFrameGuard(ctx, record.AccountID)
+	if guardErr != nil {
+		return guardErr
+	}
 	owner := uuid.NewString()
 	claimed, err := store.ClaimLiveController(ctx, record.CallHash, LiveControllerProxy, owner)
 	if err != nil {
@@ -535,6 +541,13 @@ func (s *OpenAIGatewayService) ProxyLiveSideband(
 			messageType, payload, readErr := downstream.Read(proxyCtx)
 			if readErr != nil {
 				errCh <- readErr
+				return
+			}
+			// [kong] codex 票据：sideband 是原始双向转发，票无从注入、交付也无从判定。创建端点已经
+			// 挡住门控模型，但协议允许会话中途改模型（session.update），不挡这一步就留了一条
+			// "先建非门控会话、再切到门控模型"的绕行。
+			if ticketErr := guardLiveFrame(payload); ticketErr != nil {
+				errCh <- ticketErr
 				return
 			}
 			if writeErr := upstream.WriteFrame(proxyCtx, messageType, payload); writeErr != nil {

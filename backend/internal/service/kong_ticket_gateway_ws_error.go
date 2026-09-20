@@ -1,9 +1,11 @@
 package service
 
 import (
+	"errors"
 	"strings"
 
 	coderws "github.com/coder/websocket"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
@@ -23,6 +25,36 @@ func wrapOpenAIWSKongTicketError(err error) error {
 		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "codex ticket: refusing unprotected output", err)
 	}
 	return err
+}
+
+// wrapOpenAIWSFirstTurnKongTicketError 处置**原生 WS 首轮**的票据拒服。
+//
+// 首轮是这条路上唯一可以换账号的时点，三个条件同时成立：
+//
+//   - 还没有任何字节写给客户端（首帧之前的下行写出只发生在策略拦截那几条终止分支上）；
+//   - relay 还没启动（`RunEntry` 在首帧写出之后才调用），所以上游的会话事件也还没转给客户端；
+//   - 首帧还没写上游，那一侧对本轮一无所知。
+//
+// 于是包成 failover 错误交给上层换号：上层会关掉这条上游连接、重新选号、用同一个首帧重来，客户端的
+// 连接全程不断。**后续轮次一律不能这样**——会话状态活在那条上游连接里，换号等于把上下文丢掉，所以
+// 那些轮次仍按策略关闭连接。
+//
+// **所有**首轮拒服都走统一包装，换不换号由 newKongTicketDenyFailover 按原因作用域决定：账号级的真换，
+// 帧语义歧义、注入失败这类请求级原因带 NextAccountStop、立刻进入耗尽关闭。两者都因此拿到同一套身份、
+// 调度豁免、分类文案与看板归因；关闭码仍按作用域区分（见 handler 侧的 kongApplyWSTicketDenyClose）
+// ——"稍后再来"对一个语义歧义的帧是错的建议。
+//
+// 只包一部分等于给另一部分开一条绕过统一呈现与归因的旁路，那正是前几轮反复踩的形态。
+func wrapOpenAIWSFirstTurnKongTicketError(c *gin.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	var denied *KongErrTicketDenied
+	if errors.As(err, &denied) && denied != nil {
+		MarkKongTicketDenied(c, denied.RetryAfter)
+		return newKongTicketDenyFailover(denied, kongDenyWorthSameAccountWait(denied.Reason))
+	}
+	return wrapOpenAIWSKongTicketError(err)
 }
 
 // kongWSTurnAction 是一个下行事件对「本轮票据上下文」的处置。

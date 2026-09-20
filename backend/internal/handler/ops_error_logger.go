@@ -2244,6 +2244,17 @@ func classifyOpsErrorLog(c *gin.Context, errType, message, code string, status i
 	isBusinessLimited = localModelConfiguration || routingCapacityLimited || (clientBusinessLimited && !effectiveUpstreamError) || localBusinessLimited
 	errorOwner = classifyOpsErrorOwner(phase, message)
 	errorSource = classifyOpsErrorSource(phase, message)
+	// [kong] 票据拒服是本系统的路由决定：拿不到合格票，这个池子此刻没有可用账号，**一个字节都没发给
+	// 上游**。按通用分类它会落到 `internal`（owner/source 已经对了，但那个 phase 指向"网关自己有
+	// bug"，照样把排查引向错误方向）。钉成 routing 才是实情——与"无可用账号"同类。
+	//
+	// 判据只认「最终返回的就是票据拒服」这个标记，不认"本请求期间有账号拒过服"：后者在换号后遇到真实
+	// 上游故障时照样在，据它归因就是把上游故障记成本地拒服。
+	if _, served := service.KongTicketDenyServedReason(c); served {
+		phase = "routing"
+		errorOwner = classifyOpsErrorOwner(phase, message)
+		errorSource = classifyOpsErrorSource(phase, message)
+	}
 	return phase, isBusinessLimited, errorOwner, errorSource
 }
 

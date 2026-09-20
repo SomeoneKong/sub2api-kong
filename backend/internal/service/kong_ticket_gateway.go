@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -130,6 +131,32 @@ func (g *KongTicketGateway) PrepareUpstream(ctx context.Context, req *http.Reque
 	if model == "" || !g.gatedModels[model] {
 		return nil, nil
 	}
+	// Live 这条通路**承载不了票据**：创建之后是 sideband 原始双向转发，既没有逐轮注入点，也没有
+	// 「上游是否接受了这张票」的证据。按默认拒绝极性拒服，而不是放行一次不受保障的门控会话。
+	// 非账号级原因（换号也是同一个结论），所以它带 NextAccountStop、立刻进入耗尽呈现。
+	//
+	// **只拦受保护的账号**。这一句不能省：`off` / `observe` / 未配置的账号本来就不受票据保障，拦它们
+	// 是无谓拒服，还会让 `mode=off` 这个退出手段在 Live 上失效（§8 靠它一键退回）。这个分支排在
+	// EnsureTicket 之前，所以拿不到下面 `grant.NotApplicable` 那道模式判定的保护。
+	if kongIsLiveCallsPath(req.URL) {
+		if !g.ProtectsAccount(account) {
+			return nil, nil
+		}
+		return nil, &KongErrTicketDenied{Reason: KongDenyLiveUnsupported}
+	}
+
+	// **计 token 的端点不要票**：它不产出任何模型内容，没有可被降智的东西。门控它只会在无票时白拒一次
+	// 计数请求（无谓拒服），而且那条路上的拒服还拿不到本节的补救——`/v1/responses/input_tokens` 的两个
+	// 调用点自己写 ops 传输错误、不走 failover 也不走 503 呈现，于是拒服会被记成上游故障。
+	//
+	// 仍然返回一个 attempt（Grant 为 nil）而不是 nil：那样 AfterUpstream 照旧收响应头里的票
+	// （observed 票是免费的，不消耗任何出口静默），只是不做"上游是否接受注入"的判定——本来也没注入。
+	//
+	// 这是当前唯一可达的非生成端点：embeddings / images / realtime 各有自己的模型白名单校验，受门控的
+	// codex 文本模型到不了那里。
+	if kongIsNonGeneratingUpstreamPath(req.URL) {
+		return &KongUpstreamAttempt{Model: model}, nil
+	}
 
 	grant, err := g.svc.EnsureTicket(ctx, account.ID, model)
 	if err != nil {
@@ -150,6 +177,20 @@ func (g *KongTicketGateway) PrepareUpstream(ctx context.Context, req *http.Reque
 	}
 	req.Header.Set(openAICodexTurnStateHeader, grant.State)
 	return &KongUpstreamAttempt{Model: model, Grant: grant}, nil
+}
+
+// kongNonGeneratingUpstreamPathSuffix 是不产出模型内容的上游端点。
+//
+// 按后缀匹配而不是全等：API Key 账号可以配自定义 base URL，端点会长成 `/api/v1/responses/input_tokens`
+// 这样。Anthropic 侧的 count_tokens 与 Responses 侧的 input_tokens 共用同一个上游端点，一条规则覆盖两处。
+const kongNonGeneratingUpstreamPathSuffix = "/responses/input_tokens"
+
+// kongIsNonGeneratingUpstreamPath 报告这次上游发送是否指向不产出模型内容的端点。
+func kongIsNonGeneratingUpstreamPath(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	return strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), kongNonGeneratingUpstreamPathSuffix)
 }
 
 // AfterUpstream 在拿到响应头之后、任何业务正文交付之前判定这次注入是否被上游接受。
@@ -461,7 +502,131 @@ func (g *KongTicketGateway) gatedModelOf(req *http.Request) (kongGatedModelResul
 	if _, err := io.Copy(&sb, body); err != nil {
 		return kongGatedModelResult{}, fmt.Errorf("读请求体: %w", err)
 	}
-	return kongExtractTopLevelModelString(sb.String()), nil
+	raw := sb.String()
+	// Live（realtime）创建请求把模型放在 **session.model**，顶层压根没有 `model`。按顶层判会得出
+	// "非门控"，于是受保护账号会在门控模型上发出一次**无票上送**——那是放行未受保障的输出，本项目最
+	// 重的一类缺陷。按出站 URL 识别这条端点，从嵌套对象里取。
+	if kongIsLiveCallsPath(req.URL) {
+		return kongExtractLiveSessionModel(raw), nil
+	}
+	return kongExtractTopLevelModelString(raw), nil
+}
+
+// kongLiveCallsPathSuffix 是 Live（realtime）创建端点的路径后缀。
+const kongLiveCallsPathSuffix = "/realtime/calls"
+
+// kongIsLiveCallsPath 报告这次上送是否指向 Live 创建端点。
+func kongIsLiveCallsPath(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	return strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), kongLiveCallsPathSuffix)
+}
+
+// kongExtractLiveSessionModel 取 Live 创建请求里 `session.model`。
+//
+// 重复键的判定与顶层同源（见 kongExtractTopLevelModelString）：gjson 取第一个、encoding/json 取最后
+// 一个，分歧即不可判定。`session` 自身重复同样不可判定——上游读哪一个我们说不准。
+func kongExtractLiveSessionModel(raw string) kongGatedModelResult {
+	root := gjson.Parse(raw)
+	if !root.IsObject() {
+		return kongGatedModelResult{Reason: "body_not_object"}
+	}
+	var session gjson.Result
+	seen := 0
+	root.ForEach(func(key, item gjson.Result) bool {
+		if key.String() != "session" {
+			return true
+		}
+		seen++
+		session = item
+		return seen < 2
+	})
+	switch {
+	case seen == 0:
+		// 没有 session：不是 Live 创建的形态，按"未指定模型"处理（与顶层缺 model 同口径）。
+		return kongGatedModelResult{Determinable: true}
+	case seen > 1:
+		return kongGatedModelResult{Reason: "duplicate_session_key"}
+	case !session.IsObject():
+		return kongGatedModelResult{Reason: "session_not_an_object"}
+	}
+	return kongExtractTopLevelModelString(session.Raw)
+}
+
+// LiveFrameGuard 为一条 Live sideband 连接生成逐帧守卫。
+//
+// sideband 是原始双向转发，没有逐轮守卫，所以**票据无从注入、交付也无从判定**。创建端点已经挡住了
+// 门控模型，但协议允许会话中途改模型（`session.update`），不挡这一步等于留一条"先建非门控会话、再切
+// 到门控模型"的绕行。
+//
+// **账号只在建连时读一次**：sideband 上音频帧可以每秒几十个，逐帧读库会把数据库打满。返回的闭包对
+// 未受保护的账号是空操作，调用方不必分两种写法。
+//
+// **读不到账号就返回错误，不能返回空守卫**（fail-closed）。"读失败"与"确认不受保护"是两件事，合并
+// 成放行等于让一次瞬时读库故障把整条连接的保护关掉——而创建端点补不上这个缺口：会话可以先用非门控
+// 模型建好，再用一帧 `session.update` 切过去。这条通路上守卫是唯一的保护点。
+func (g *KongTicketGateway) LiveFrameGuard(ctx context.Context, accountID int64) (func([]byte) error, error) {
+	noop := func([]byte) error { return nil }
+	if !g.Enabled() {
+		return noop, nil
+	}
+	account, err := g.svc.accounts.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("读账号 %d 以装配 Live 逐帧守卫: %w", accountID, err)
+	}
+	if account == nil {
+		return nil, fmt.Errorf("账号 %d 不存在，无法装配 Live 逐帧守卫", accountID)
+	}
+	if !g.ProtectsAccount(account) {
+		return noop, nil
+	}
+	return g.guardLiveFrame, nil
+}
+
+// guardLiveFrame 判一帧「客户端→上游」的 sideband 帧是否声明了门控模型。纯判定，不读库。
+func (g *KongTicketGateway) guardLiveFrame(payload []byte) error {
+	if len(payload) == 0 {
+		return nil
+	}
+	for _, path := range []string{"session", "response"} {
+		res := kongExtractLiveNestedModel(payload, path)
+		if !res.Determinable {
+			return &KongErrTicketDenied{Reason: KongDenyLiveUnsupported}
+		}
+		if res.Model != "" && g.gatedModels[res.Model] {
+			return &KongErrTicketDenied{Reason: KongDenyLiveUnsupported}
+		}
+	}
+	return nil
+}
+
+// kongExtractLiveNestedModel 取一帧里 `<path>.model`。path 不存在时视为"未指定模型"。
+func kongExtractLiveNestedModel(payload []byte, path string) kongGatedModelResult {
+	root := gjson.ParseBytes(payload)
+	if !root.IsObject() {
+		// 非对象帧（二进制音频等）不声明模型。
+		return kongGatedModelResult{Determinable: true}
+	}
+	var nested gjson.Result
+	seen := 0
+	root.ForEach(func(key, item gjson.Result) bool {
+		if key.String() != path {
+			return true
+		}
+		seen++
+		nested = item
+		return seen < 2
+	})
+	switch {
+	case seen == 0:
+		return kongGatedModelResult{Determinable: true}
+	case seen > 1:
+		return kongGatedModelResult{Reason: "duplicate_" + path + "_key"}
+	case !nested.IsObject():
+		return kongGatedModelResult{Determinable: true}
+	}
+	return kongExtractTopLevelModelString(nested.Raw)
 }
 
 // kongExtractTopLevelModel 取出 JSON 请求体顶层的 `model`。
@@ -632,21 +797,51 @@ func (e *kongTicketDenyFailover) Error() string { return e.denied.Error() }
 
 func (e *kongTicketDenyFailover) Unwrap() []error { return []error{e.failover, e.denied} }
 
+// kongDenyIsAccountScoped 报告这个拒服原因是否只反映**这个账号此刻的状态**。
+//
+// 只有账号级的才值得换号。请求级的技术原因（帧语义歧义、注入写不进去、模型判不出）在每个账号上都会
+// 得出同一个结论，换号只是把它在每个账号上重演一遍——还白占别的账号的槽位、把真正能服务的那次重试
+// 推到重试预算之外。
+//
+// 正向列举、默认 false：漏一项的后果是"本可换号却没换"（少拿一点收益），而反过来默认 true 时漏判
+// 会让一个必然失败的请求把整个账号池走一遍。两个方向不对称，所以取安全的那一侧。
+// 与 KongIsTicketDeniedFailover 的判据不同不是疏漏：那里认的是"是不是票据拒服"（漏判会造成归因
+// 错误，所以必须用类型），这里判的是"换号有没有用"。
+// KongDenyIsAccountScoped 导出给 handler 侧选关闭码/呈现用：账号级原因值得让客户端稍后再来，
+// 请求级或系统级原因重试也是同一个结论。
+func KongDenyIsAccountScoped(reason string) bool {
+	return kongDenyIsAccountScoped(reason)
+}
+
+func kongDenyIsAccountScoped(reason string) bool {
+	switch reason {
+	case KongDenyAccountUnready, KongDenyEgressUnusable, KongDenyNoTicketSource,
+		KongDenyWindowClosed, KongDenyEgressBusy, KongDenyWaitTimeout,
+		KongDenyPreparing, KongDenyOtherModelTask, KongDenyTaskNoTicket:
+		return true
+	default:
+		return false
+	}
+}
+
 // newKongTicketDenyFailover 构造票据拒服的 failover 错误。
 //
 //   - RequestScopedTransient：**不得据此临时封禁账号**。账号本身是好的，只是这一刻没票可注入。
 //   - Scope=account：换一个账号确实有帮助——票是按账号持有的。
+//   - NextAccountStop（仅非账号级原因）：**照样包成 failover 错误**，但不换号。包装是为了让身份、
+//     调度豁免与 503 呈现三件事在所有拒服原因上走同一条路；不换号是因为换了也是同一个结论。
 func newKongTicketDenyFailover(denied *KongErrTicketDenied, retrySameAccount bool) error {
-	return &kongTicketDenyFailover{
-		failover: &UpstreamFailoverError{
-			StatusCode:             0,
-			RequestScopedTransient: true,
-			RetryableOnSameAccount: retrySameAccount,
-			Scope:                  GatewayFailureScopeAccount,
-			Reason:                 KongTicketDenyFailoverReason(denied.Reason),
-		},
-		denied: denied,
+	failover := &UpstreamFailoverError{
+		StatusCode:             0,
+		RequestScopedTransient: true,
+		RetryableOnSameAccount: retrySameAccount,
+		Scope:                  GatewayFailureScopeAccount,
+		Reason:                 KongTicketDenyFailoverReason(denied.Reason),
 	}
+	if !kongDenyIsAccountScoped(denied.Reason) {
+		failover.NextAccountAction = NextAccountStop
+	}
+	return &kongTicketDenyFailover{failover: failover, denied: denied}
 }
 
 // KongTicketDenyReasonOf 从一个**已经摘出来的** failover 错误反查票据拒服分类。
@@ -741,6 +936,34 @@ func MarkKongTicketDenied(c *gin.Context, retryAfter string) {
 		next.Earliest = retryAfter
 	}
 	c.Set(kongTicketDenyWaitKey, next)
+}
+
+// kongTicketDenyServedKey 记「本次请求最终返回的就是票据拒服」。
+const kongTicketDenyServedKey = "kong_ticket_deny_served"
+
+// MarkKongTicketDenyServed 在票据拒服的响应**真的写出去之后**记一笔，供错误看板归因。
+//
+// 与 KongTicketDenyWait 分开是刻意的：那个是"本请求期间有账号拒过服"，换号成功或后一个账号真的
+// 故障时它照样在；而看板归因必须只看**最终发生了什么**。拿前者做归因就会把一次真实的上游故障记成
+// 本地拒服——正是本次要修的那类归因错误的反方向。
+func MarkKongTicketDenyServed(c *gin.Context, reason string) {
+	if c == nil {
+		return
+	}
+	c.Set(kongTicketDenyServedKey, reason)
+}
+
+// KongTicketDenyServedReason 报告本次请求最终是否以票据拒服收场，以及拒服分类。
+func KongTicketDenyServedReason(c *gin.Context) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	if raw, ok := c.Get(kongTicketDenyServedKey); ok {
+		if reason, ok := raw.(string); ok {
+			return reason, true
+		}
+	}
+	return "", false
 }
 
 // KongTicketDenyWaitFromContext 取本次请求累计的票据恢复信息。没有则返回 nil。

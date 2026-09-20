@@ -154,11 +154,17 @@ func (s *KongTicketService) ensureTicketOpts(ctx context.Context, accountID int6
 // 之后先尝试复位一张已拒票并以它为验证目标。两者都只由人工触发置真。
 func (s *KongTicketService) ensureTicket(ctx context.Context, accountID int64, model string, manual, revive, allowHandoff bool) (*KongTicketGrant, error) {
 	account, err := s.accounts.GetByID(ctx, accountID)
-	if err != nil {
-		return nil, fmt.Errorf("读账号 %d: %w", accountID, err)
+	if errors.Is(err, ErrAccountNotFound) || (err == nil && account == nil) {
+		// **账号不存在是账号级条件，不是系统故障**：调度到准入之间账号可能被删掉。报成错误会让上层
+		// 包成 `ensure_failed`（系统级、不换号），于是"A 已不存在、B 持有合格票"时整个请求在 A 上终止
+		// ——那是无谓拒服。account_unready 换号有用，正是它的本意。
+		slog.Warn("kong ticket: 账号已不存在，按不可调度处理",
+			"account_id", accountID, "model", model, "error", err)
+		return &KongTicketGrant{DenyReason: KongDenyAccountUnready}, nil
 	}
-	if account == nil {
-		return nil, fmt.Errorf("账号 %d 不存在", accountID)
+	if err != nil {
+		// 其余读取失败是共享基础设施故障：换一个账号同样读不到，仍按系统级处理。
+		return nil, fmt.Errorf("读账号 %d: %w", accountID, err)
 	}
 	cfg, rejected := ParseKongTicketConfig(account.Extra)
 	if len(rejected) > 0 {

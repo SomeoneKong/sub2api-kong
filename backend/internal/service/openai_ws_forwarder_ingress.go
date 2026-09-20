@@ -249,6 +249,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// [kong] codex 票据：歧义帧在读 `type` / `model` 之前挡住。下面全程按 gjson 的首键语义
 		// 解读并用 sjson 改写（改的也是首处），重复键会让上游读到另一个值。
 		if ticketErr := s.kongTicket.GuardWSFrame(account, trimmed); ticketErr != nil {
+			// 首轮走统一包装（歧义是请求级原因，不会换号但要拿到同一套身份与归因）；后续轮次会话
+			// 已建立，仍按策略关闭。
+			if turn == 1 {
+				return openAIWSClientPayload{}, wrapOpenAIWSFirstTurnKongTicketError(c, ticketErr)
+			}
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
 				coderws.StatusPolicyViolation,
 				"codex ticket unavailable for this model",
@@ -421,6 +426,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// WS 上票不是头而是 payload 字段，且逐轮上送（口径见 kong_ticket_gateway.go 的 WS 段）。
 		// 放在每一帧的模型解析之后，会话中途用 response.create 换成门控模型同样受保护。
 		if next, attempt, err := s.kongTicket.PrepareWSTurn(ctx, account, upstreamModel, normalized); err != nil {
+			// 首轮的账号级拒服可以换号：这一次 parseClientPayload 发生在取上游连接与首帧上送之前，
+			// 客户端也还没收到任何字节（理由与落点见 wrapOpenAIWSFirstTurnKongTicketError）。
+			// 后续轮次会话已建立，换号会丢掉活在那条上游连接里的上下文，仍按策略关闭连接。
+			if turn == 1 {
+				return openAIWSClientPayload{}, wrapOpenAIWSFirstTurnKongTicketError(c, err)
+			}
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
 				coderws.StatusPolicyViolation,
 				"codex ticket unavailable for this model",

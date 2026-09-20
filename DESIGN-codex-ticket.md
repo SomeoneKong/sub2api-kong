@@ -1404,6 +1404,11 @@ refresh_before = 1900s  → 间隔 1700s（28 分钟静默）← 踩在实测门
    拒服期间，同分组另一账号已持有合格票，**64 个请求仍被直接拒掉、一个都没切过去**——那是无谓拒服，
    与放行降智同级。实例见 `../INCIDENT-20260920-ticket-deny-as-502.md`。
 
+   ⚠️ `ensure_failed` 里有一种**账号级**情形要单独摘出来：调度到准入之间账号可能被删掉。那时
+   `ensureTicket` 直接返回 `account_unready` 的拒服而不是错误——包成 `ensure_failed` 会带上
+   `NextAccountStop`，于是"A 已不存在、B 持有合格票"时整个请求在 A 上终止，那是无谓拒服。其余读取
+   失败仍是系统级（换一个账号同样读不到）。
+
    ⚠️ **拒服身份靠错误类型认，不靠 reason 字符串**。`*KongErrTicketDenied` 有十几个构造点，其中六种
    原因带自由文本（`ensure_failed: <err>`、`model_undeterminable: <reason>` 等），维护一张字符串清单
    反查必然漏项——漏一项就是把一次本地拒服计进账号健康度 EWMA（实测 `ensure_failed` 让 EWMA 从 0
@@ -1414,6 +1419,14 @@ refresh_before = 1900s  → 间隔 1700s（28 分钟静默）← 踩在实测门
    **身份判定要认两种传参形态**：多值 `Unwrap` 只能由外向内查找，所以调用方一旦先 `errors.As` 把
    `*UpstreamFailoverError` 摘出来、再把那个指针单独传给调度上报（WS 换号就是这样），从它反查不到并列
    的 `*KongErrTicketDenied`。那时靠受控命名空间识别。只认类型会在这类消费点上静默漏掉。
+
+   **换号有没有用另判一次**（`kongDenyIsAccountScoped`）：上面列的九种调度原因都是账号级的，换号有用；
+   而 `model_undeterminable` / `frame_undeterminable` / `inject_failed` / `inject_unverified` /
+   `ensure_failed` 这些是**请求级或系统级**的技术原因，每个账号上都会得出同一个结论，换号只是把它在整个
+   账号池上重演一遍，还白占别人的槽位。它们**照样包成 failover 错误**（身份、调度豁免、503 呈现三件事
+   在所有拒服原因上走同一条路），只是带 `NextAccountStop`——上层立刻进入耗尽呈现。
+   这个分类正向列举、默认"不换号"：漏一项只是少拿一点收益，而反过来默认换号时漏判会让一个必然失败的
+   请求走完整个账号池。
 
    同账号先不先等（`RetryableOnSameAccount`）另按**这个原因在几秒内是否可能自行好转**定：
    - **值得等**：`preparing`（本账号的任务正在跑，产物就是本账号要的票）、`other_model_task`（本账号
@@ -1459,6 +1472,21 @@ refresh_before = 1900s  → 间隔 1700s（28 分钟静默）← 踩在实测门
    是"服务暂时不可用"的标准表达。`Retry-After` 给**秒数**不给日期——日期要求两端时钟一致，而它们可以
    差好几分钟。
 
+**Live（realtime）是第五条通路，本期按拒绝处理**。它把模型放在 `session.model`，顶层没有 `model`
+——按顶层判会得出"非门控"，于是受保护账号会在门控模型上发出一次**无票上送**，那是放行未受保障的输出。
+创建端点因此按嵌套字段判定；判出门控模型就拒服（`live_unsupported`），因为这条通路承载不了票据：创建
+之后是 sideband 原始双向转发，既没有逐轮注入点，也没有「上游是否接受了这张票」的证据。sideband 的
+客户端帧另有一道守卫（`LiveFrameGuard`），挡住"先建非门控会话、再 `session.update` 切到门控模型"的
+绕行。要支持受控 Live，需要先定下票据载体与交付证据——**需调用方定**。
+
+这道拒绝的**作用域与别处一样是"受保护账号"**：`off` / `observe` / 未配置票据出口的账号照原样放行，
+否则一条本期不做的保护会变成对全部 Live 用户的功能下线。守卫**每条连接解析一次**而不是每帧解析——
+realtime 是音频帧流，逐帧读账号等于把一次会话变成对数据库的持续打击；装配时账号读失败或账号不存在
+即**拒绝建立连接**（fail-closed），此刻无法判断账号是否受保护，放过去就可能是一次无票上送。
+Live 的两个终点都不经过 failover 耗尽 handler，所以统一呈现要各接一次：创建落 503 + 分类，sideband
+落 1008 + 分类，两处都写下"最终以票据拒服收场"的归因标记——否则前者说成 `502 / api_error`（把本地
+策略决定说成上游挂了），后者说成 1011（让人去查网关自己）。
+
 **还有第三条传输通路**：客户端 HTTP 进来、上游是 WebSocket（`openai_ws_forwarder_v2.go` 的
 `PrepareWSMapPayload`）。它既不过 `doOpenAIUpstream` 也不过两条原生 WS 适配器，所以拒服要显式走 HTTP
 那套统一转换——客户端是 HTTP，终点应当是 HTTP 的耗尽呈现（503），不是 WS 的关闭错误。裸返回会让
@@ -1500,9 +1528,31 @@ deny_reason，含带自由文本的技术原因）。计进错误率 EWMA 会让
 1. 票据层只回一个布尔，没把**可接手的账号 id** 交给上层，所以上层无法与本请求的可调度集合取交集。
    别家账号全部不可调度时，failover 会耗尽而不是回来等。
 2. OpenAI 主路径不写绑定事实到 context，于是"新请求立刻换号"退化成"先等几次重试再换"。
-3. 原生 WS 完全不交接，**也不参与本节第 2 层的 failover**——那条路上的票据拒服仍是按策略关闭连接
-   （1008）。接它需要区分首帧未上送（可安全切换）与已建立会话（须保持本号），并让 WS 的同账号重试
-   helper 支持票据拒服（当前只认 429 的 deadline）。
+3. 原生 WS **只有首轮**参与 failover。首轮是这条路上唯一可换号的时点，三个条件同时成立：还没有任何
+   字节写给客户端、relay 尚未启动（`RunEntry` 在首帧写出之后才调用）、首帧也还没写上游。所以首轮的
+   账号级拒服包成 failover 错误交给上层换号（`wrapOpenAIWSFirstTurnKongTicketError`），客户端连接
+   全程不断；WS 的同账号等待 helper 也放行票据拒服（原先只认 429 的 deadline，于是 `preparing` 只能
+   靠换号，而换号在 WS 上要丢掉上游连接与它的上下文缓存）。耗尽时关 **1013** 并带分类与剩余秒数，
+   不再是 1011「upstream websocket proxy failed」。
+
+   **首轮的拒服一律统一包装**，换不换号由原因作用域决定（账号级真换，其余带 `NextAccountStop` 立刻
+   进入耗尽关闭）。只包"能换号的那部分"等于给其余拒服开一条绕过统一呈现与归因的旁路。关闭码仍按作用域
+   区分：账号级 1013（稍后再来），请求级/系统级 1008——对一个语义歧义的帧建议客户端稍后重试是错的。
+   两条原生入口的**首帧歧义出口**同样走这条路。
+
+   **两条原生入口都要接**：passthrough 在它自己的首帧注入处，ctx_pool / shared / dedicated 走
+   `openai_ws_forwarder_ingress.go` 的 `parseClientPayload`（`turn == 1`），HTTP bridge 的首轮也落在
+   同一个解析器上。只接一条等于另一条仍然在别的账号有票时直接断连。
+
+   ⚠️ **bridge 每轮还有第二次准入**：它把 WS 轮次转成 HTTP 请求，于是 `doOpenAIUpstream` 里的
+   `PrepareUpstream` 会再判一次。第一次通过不代表第二次还成立——两者之间票可能过期或被并发撤销。
+   那一次失败同样要保住拒服身份：首轮走统一 failover，后续轮次按策略关闭（1008），**都不能落进
+   "写一帧 502 upstream_error + 把错误字符串化"的通用路径**，那会同时丢掉类型、误罚账号健康度、
+   并把本地拒服告知客户端为上游故障。
+
+   **后续轮次仍然不交接**：会话状态活在那条上游连接里，换号等于把上下文丢掉，所以逐帧过滤器里的同一
+   判定仍按策略关闭连接（1008）。原生 WS 也仍然不做票据层的**交接判定**（`EnsureTicketNoHandoff`）
+   ——那条路上拿不到票时同步等任务出结果。
 
 ## 8. 风险与退出
 
@@ -1518,21 +1568,25 @@ deny_reason，含带自由文本的技术原因）。计进错误率 EWMA 会让
 **退出条件**：若上游变更使注入失效且无法在合理成本内恢复，**放弃该特性**而不是层层加码
 绕过——继续对抗只会把风险推到账号上。
 
-⚠️ **残留缺陷：`ops_error_logs` 仍把票据拒服归因给上游。** 换号、响应与调度健康度三件已经修了
-（§4.6 第 2、3 层），但看板那一侧还会把这类记成 `error_owner = provider` /
-`error_source = upstream_http`，而同一行的 `upstream_status_code` 是 NULL——三者自相矛盾，供应商质量
-统计因此被污染。**在改之前，排查这类问题的判据是：`upstream_status_code` 为 NULL 即"压根没有上游
-响应"**。
+**看板归因**：票据拒服在 `ops_error_logs` 里落 `routing` / `platform` / `gateway`。它由响应本身决定
+（502 `upstream_error` 会被分类成 `upstream` / `provider` / `upstream_http`），所以呈现改成 503 之后
+归因自然就对了；另外按「最终返回的就是票据拒服」这个标记把 phase 从 `internal` 钉成 `routing`
+——`internal` 指向"网关自己有 bug"，同样是误导。判据只认最终结果，不认"本请求期间有账号拒过服"：
+后者在换号后遇到真实上游故障时照样在，据它归因就是把上游故障记成本地拒服。
 
-⚠️ **另一条残留：六个 `doOpenAIUpstream` 调用点不经过票据拒服的转换**（embeddings、responses
-input_tokens、Anthropic count_tokens、images、images_responses、live），它们自己写 ops 传输错误，于是
-那几条路上的拒服既不换号、也不按 503 呈现。真正可达的是 count_tokens 两条——顺带的问题是 count_tokens
-本不产出模型输出、**门控它只会带来无谓拒服**。
+排查这类记录的通用判据仍然有用：**`upstream_status_code` 为 NULL 即"压根没有上游响应"**。
 
-两条实例与待办均见 `../INCIDENT-20260920-ticket-deny-as-502.md`。
+**门控范围只覆盖会产出模型内容的端点**。`/v1/responses/input_tokens`（Responses 的 input_tokens 与
+Anthropic 的 count_tokens 共用它）不产出模型输出，没有可被降智的东西——门控它只会在无票时白拒一次
+计数请求，而且那条路上的拒服还拿不到本节的补救（它自己写 ops 传输错误，不走 failover 也不走 503
+呈现）。跳过时仍返回一个 attempt，好让 `AfterUpstream` 继续收响应头里的免费票。embeddings / images /
+realtime 的 `doOpenAIUpstream` 调用点同样绕开转换，但受门控的 codex 文本模型过不了它们各自的模型
+白名单校验，到不了那里。
 
-改它时要守住：`full` 拿不到合格票**仍然必须拒服**。这条缺陷是关于怎么把拒服告诉调用方与看板，不是
-该不该拒服。
+以上两条的实例见 `../INCIDENT-20260920-ticket-deny-as-502.md`。
+
+守住的边界：`full` 拿不到合格票**仍然必须拒服**。这些改动都是关于怎么把拒服告诉调用方与看板、以及拒
+之前有没有先试别的账号，不是该不该拒服。
 
 ## 9. 待定
 

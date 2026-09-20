@@ -1,12 +1,15 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -144,6 +147,166 @@ func TestKongTicketDenyUnknownRecoverySuppressesRetryAfter(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), "earliest retry") {
 		t.Errorf("文案不该给一个不成立的等待时间，实得 %q", w.Body.String())
+	}
+}
+
+// 票据拒服在错误看板上不得记成上游的锅。
+//
+// 生产上那 300 条被记成 `error_owner = provider` / `error_source = upstream_http`，而同一行的
+// `upstream_status_code` 是 NULL——三者自相矛盾，后果是供应商质量统计被污染、排查方向被带向上游。
+// 归因由响应本身决定（502 upstream_error → provider），所以呈现改成 503 之后这条自然就对了；这里
+// 钉住它，免得以后改文案或错误类型时静默回归。phase 钉成 routing 而不是 internal：后者指向"网关
+// 自己有 bug"，同样是误导。
+func TestKongTicketDenyOpsAttributionIsNotProvider(t *testing.T) {
+	for _, anthropic := range []bool{false, true} {
+		name := "responses"
+		if anthropic {
+			name = "messages"
+		}
+		t.Run(name, func(t *testing.T) {
+			w, c := kongDenyTestContext()
+			service.MarkKongTicketDenied(c, time.Now().Add(20*time.Minute).UTC().Format(time.RFC3339))
+			h := &OpenAIGatewayHandler{}
+			if anthropic {
+				h.handleAnthropicFailoverExhausted(c, kongDenyFailoverErr(service.KongDenyWindowClosed), false)
+			} else {
+				h.handleFailoverExhausted(c, kongDenyFailoverErr(service.KongDenyWindowClosed), false)
+			}
+			parsed := parseOpsErrorBody(t, w.Body.Bytes())
+			phase, _, owner, source := classifyOpsErrorLog(c, parsed.errType, parsed.message, "", w.Code)
+			if owner != "platform" || source != "gateway" {
+				t.Errorf("归因 = %s/%s, want platform/gateway", owner, source)
+			}
+			if phase != "routing" {
+				t.Errorf("phase = %s, want routing（拿不到合格票等于此刻没有可用账号）", phase)
+			}
+		})
+	}
+	// 反面：真实上游故障仍然记在供应商头上，本次改动不得把它一起洗白。
+	w, c := kongDenyTestContext()
+	h := &OpenAIGatewayHandler{}
+	h.handleFailoverExhausted(c, &service.UpstreamFailoverError{StatusCode: 502}, false)
+	parsed := parseOpsErrorBody(t, w.Body.Bytes())
+	_, _, owner, source := classifyOpsErrorLog(c, parsed.errType, parsed.message, "", w.Code)
+	if owner != "provider" || source != "upstream_http" {
+		t.Errorf("真实上游故障的归因 = %s/%s, want provider/upstream_http", owner, source)
+	}
+}
+
+type opsErrorBody struct {
+	errType string
+	message string
+}
+
+// parseOpsErrorBody 按看板真实的取法从响应体里读错误类型与文案——归因链的输入就是这两个值。
+func parseOpsErrorBody(t *testing.T, body []byte) opsErrorBody {
+	t.Helper()
+	var payload struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("解析响应体: %v（%s）", err, body)
+	}
+	return opsErrorBody{errType: normalizeOpsErrorType(payload.Error.Type, ""), message: payload.Error.Message}
+}
+
+// WS 耗尽关闭的码按原因作用域分：账号级"稍后再来"（1013），请求级/系统级用 1008——对一个语义歧义的
+// 帧建议客户端稍后重试是错的。两者都要拿到票据分类与看板归因标记。
+func TestKongWSTicketDenyCloseStatusByScope(t *testing.T) {
+	cases := map[string]coderws.StatusCode{
+		service.KongDenyWindowClosed:       coderws.StatusTryAgainLater,
+		service.KongDenyNoTicketSource:     coderws.StatusTryAgainLater,
+		"frame_undeterminable: duplicate":  coderws.StatusPolicyViolation,
+		"ensure_failed: dial tcp: refused": coderws.StatusPolicyViolation,
+		service.KongDenyLiveUnsupported:    coderws.StatusPolicyViolation,
+	}
+	for reason, want := range cases {
+		_, c := kongDenyTestContext()
+		intendedStatus := 502
+		errorType, errorCode, message := "upstream_error", "upstream_ws_failover_exhausted", "upstream websocket proxy failed"
+		closeStatus := coderws.StatusInternalError
+		ok := kongApplyWSTicketDenyClose(c, kongDenyFailoverErr(reason),
+			&intendedStatus, &errorType, &errorCode, &message, &closeStatus)
+		if !ok {
+			t.Fatalf("%s 应当被认成票据拒服", reason)
+		}
+		if closeStatus != want {
+			t.Errorf("%s 的关闭码 = %v, want %v", reason, closeStatus, want)
+		}
+		if intendedStatus != 503 {
+			t.Errorf("%s 的意图状态码 = %d, want 503", reason, intendedStatus)
+		}
+		if served, has := service.KongTicketDenyServedReason(c); !has || served == "" {
+			t.Errorf("%s 没有记下「最终以票据拒服收场」，看板归因会落回上游", reason)
+		}
+	}
+	// 真实上游故障不走这条路。
+	_, c := kongDenyTestContext()
+	intendedStatus := 502
+	errorType, errorCode, message := "upstream_error", "code", "msg"
+	closeStatus := coderws.StatusInternalError
+	if kongApplyWSTicketDenyClose(c, &service.UpstreamFailoverError{StatusCode: 500},
+		&intendedStatus, &errorType, &errorCode, &message, &closeStatus) {
+		t.Error("普通上游故障被当成票据拒服")
+	}
+}
+
+// Live 的两个终点不经过 failover 耗尽 handler，所以统一呈现要在那里各接一次。
+//
+// 不接的话：创建落成 `502 / api_error / "Live upstream request failed"`（把本地策略决定说成上游挂了），
+// sideband 落成 1011「live sideband closed」（让人去查网关自己）。两处都拿不到票据分类与看板归因标记。
+func TestKongLiveTicketDenyPresentation(t *testing.T) {
+	h := &OpenAIGatewayHandler{}
+
+	// 创建路径：拒服已被包成 failover 错误，但终点是 writeLiveCreateError。
+	w, c := kongDenyTestContext()
+	denied := service.KongDenyLiveUnsupported
+	h.writeLiveCreateError(c, kongDenyFailoverErr(denied))
+	if w.Code != 503 {
+		t.Errorf("状态码 = %d, want 503", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, denied) {
+		t.Errorf("文案要带分类，实得 %q", body)
+	}
+	if strings.Contains(body, "Live upstream request failed") {
+		t.Errorf("不该再出现那句会引人查上游的文案，实得 %q", body)
+	}
+	if served, ok := service.KongTicketDenyServedReason(c); !ok || served != denied {
+		t.Errorf("没有记下「最终以票据拒服收场」，看板归因会落回上游，实得 %q/%v", served, ok)
+	}
+	// live_unsupported 没有恢复时刻，不该编一个 Retry-After。
+	if got := w.Header().Get("Retry-After"); got != "" {
+		t.Errorf("这条通路等多久都一样，不该给 Retry-After，实得 %q", got)
+	}
+
+	// 反面：真实上游故障仍走原来的映射。
+	w2, c2 := kongDenyTestContext()
+	h.writeLiveCreateError(c2, &service.UpstreamFailoverError{StatusCode: 500})
+	if w2.Code != 502 {
+		t.Errorf("普通上游故障要保持原来的 502 映射，实得 %d", w2.Code)
+	}
+
+	// sideband 路径：按策略关闭而不是 1011。
+	_, c3 := kongDenyTestContext()
+	status, reason, ok := kongLiveSidebandDenyClose(c3, &service.KongErrTicketDenied{Reason: denied})
+	if !ok {
+		t.Fatal("sideband 上的票据拒服要被认出来")
+	}
+	if status != coderws.StatusPolicyViolation {
+		t.Errorf("关闭码 = %v, want 1008", status)
+	}
+	if !strings.Contains(reason, denied) {
+		t.Errorf("关闭文案要带分类，实得 %q", reason)
+	}
+	if served, has := service.KongTicketDenyServedReason(c3); !has || served != denied {
+		t.Errorf("sideband 也要记下归因标记，实得 %q/%v", served, has)
+	}
+	if _, _, ok := kongLiveSidebandDenyClose(c3, errors.New("普通错误")); ok {
+		t.Error("普通错误不该被当成票据拒服")
 	}
 }
 

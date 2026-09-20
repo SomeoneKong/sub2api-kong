@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
 
+	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -37,6 +39,9 @@ func (h *OpenAIGatewayHandler) kongWriteTicketDenyExhausted(
 		c.Header("Retry-After", retryAfter)
 	}
 	// 刻意不调 SetOpsUpstreamError：没有上游响应可记，记了只是在错误看板上多一条指向上游的假证据。
+	// 改记一个「最终以票据拒服收场」的标记，让看板归因落在 routing/platform/gateway（见
+	// classifyOpsErrorLog 的 kong 分支）。标记放在这里而不是拒服发生处：归因只能看最终结果。
+	service.MarkKongTicketDenyServed(c, reason)
 	if anthropic {
 		h.anthropicStreamingAwareError(c, status, "api_error", msg, streamStarted)
 		return true
@@ -88,4 +93,77 @@ func kongRetryAfterSeconds(retryAfter string) string {
 		return ""
 	}
 	return strconv.Itoa(secs)
+}
+
+// kongApplyWSTicketDenyClose 把原生 WS 上的票据拒服翻成关闭帧的状态与文案。
+//
+// 返回 false 表示这次终止与票据无关，调用方继续走原来的上游错误映射。
+//
+// 1013（稍后重试）而不是 1011（内部错误）：与 HTTP 侧给 503 而不是 502 同一个理由——压根没有上游
+// 交互，把它说成上游/网关故障会让客户端与运维都去查错的地方。关闭帧的 reason 有长度上限，所以只带
+// 分类与秒数，不带完整时刻。
+func kongApplyWSTicketDenyClose(
+	c *gin.Context,
+	failoverErr *service.UpstreamFailoverError,
+	intendedStatus *int,
+	errorType, errorCode, message *string,
+	closeStatus *coderws.StatusCode,
+) bool {
+	reason, ok := service.KongTicketDenyReasonOf(failoverErr)
+	if !ok {
+		return false
+	}
+	*intendedStatus = http.StatusServiceUnavailable
+	*errorType = "service_unavailable"
+	*errorCode = "codex_ticket_unavailable:" + reason
+	*message = "codex ticket unavailable for this model [reason: " + reason + "]"
+	if wait := service.KongTicketDenyWaitFromContext(c); wait != nil && !wait.Unknown {
+		if secs := kongRetryAfterSeconds(wait.Earliest); secs != "" {
+			*message += " (earliest retry in " + secs + "s)"
+		}
+	}
+	// 关闭码按原因作用域分：账号级的确实"稍后再来"就可能好（1013）；请求级/系统级原因重试也是同一个
+	// 结论，用 1008（策略违规）才不会误导客户端去重试。两者的身份、分类与归因走同一条路。
+	*closeStatus = coderws.StatusTryAgainLater
+	if !service.KongDenyIsAccountScoped(reason) {
+		*closeStatus = coderws.StatusPolicyViolation
+	}
+	service.MarkKongTicketDenyServed(c, reason)
+	return true
+}
+
+// kongWriteLiveTicketDeny 把 Live 创建路径上的票据拒服写成客户端响应。
+//
+// Live 的创建终点是 `writeLiveCreateError`，不经过 failover 耗尽 handler，所以统一呈现要在这里单独
+// 接一次。返回 false 表示这次失败与票据无关，调用方继续走原来的映射。
+//
+// `live_unsupported` **没有恢复时刻**（这条通路承载不了票据，等多久都一样），所以不设 Retry-After、
+// 也不去编一个恢复时间。
+func (h *OpenAIGatewayHandler) kongWriteLiveTicketDeny(c *gin.Context, err error) bool {
+	var failoverErr *service.UpstreamFailoverError
+	if !errors.As(err, &failoverErr) {
+		return false
+	}
+	reason, ok := service.KongTicketDenyReasonOf(failoverErr)
+	if !ok {
+		return false
+	}
+	service.MarkKongTicketDenyServed(c, reason)
+	h.errorResponse(c, http.StatusServiceUnavailable, "service_unavailable",
+		"Model access is temporarily gated on this transport [reason: "+reason+"]")
+	return true
+}
+
+// kongLiveSidebandDenyClose 给 sideband 上的票据拒服选关闭码与文案。
+//
+// 返回 false 表示这次失败与票据无关，调用方保持原来的 1011。
+func kongLiveSidebandDenyClose(c *gin.Context, err error) (coderws.StatusCode, string, bool) {
+	var denied *service.KongErrTicketDenied
+	if !errors.As(err, &denied) || denied == nil {
+		return 0, "", false
+	}
+	reason := denied.Reason
+	service.MarkKongTicketDenyServed(c, reason)
+	// 关闭帧的 reason 有长度上限，只带分类。
+	return coderws.StatusPolicyViolation, "codex ticket: " + reason, true
 }

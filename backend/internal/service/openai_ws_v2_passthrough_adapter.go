@@ -708,7 +708,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	// `{"model":"gpt-5.1","model":"gpt-6-astra"}` 于是被判成非门控放行，整轮无票交付。
 	// 注入与最终模型核对在写上游之前另有一段。
 	if ticketErr := s.kongTicket.GuardWSFrame(account, firstClientMessage); ticketErr != nil {
-		return wrapOpenAIWSKongTicketError(ticketErr)
+		// 首帧：走统一包装。歧义是请求级原因，不会换号（NextAccountStop），但要拿到同一套身份、
+		// 分类与看板归因——只包"能换号的那部分"等于给其余拒服开一条旁路。
+		return wrapOpenAIWSFirstTurnKongTicketError(c, ticketErr)
 	}
 	requestModel := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "model").String())
 	requestPreviousResponseID := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "previous_response_id").String())
@@ -1188,8 +1190,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if firstTurnModel == "" {
 		firstTurnModel = initialRequestModel
 	}
+	// 首轮的拒服可以换账号（理由见 wrapOpenAIWSFirstTurnKongTicketError）：此刻客户端一个字节都没收到、
+	// relay 还没启动、首帧也还没写上游。后续轮次的同一判定在逐帧过滤器里，那里只能按策略关闭连接。
 	if next, attempt, ticketErr := s.kongTicket.PrepareWSTurn(ctx, account, firstTurnModel, firstClientMessage); ticketErr != nil {
-		return wrapOpenAIWSKongTicketError(ticketErr)
+		return wrapOpenAIWSFirstTurnKongTicketError(c, ticketErr)
 	} else {
 		firstClientMessage = next
 		kongTurnAttempt.Store(attempt)

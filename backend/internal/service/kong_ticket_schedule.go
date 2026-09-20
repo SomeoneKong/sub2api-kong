@@ -59,6 +59,12 @@ const (
 	// 它与 window_closed 必须分开：后者的含义是"还没到能取的时候"，而这里是"取过了、没成"。混在
 	// 一起会把运维引向错误的原因——人工触发已经跳过了窗口，页面却提示"静默或冷却未满"。
 	KongDenyTaskNoTicket = "task_no_ticket"
+	// KongDenyLiveUnsupported 表示这条通路承载不了票据，受保护账号上的门控模型一律拒服。
+	//
+	// Live（realtime）创建之后是 sideband 原始双向转发：没有逐轮注入点，也没有「上游是否接受了这张
+	// 票」的证据。放行等于交付一次不受保障的门控输出，所以按默认拒绝极性拒。换号得不出别的结论，
+	// 因此它是非账号级原因（见 kongDenyIsAccountScoped）。
+	KongDenyLiveUnsupported = "live_unsupported"
 )
 
 // KongTicketParams 是调度的时间参数。默认值的依据见设计 §7.1 / §7.2。
