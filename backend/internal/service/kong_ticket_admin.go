@@ -422,6 +422,29 @@ func (s *KongTicketAdminService) TriggerRefresh(ctx context.Context, accountID i
 	return result, status, nil
 }
 
+// TriggerVerify 立即重验当前票；验不成功即作废。触发后同样回一份新状态。
+func (s *KongTicketAdminService) TriggerVerify(ctx context.Context, accountID int64, model string) (*KongManualVerify, *KongTicketAccountStatus, error) {
+	if s.svc == nil {
+		return nil, nil, fmt.Errorf("票据功能未启用，无法手工验票")
+	}
+	if !s.isGated(model) {
+		return nil, nil, fmt.Errorf("模型 %q 不在门控集合里", model)
+	}
+	result, err := s.svc.TriggerVerify(ctx, accountID, model)
+	if err != nil {
+		return nil, nil, err
+	}
+	account, err := s.accounts.GetAccountView(ctx, accountID)
+	if err != nil || account == nil {
+		return result, nil, nil
+	}
+	status, err := s.statusOf(ctx, account, time.Now())
+	if err != nil {
+		return result, nil, nil
+	}
+	return result, status, nil
+}
+
 // isGated 判断模型是否在门控集合里。
 func (s *KongTicketAdminService) isGated(model string) bool {
 	for _, m := range s.gatedModels {

@@ -144,17 +144,32 @@
                       <p v-if="m.unverified_count > 0" class="text-xs text-gray-500 dark:text-dark-400">
                         候选 {{ m.unverified_count }} 张待验
                       </p>
-                      <!-- 人工干预：立刻走一遍取票/验票，**跳过静默与冷却**（那两条是自动运行用的
-                           保守估计，系统只看得见自己产生的出口活动）。结构性约束仍然生效。 -->
                       <div class="mt-1 flex items-center gap-2">
+                        <!-- 人工干预：立刻走一遍取票/验票，**跳过静默与冷却**（那两条是自动运行用的
+                             保守估计，系统只看得见自己产生的出口活动）。
+                             不能主动取票的账号直接不显示这个按钮——摆一个永远点不动的钮，读者还得
+                             自己去找为什么。判据与服务端的结构性约束同一套：模式、出口、可调度性。 -->
                         <button
+                          v-if="canFetch(row)"
                           type="button"
                           class="btn-secondary px-2 py-0.5 text-xs"
-                          :disabled="readOnly || busy || refreshingKey !== null || row.mode !== 'full'"
-                          :title="row.mode !== 'full' ? '只有 full 模式会主动取票' : '人工干预：立刻取票/验票，跳过静默与冷却'"
+                          :disabled="readOnly || busy || refreshingKey !== null"
+                          title="人工干预：立刻取票或验候选，跳过静默与冷却。有成熟候选时优先验它（走流量出口，不动票据出口）"
                           @click="triggerRefresh(row, m.model)"
                         >
                           {{ refreshingKey === refreshKey(row.account_id, m.model) ? '执行中…' : '立即取票验票' }}
+                        </button>
+                        <!-- 立即验票只针对当前那张票，没票就没有可验的。验证走流量出口，不消耗票据
+                             出口的静默，所以不受 canFetch 那几条约束。**验不通过即作废**。 -->
+                        <button
+                          v-if="liveRemaining(m.current_ticket, row.account_id) > 0 && row.mode !== 'off'"
+                          type="button"
+                          class="btn-secondary px-2 py-0.5 text-xs"
+                          :disabled="readOnly || busy || refreshingKey !== null"
+                          title="立刻重验这张票（走流量出口，不占票据出口静默）。真验出问题才作废；探测失败只报未得出结论、旧票保留"
+                          @click="triggerVerify(row, m.model)"
+                        >
+                          {{ refreshingKey === refreshKey(row.account_id, m.model) ? '执行中…' : '立即验票' }}
                         </button>
                         <span v-if="refreshNote(row.account_id, m.model)" class="text-xs" :class="refreshNoteClass(row.account_id, m.model)">
                           {{ refreshNote(row.account_id, m.model) }}
@@ -707,6 +722,19 @@ async function loadProxies(): Promise<void> {
   }
 }
 
+// 「立即取票验票」能不能点。
+//
+// ⚠️ **判据里刻意不含 `egress_usable`**：那个端点叫 refresh，它不只取票——服务端的决策里
+// 「有成熟候选」优先于取票（`HasCandidate → VerifyCandidate`），而候选验证走**流量出口**，压根
+// 不要求票据出口可用。按 `egress_usable` 藏按钮会把 `egress=none` + 有候选这种真能干活的局面
+// 也一起藏掉，那是无谓地削弱人工干预手段。
+//
+// 剩下两条是真正的结构性约束，不成立时任何主动请求都不会发出：只有 full 在保护范围内，账号不可
+// 调度时一切主动动作都停。既无出口又无候选时服务端会回 deny_reason，页面照实显示。
+function canFetch(row: TicketAccountStatus): boolean {
+  return row.mode === 'full' && row.ready
+}
+
 function refreshKey(accountID: number, model: string): string {
   return `${accountID}::${model}`
 }
@@ -724,6 +752,48 @@ function refreshNoteClass(accountID: number, model: string): string {
 //
 // 拿到票与被拒都算正常结果，区别只在提示文案；只有请求本身失败（未启用、模型不在门控集合、
 // 账号不存在）才是错误。
+// 服务端把该行的最新状态一起回了，直接替换——重新拉 overview 会冲掉其它行未保存的草稿。
+function applyRowStatus(accountID: number, status: TicketAccountStatus | null): void {
+  if (!status) return
+  const list = overview.value?.accounts
+  if (list) {
+    const index = list.findIndex((item) => item.account_id === accountID)
+    if (index >= 0) list.splice(index, 1, status)
+  }
+  rowLoadedAt[accountID] = Date.now()
+}
+
+// 立即验票：只针对当前那张票，**验不成功服务端就把它作废**。所以这是个有副作用的按钮，
+// 文案要说清结果，不能只说"失败了"。
+async function triggerVerify(row: TicketAccountStatus, model: string): Promise<void> {
+  const key = refreshKey(row.account_id, model)
+  refreshingKey.value = key
+  delete refreshNotes[key]
+  try {
+    const res = await codexTicketAPI.triggerVerify(row.account_id, model)
+    const r = res.result
+    if (r?.accepted) {
+      refreshNotes[key] = { text: `票 #${r.ticket_id} 重验通过，仍可用`, ok: true }
+    } else if (r?.revoked) {
+      const why = r.reason ? `：${r.reason}` : ''
+      refreshNotes[key] = { text: `票 #${r.ticket_id} 未通过，已作废${why}`, ok: false }
+    } else if (r?.inconclusive) {
+      // 与"已作废"必须分开说：这时票还在服务，只是这次没测出结论。
+      const why = r.reason ? `：${r.reason}` : ''
+      refreshNotes[key] = { text: `未得出结论，票 #${r.ticket_id} 保留${why}`, ok: false }
+    } else if (r?.not_applicable) {
+      refreshNotes[key] = { text: '没有当前票可验', ok: false }
+    } else {
+      refreshNotes[key] = { text: `未能开始验票：${denyReasonText(r?.deny_reason)}`, ok: false }
+    }
+    applyRowStatus(row.account_id, res.status)
+  } catch (error) {
+    refreshNotes[key] = { text: extractApiErrorMessage(error, '验票失败'), ok: false }
+  } finally {
+    refreshingKey.value = null
+  }
+}
+
 async function triggerRefresh(row: TicketAccountStatus, model: string): Promise<void> {
   const key = refreshKey(row.account_id, model)
   refreshingKey.value = key
@@ -741,15 +811,7 @@ async function triggerRefresh(row: TicketAccountStatus, model: string): Promise<
       if (r?.retry_after) parts.push(`可再试于 ${formatTime(r.retry_after)}`)
       refreshNotes[key] = { text: parts.join('，'), ok: false }
     }
-    // 服务端把该行的最新状态一起回了，直接替换——重新拉 overview 会冲掉其它行未保存的草稿。
-    if (res.status) {
-      const list = overview.value?.accounts
-      if (list) {
-        const index = list.findIndex((item) => item.account_id === row.account_id)
-        if (index >= 0) list.splice(index, 1, res.status)
-      }
-      rowLoadedAt[row.account_id] = Date.now()
-    }
+    applyRowStatus(row.account_id, res.status)
   } catch (error) {
     refreshNotes[key] = { text: extractApiErrorMessage(error, '触发失败'), ok: false }
   } finally {

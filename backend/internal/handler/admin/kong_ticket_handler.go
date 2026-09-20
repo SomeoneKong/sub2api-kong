@@ -139,6 +139,29 @@ func (h *KongTicketHandler) TriggerRefresh(c *gin.Context) {
 	response.Success(c, gin.H{"result": result, "status": status})
 }
 
+// TriggerVerify 立即重验当前票。验不成功即作废，那同样不是错误——页面靠 revoked / reason 说明。
+func (h *KongTicketHandler) TriggerVerify(c *gin.Context) {
+	if !h.ready(c) {
+		return
+	}
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		response.BadRequest(c, "invalid account id")
+		return
+	}
+	var req kongTicketRefreshRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body: "+err.Error())
+		return
+	}
+	result, status, err := h.svc.TriggerVerify(c.Request.Context(), accountID, strings.TrimSpace(req.Model))
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.Success(c, gin.H{"result": result, "status": status})
+}
+
 // ListEvents 分页查事件。
 func (h *KongTicketHandler) ListEvents(c *gin.Context) {
 	if !h.ready(c) {

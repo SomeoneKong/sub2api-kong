@@ -341,7 +341,10 @@ type KongTicketRepository interface {
 	// InsertTicket 插入一张票。第二个返回值为假表示这张票原值已经存在——重复出现不是新信息，
 	// 调用方不得据此延长期限、解除候选跳过标记或触发诊断探测。
 	InsertTicket(ctx context.Context, t *KongTicket) (int64, bool, error)
-	// SetTicketStatus 落指纹结论。仅在票仍为 unverified 时生效，返回是否更新——
+	// TicketStatus 读一张票当前的状态。人工重验要据它区分"已被判不合格"与"没得出结论"——
+	// 前者 verifyTicket 自己已经提交成 rejected，后者旧结论仍然有效。
+	TicketStatus(ctx context.Context, id int64) (string, error)
+	// SetTicketStatus 落指纹结论。票已是 rejected 时不生效，返回是否更新——
 	// 晚到的结果不能覆盖已被改写的状态。
 	SetTicketStatus(ctx context.Context, id int64, status string, attr KongAttribution) (bool, error)
 	// SkipCandidate 标记该候选在本段无票期内不再被选中。

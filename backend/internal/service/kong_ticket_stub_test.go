@@ -125,6 +125,14 @@ func (r *kongStubRepo) VerifiedTickets(_ context.Context, accountID int64, model
 		if status != KongTicketStatusVerified || !expires.After(now) {
 			continue
 		}
+		// 生产侧筛掉 skip：一张 verified 票被标 skip 只有一种来源——注入被上游拒绝，那张票已经
+		// 不作数，不能再当当前票。
+		if st := r.stateOf(t); st != nil && st.SkipUntilNew {
+			continue
+		}
+		if t.SkipUntilNew && r.stateOf(t) == nil {
+			continue
+		}
 		out = append(out, t)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].ExpiresAt.After(out[j].ExpiresAt) })
@@ -248,7 +256,8 @@ func (r *kongStubRepo) SetTicketStatus(_ context.Context, id int64, status strin
 		return *r.setStatusOK, nil
 	}
 	if st := r.tickets[id]; st != nil {
-		if st.Status != KongTicketStatusUnverified {
+		// 与 CommitVerification 同一前置：rejected 排除，verified 可被重验改写。
+		if st.Status == KongTicketStatusRejected {
 			return false, nil
 		}
 		st.Status = status
@@ -269,11 +278,12 @@ func (r *kongStubRepo) CommitVerification(ctx context.Context, id int64, status 
 	if r.commitErr != nil {
 		return false, r.commitErr
 	}
-	// 生产条件：`status = unverified AND skip_until_new = FALSE AND expires_at > now()`。
+	// 生产条件：`status IN (unverified, verified) AND skip_until_new = FALSE AND
+	// expires_at > now()`（verified 是为了人工重验当前票，rejected 排除）。
 	// 逐票判——「任何账号被标过就全都提交失败」是桩自己的错，会掩盖真实的隔离问题。
 	r.mu.Lock()
 	st := r.tickets[id]
-	blocked := st != nil && (st.Status != KongTicketStatusUnverified || st.SkipUntilNew || !st.ExpiresAt.After(time.Now()))
+	blocked := st != nil && (st.Status == KongTicketStatusRejected || st.SkipUntilNew || !st.ExpiresAt.After(time.Now()))
 	r.mu.Unlock()
 	if blocked {
 		return false, nil
@@ -294,11 +304,24 @@ func (r *kongStubRepo) CommitVerification(ctx context.Context, id int64, status 
 	return true, nil
 }
 
+func (r *kongStubRepo) TicketStatus(_ context.Context, id int64) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if st := r.tickets[id]; st != nil {
+		return st.Status, nil
+	}
+	return "", nil
+}
+
 func (r *kongStubRepo) SkipCandidate(_ context.Context, id int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.skipped = append(r.skipped, id)
 	if st := r.tickets[id]; st != nil {
+		// 生产侧只对 unverified 生效：跳过标记是候选池的机制，打在正在服务的票上等于悄悄作废它。
+		if st.Status != KongTicketStatusUnverified {
+			return nil
+		}
 		st.SkipUntilNew = true
 	}
 	return nil

@@ -103,8 +103,12 @@ func scanKongTicket(row interface{ Scan(...any) error }) (*service.KongTicket, e
 // 之后就能构造出这个状态，后果是业务与管理面一致地误报无票，且不报错。行数由票表自身的清理与
 // 留存上限约束，不该在这条查询里再截一刀。
 func (r *kongTicketRepository) VerifiedTickets(ctx context.Context, accountID int64, model string) ([]*service.KongTicket, error) {
+	// **必须筛掉 skip_until_new**：那个标记在一张已 verified 的票上只有一种来源——注入被上游拒绝
+	// （它回发了新票，说明我们这张已经不作数）。不筛的话，一张已知注入无效的票仍会被当成当前票
+	// 反复注入，而且会挡住更早那张仍然合格的票接替。
 	query := `SELECT ` + kongTicketColumns + ` FROM kong_ticket_cache
 		WHERE account_id = $1 AND model = $2 AND status = $3 AND expires_at > now()
+		  AND skip_until_new = FALSE
 		ORDER BY expires_at DESC`
 	rows, err := r.db.QueryContext(ctx, query, accountID, model, service.KongTicketStatusVerified)
 	if err != nil {
@@ -213,13 +217,19 @@ func (r *kongTicketRepository) CommitVerification(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 条件里除了 unverified 还要有未过期与未被跳过：注释一直写着「被跳过时不更新」，
-	// 只比 status 兑现不了它。
+	// 条件里除了状态还要有未过期与未被跳过：注释一直写着「被跳过时不更新」，只比 status
+	// 兑现不了它。
+	//
+	// 前置状态收 unverified **与 verified** 两种：前者是候选首次验证，后者是人工「立即验票」
+	// 重验当前票——只收 unverified 的话那条路永远提交不上，于是每次重验都以「验证期间被改写」
+	// 收尾，把一张其实合格的票判成失效。**rejected 仍然排除**：那是验证期间被撤销的信号，
+	// 不能凭一个此前的结论把它复活。
 	res, err := tx.ExecContext(ctx,
 		`UPDATE kong_ticket_cache
 		 SET status = $1, fingerprint_model = $2, fingerprint_p = $3, fingerprint_probs = $4
-		 WHERE id = $5 AND status = $6 AND skip_until_new = FALSE AND expires_at > now()`,
-		status, attr.Model, attr.P, probs, id, service.KongTicketStatusUnverified)
+		 WHERE id = $5 AND status = ANY($6) AND skip_until_new = FALSE AND expires_at > now()`,
+		status, attr.Model, attr.P, probs, id,
+		pq.Array([]string{service.KongTicketStatusUnverified, service.KongTicketStatusVerified}))
 	if err != nil {
 		return false, fmt.Errorf("commit verification status: %w", err)
 	}
@@ -277,8 +287,27 @@ func (r *kongTicketRepository) SkipCandidatesFor(ctx context.Context, accountID 
 	return nil
 }
 
+// TicketStatus 读一张票当前的状态；票已不存在时返回空串而不是错误——过期清理会删行，那是预期
+// 状态，调用方据空串按"没得出结论"处理即可。
+func (r *kongTicketRepository) TicketStatus(ctx context.Context, id int64) (string, error) {
+	var status string
+	err := r.db.QueryRowContext(ctx, `SELECT status FROM kong_ticket_cache WHERE id = $1`, id).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("query ticket status: %w", err)
+	}
+	return status, nil
+}
+
+// SkipCandidate 标记单张候选。**只对 unverified 生效**——跳过标记是候选池的机制，把它打在一张
+// 正在服务的 verified 票上等于悄悄作废它（VerifiedTickets 会筛掉 skip），而"作废当前票"必须是
+// 显式动作、走 RevokeTicket。
 func (r *kongTicketRepository) SkipCandidate(ctx context.Context, id int64) error {
-	_, err := r.db.ExecContext(ctx, `UPDATE kong_ticket_cache SET skip_until_new = TRUE WHERE id = $1`, id)
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE kong_ticket_cache SET skip_until_new = TRUE WHERE id = $1 AND status = $2`,
+		id, service.KongTicketStatusUnverified)
 	if err != nil {
 		return fmt.Errorf("skip candidate: %w", err)
 	}

@@ -196,6 +196,28 @@ export interface TicketRefreshResult {
   retry_after: string | null
 }
 
+// 立即验票的结果。与取票分开：那个可能取新票，这个只认当前这一张。
+export interface TicketVerifyResult {
+  /** 被验的那张票；没有当前票时为 0。 */
+  ticket_id: number
+  /** 重新自证合格，仍可用。 */
+  accepted: boolean
+  /** 已把它作废：证据完整但归因不合格，或上游明确重发了票。 */
+  revoked: boolean
+  /** 没能完成测量（超时、429、前提失效、写库失败）；旧票与旧结论保留。与 revoked 互斥。 */
+  inconclusive: boolean
+  reason: string
+  /** 压根没票可验，或该账号已退出保护（mode=off）。 */
+  not_applicable: boolean
+  /** 没能开始验的原因（同账号有任务在途之类）。 */
+  deny_reason: string
+}
+
+export interface TicketVerifyResponse {
+  result: TicketVerifyResult | null
+  status: TicketAccountStatus | null
+}
+
 export interface TicketRefreshResponse {
   result: TicketRefreshResult | null
   /** 触发后该行的最新状态；服务端一并返回，避免调用方重拉 overview 冲掉别行的草稿。 */

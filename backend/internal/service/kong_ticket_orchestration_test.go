@@ -25,7 +25,9 @@ type kongStubUpstream struct {
 	fetchHook func()
 
 	// answers 按调用顺序返回；用尽后重复最后一个。
-	answers       []*KongUpstreamAnswer
+	answers []*KongUpstreamAnswer
+	// answerErrFor 按调用序号（从 0 起）覆盖挑战结果，用来构造"一份有效 + 两份失败"这种局面。
+	answerErrFor  map[int]error
 	answerErr     error
 	challengeCall int
 }
@@ -60,6 +62,9 @@ func (u *kongStubUpstream) RunChallenge(_ context.Context, _ *Account, _, _ stri
 	defer u.mu.Unlock()
 	idx := u.challengeCall
 	u.challengeCall++
+	if err, ok := u.answerErrFor[idx]; ok {
+		return nil, err
+	}
 	if u.answerErr != nil {
 		return nil, u.answerErr
 	}
@@ -198,7 +203,7 @@ func TestKongObservedFailureDoesNotEnterCooldown(t *testing.T) {
 
 			cfg, _ := ParseKongTicketConfig(account.Extra)
 			_, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-				7, strings.Repeat("a", 292), c.source, time.Now().Add(time.Hour), nil, time.Now())
+				7, strings.Repeat("a", 292), c.source, time.Now().Add(time.Hour), nil, time.Now(), false)
 			if err == nil {
 				t.Fatal("数字不足时不该判为合格")
 			}
@@ -225,7 +230,7 @@ func TestKongProbesKeepDigitsWhenAttributionFails(t *testing.T) {
 
 	cfg, _ := ParseKongTicketConfig(account.Extra)
 	_, _ = svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-		7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now())
+		7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now(), false)
 
 	if len(repo.probes) == 0 {
 		t.Fatal("没有任何探测记录落库")
@@ -280,7 +285,7 @@ func TestKongVerifyRejectsStaleConclusion(t *testing.T) {
 			accounts.set(changed)
 
 			_, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-				7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now())
+				7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now(), false)
 			if err == nil {
 				t.Fatal("前提已失效，不该给出有效结论")
 			}
@@ -317,7 +322,7 @@ func TestKongVerifyHonorsStatusUpdateResult(t *testing.T) {
 	cfg, _ := ParseKongTicketConfig(account.Extra)
 
 	id, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
-		7, strings.Repeat("a", 292), KongTicketSourceFetch, time.Now().Add(time.Hour), nil, time.Now())
+		7, strings.Repeat("a", 292), KongTicketSourceFetch, time.Now().Add(time.Hour), nil, time.Now(), false)
 	if err == nil || id != 0 {
 		t.Fatalf("状态未更新时不该授予资格，得到 id=%d err=%v", id, err)
 	}

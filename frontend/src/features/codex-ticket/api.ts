@@ -2,6 +2,7 @@ import { apiClient } from '@/api/client'
 import type {
   FingerprintProbe,
   TicketRefreshResponse,
+  TicketVerifyResponse,
   TicketAccountStatus,
   TicketConfigRequest,
   TicketEventPage,
@@ -65,4 +66,28 @@ export async function triggerRefresh(
   return data
 }
 
-export default { getOverview, updateAccountConfig, listEvents, listProbes, triggerRefresh }
+// triggerVerify 立即重验当前票。**真验出问题时服务端会把它作废**（证据完整而归因不合格，或上游
+// 明确重发了票），所以这是一次有副作用的调用；探测失败只报「未得出结论」，旧票保留。
+//
+// 330s 是刻意比服务端大一档：那边的同步验证上限是 kongWaitBudget(300s)，客户端留 30 秒余量，
+// 于是调用方总能拿到真实结论——不会出现"页面报失败、后台还在改票状态"。
+export async function triggerVerify(
+  accountID: number,
+  model: string,
+): Promise<TicketVerifyResponse> {
+  const { data } = await apiClient.post<TicketVerifyResponse>(
+    `${basePath}/accounts/${accountID}/verify`,
+    { model },
+    { timeout: 330_000 },
+  )
+  return data
+}
+
+export default {
+  getOverview,
+  updateAccountConfig,
+  listEvents,
+  listProbes,
+  triggerRefresh,
+  triggerVerify,
+}
