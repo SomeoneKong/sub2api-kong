@@ -297,6 +297,10 @@ const (
 	KongProbeInvalidTicketExpired      = "ticket_expired"
 	KongProbeInvalidNonASCIIDigits     = "non_ascii_digits"
 	KongProbeInvalidScoreFailed        = "score_failed"
+	// KongProbeInvalidStg0Mismatch 表示上游在这次回答里**回报了别的 model**（stg0 判 fail，见
+	// kong_ticket_stg0.go）。这份回答本身可能格式完好，但它不是被请求的那个模型产出的，所以不能
+	// 作为该票的有效指纹——尤其不能拿来标定档位。
+	KongProbeInvalidStg0Mismatch = "stg0_model_mismatch"
 )
 
 // KongNormalizeEventLimit 把分页上限收敛到有效区间。

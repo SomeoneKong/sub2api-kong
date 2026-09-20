@@ -214,9 +214,19 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 		confidence = v
 	}
 
+	// stg0 的白名单与 accept 分开解析：它的取值不受校准资料约束（上游可能回报任何 model 名，
+	// 升级投放的目标压根不在指纹库里），照 accept 那样校验会把正确配置当笔误忽略。
+	stg0, stg0Warnings, err := KongParseStg0Accept(gated, ticketCfg.Stg0Accept)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range stg0Warnings {
+		slog.Warn("codex 票据：stg0 白名单有条目被忽略", "detail", w)
+	}
+
 	access := NewKongAccountAccess(accountRepo, proxyRepo)
 	ticketService := NewKongTicketService(repo, upstream, accountRepo, bank, params,
-		gated, ticketCfg.BatchFetchAllModels, ticketCfg.FetchFusedFingerprint, accept, confidence)
+		gated, ticketCfg.BatchFetchAllModels, ticketCfg.FetchFusedFingerprint, accept, stg0, confidence)
 	adminService := NewKongTicketAdminService(repo, access, params, gated, accept, confidence)
 	// 手工触发要走编排服务的正常决策路径，所以 Admin 需要它。
 	adminService.SetTicketService(ticketService)

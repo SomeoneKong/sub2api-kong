@@ -2259,6 +2259,7 @@ func setDefaults() {
 	// 同一个理由（viper 只解码 AllKeys() 里的键）：本 fork 的票据配置没有 config 文件可依，
 	// 现网全靠 GATEWAY_KONG_CODEX_TICKET_* 环境变量，不注册空默认值就永远读不到。
 	viper.SetDefault("gateway.kong_codex_ticket.accept_extra", DefaultKongTicketAcceptExtra)
+	viper.SetDefault("gateway.kong_codex_ticket.stg0_accept", DefaultKongTicketStg0Accept)
 	viper.SetDefault("gateway.kong_codex_ticket.batch_fetch_all_models", DefaultKongTicketBatchFetchAllModels)
 	viper.SetDefault("gateway.kong_codex_ticket.fetch_fused_fingerprint", DefaultKongTicketFetchFusedFingerprint)
 

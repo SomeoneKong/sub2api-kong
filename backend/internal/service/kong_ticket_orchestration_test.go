@@ -35,6 +35,20 @@ type kongStubUpstream struct {
 	fusedText  string
 	// fusedReadErr 非空时模拟"票拿到了、但正文读失败"（提前 EOF / SSE 错误）。
 	fusedReadErr string
+	// reportedModel / fusedReportedModel 是上游在响应里回报的 model（stg0 的输入）。
+	//
+	// 两者分开：融合样本来自取票请求（**无票状态**），常规挑战带着票发出，两条路径的 stg0 语义相反
+	// ——一个不该判死票、一个该判死。用同一个字段就测不出这个区别。
+	//
+	// 空串表示上游没给这个字段，stg0 判 unknown。默认就是空，所以既有用例不受影响。
+	reportedModel      string
+	fusedReportedModel string
+	// partialAnswerErr 模拟真实读取层的行为：**返回已读到的 answer 连同一个错误**（提前 EOF、坏
+	// JSON、response.failed 都是这样）。
+	//
+	// answerErr / answerErrFor 返回 (nil, err)，覆盖不到"model 已声明、正文才断"这条路径——而那正是
+	// 绕过 stg0 的方式。两者必须都有。
+	partialAnswerErr error
 	// answerErrFor 按调用序号（从 0 起）覆盖挑战结果，用来构造"一份有效 + 两份失败"这种局面。
 	answerErrFor  map[int]error
 	answerErr     error
@@ -92,10 +106,14 @@ func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, mode
 		switch {
 		case readErr != "":
 			probe.FusedReadErr = readErr
+			// 生产侧读失败时回报值**照样带回来**（`response.created` 在流首就到了）。桩不设它，
+			// "断流但上游已经声明了别的模型"这条路径在测试里就等于不存在。
+			probe.FusedReportedModel = u.fusedReportedModel
 		case text != "":
 			probe.Answer = &KongUpstreamAnswer{
 				Text: text, EchoedState: state, StatusCode: 200,
 				LatencyMs: 28000, OutputTokens: kongIntPtr(1200),
+				ReportedModel: u.fusedReportedModel,
 			}
 		default:
 			probe.FusedReadErr = "桩未提供融合正文"
@@ -116,12 +134,20 @@ func (u *kongStubUpstream) RunChallenge(_ context.Context, _ *Account, _, _ stri
 		return nil, u.answerErr
 	}
 	if len(u.answers) == 0 {
-		return &KongUpstreamAnswer{Text: "1,2,3"}, nil
+		return &KongUpstreamAnswer{Text: "1,2,3", ReportedModel: u.reportedModel}, nil
 	}
 	if idx >= len(u.answers) {
 		idx = len(u.answers) - 1
 	}
-	return u.answers[idx], nil
+	// **复制再改**：kongVerifyAnswers() 把同一个指针放进三个槽位，直接写字段会跨份互相污染。
+	answer := *u.answers[idx]
+	answer.ReportedModel = u.reportedModel
+	if u.partialAnswerErr != nil {
+		// 正文残缺但 model 已经拿到：真实读取层就是这样返回的。
+		answer.Text = ""
+		return &answer, u.partialAnswerErr
+	}
+	return &answer, nil
 }
 
 // kongStubAccounts 是账号装载替身，支持在验证中途改变账号。
@@ -168,7 +194,7 @@ func kongTestService(t *testing.T, repo *kongStubRepo, up *kongStubUpstream, acc
 	// 几次取票、或把取票响应也当成一份样本。两者各自的用例显式打开。
 	return NewKongTicketService(repo, up, accounts, bank, params,
 		[]string{"gpt-6-astra"}, false, false,
-		KongTicketAccept{"gpt-6-astra": []string{"gpt-6-astra"}}, 0.9)
+		KongTicketAccept{"gpt-6-astra": []string{"gpt-6-astra"}}, KongStg0Accept{}, 0.9)
 }
 
 // 两个账号共用同一个票据出口时不得并发取票：每次取票都是该出口上的一次活动，并发会互相把

@@ -36,6 +36,11 @@ type KongUpstreamProbe struct {
 	FusedAttempted bool
 	// FusedReadErr 是读正文的失败原因（仅 FusedAttempted 且 Answer 为 nil 时有值）。
 	FusedReadErr string
+	// FusedReportedModel 是读正文失败时**仍然拿到的**上游回报 model（stg0 的输入）。
+	//
+	// 与 Answer 分开正是因为两者的可用性不同：正文残缺不能拿去归因，而 model 声明在流首就到了、
+	// 独立成立。读成功时这个字段为空，回报值在 Answer.ReportedModel 里。
+	FusedReportedModel string
 }
 
 // KongUpstreamAnswer 是一次指纹挑战的结果。
@@ -44,8 +49,11 @@ type KongUpstreamAnswer struct {
 	// EchoedState 非空表示上游**又下发了一张票**，也就是本次注入没被接受——那么这次回答的
 	// 档位反映的不是被验证的那张票，不能用来判定它合格。
 	EchoedState string
-	StatusCode  int
-	LatencyMs   int
+	// ReportedModel 是上游在响应里回报的本次实际使用的 model，stg0 的判据（见 kong_ticket_stg0.go）。
+	// 为空表示没观测到——那是「没测出来」，不是「一致」。
+	ReportedModel string
+	StatusCode    int
+	LatencyMs     int
 	// OutputTokens 为空表示上游没给 usage——那是「未知」，不是「确定为 0」。把未知记成 0 会让
 	// 「这次探测烧了多少额度」这类统计得出与事实相反的结论。
 	OutputTokens *int
@@ -294,13 +302,16 @@ func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Accoun
 		// 成功，不拿 Answer.EchoedState 当"注入未被接受"。
 		fusedRead = true
 		probe.FusedAttempted = true
-		text, outputTokens, readErr := kongReadCodexSSEText(resp.Body)
+		sse, readErr := kongReadCodexSSEText(resp.Body)
 		answer := &KongUpstreamAnswer{
-			StatusCode:   resp.StatusCode,
-			EchoedState:  probe.State,
-			Text:         text,
-			OutputTokens: outputTokens,
-			LatencyMs:    int(time.Since(started).Milliseconds()),
+			StatusCode:  resp.StatusCode,
+			EchoedState: probe.State,
+			Text:        sse.Text,
+			// 融合样本的 stg0 判据同样来自这条流。**读失败也要带回来**：上游可能已经在
+			// response.created 里回报过 model，那一条足以判定，不该因为正文没读完而丢掉。
+			ReportedModel: sse.ReportedModel,
+			OutputTokens:  sse.OutputTokens,
+			LatencyMs:     int(time.Since(started).Milliseconds()),
 		}
 		if readErr != nil {
 			// 读正文失败**不影响取票本身**：票在响应头里，已经拿到了，绝不能因此把整次取票判失败
@@ -308,6 +319,12 @@ func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Accoun
 			//
 			// 但也不能装作没融合：额度已经花了。把失败原因带回去，由编排层留档并记一条 inconclusive。
 			probe.FusedReadErr = readErr.Error()
+			// **回报的 model 要带回来**：它在 response.created 里就到了，而 stg0 判的是"上游说它给了
+			// 哪个模型"，这个结论不因正文残缺而失效。
+			//
+			// 只带 ReportedModel，**不把 answer 挂上去**：下游以 `Answer != nil` 作为"这份正文可以
+			// 拿去归因"的条件，挂上残缺正文会让它被送进 stg1，甚至凑够数字就早停通过。
+			probe.FusedReportedModel = sse.ReportedModel
 			return probe, nil
 		}
 		probe.Answer = answer
@@ -339,27 +356,47 @@ func (u *kongTicketUpstream) RunChallenge(ctx context.Context, account *Account,
 	if resp.StatusCode >= 400 {
 		return answer, fmt.Errorf("挑战请求返回 %d", resp.StatusCode)
 	}
-	text, outputTokens, err := kongReadCodexSSEText(resp.Body)
-	answer.OutputTokens = outputTokens
+	sse, err := kongReadCodexSSEText(resp.Body)
+	answer.OutputTokens = sse.OutputTokens
 	answer.LatencyMs = int(time.Since(started).Milliseconds())
-	answer.Text = text
+	answer.Text = sse.Text
+	// 即使流出错也带回已读到的回报值：stg0 判据在 response.created 就能拿到，而"上游明说给了别的
+	// 模型"这个结论不因正文残缺而失效。
+	answer.ReportedModel = sse.ReportedModel
 	if err != nil {
 		return answer, err
 	}
 	return answer, nil
 }
 
-// kongReadCodexSSEText 从 codex 的 SSE 流里累积回答正文，并取出完成事件带的输出 token 数。
+// kongSSEAnswer 是一次 SSE 读取的产物。
 //
-// 第二个返回值为空表示上游没给 usage。
+// 用结构体而不是多返回值：Text 与 ReportedModel 都是 string，相邻的同类型返回值调用方错序了也能
+// 编译过，而那会把回答正文当成模型名喂进 stg0。
+type kongSSEAnswer struct {
+	Text string
+	// OutputTokens 为空表示上游没给 usage——那是「未知」，不是「确定为 0」。
+	OutputTokens *int
+	// ReportedModel 是上游回报的本次实际使用的 model（stg0 的输入）。为空表示流里没有这个字段。
+	ReportedModel string
+}
+
+// kongReadCodexSSEText 从 codex 的 SSE 流里累积回答正文，并取出完成事件带的输出 token 数与上游
+// 回报的 model。
 //
 // 事件口径与上游一致：`response.output_text.delta` 带文本增量，`response.completed` / `response.done`
 // 表示正常结束，`response.failed` / `error` 是失败。**不吞错误**——半截的回答会被归因当成截断
 // 处理，但「流中途报错」和「模型只答了一半」是两回事，前者要能看见。
-func kongReadCodexSSEText(body io.Reader) (string, *int, error) {
+func kongReadCodexSSEText(body io.Reader) (kongSSEAnswer, error) {
 	var text strings.Builder
 	var outputTokens *int
+	var reportedModel string
 	reader := bufio.NewReaderSize(body, 64*1024)
+	// 收尾时统一组装：下面每条失败路径都要带回已经读到的部分（正文用于诊断，model 与 tokens 说明
+	// 额度花在哪了），逐处手写三个字段必漏。
+	result := func() kongSSEAnswer {
+		return kongSSEAnswer{Text: text.String(), OutputTokens: outputTokens, ReportedModel: reportedModel}
+	}
 
 	// 流首可能有一个 UTF-8 BOM。不吃掉它，第一行就变成 "\ufeffdata: {...}"，`data:` 前缀匹配不上
 	// ——那一整个事件被当作未知字段行忽略，正文少掉第一段。而归因只看「数字够不够」，少一段仍然够，
@@ -388,7 +425,21 @@ func kongReadCodexSSEText(body io.Reader) (string, *int, error) {
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			return fmt.Errorf("SSE 事件解码失败，证据不完整: %w", err)
 		}
-		switch eventType, _ := event["type"].(string); eventType {
+		eventType, _ := event["type"].(string)
+		// 回报的 model：**终止事件的声明覆盖先前的，中途事件只在还没有值时记一次**。
+		//
+		// 终止事件的判定复用上游的 isUpstreamResponseModelTerminalEvent，不自己列——它覆盖
+		// completed / done / failed / incomplete / cancelled / canceled 六种，而手写枚举漏掉
+		// failed 与 incomplete 的后果是：上游在 created 里说 astra、在 failed 里说 luna 时，
+		// 我们只看得见 astra，明确的降档证据被丢掉。
+		//
+		// 上游的口径是「只有终止事件报告实际处理的档位」，中途事件里那个是预告，所以先后顺序不能反。
+		if m := kongExtractReportedModel(event); m != "" {
+			if isUpstreamResponseModelTerminalEvent(eventType) || reportedModel == "" {
+				reportedModel = m
+			}
+		}
+		switch eventType {
 		case "response.output_text.delta":
 			// 字段必须**存在且是字符串**。缺字段与类型不对是同一件事：这条事件本该携带一段正文
 			// 而我们没拿到，正文已经不完整。合法的空字符串仍然接受。
@@ -422,7 +473,7 @@ func kongReadCodexSSEText(body io.Reader) (string, *int, error) {
 	for {
 		line, terminated, err := kongReadSSELine(reader)
 		if err != nil {
-			return text.String(), outputTokens, fmt.Errorf("读取 SSE 流: %w", err)
+			return result(), fmt.Errorf("读取 SSE 流: %w", err)
 		}
 		if !terminated {
 			// 到了流末尾。最后一行没有换行符时它仍然算这个事件的一部分。
@@ -437,7 +488,7 @@ func kongReadCodexSSEText(body io.Reader) (string, *int, error) {
 				}
 			}
 			if err := flush(); err != nil {
-				return text.String(), outputTokens, err
+				return result(), err
 			}
 			break
 		}
@@ -446,11 +497,11 @@ func kongReadCodexSSEText(body io.Reader) (string, *int, error) {
 			// ——按 TrimSpace 判会把它当成边界，于是一个拆成多行 data 的合法事件被提前解码，
 			// 报 JSON 截断、整份挑战作废。那是无谓拒服。
 			if err := flush(); err != nil {
-				return text.String(), outputTokens, err
+				return result(), err
 			}
 			if completed {
 				// 正常完成事件已到，不再等 EOF：继续读只会把一份完整回答拖到读超时。
-				return text.String(), outputTokens, nil
+				return result(), nil
 			}
 			continue
 		}
@@ -461,9 +512,9 @@ func kongReadCodexSSEText(body io.Reader) (string, *int, error) {
 		dataLines = append(dataLines, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
 	}
 	if !completed {
-		return text.String(), outputTokens, fmt.Errorf("SSE 流在 response.completed 之前结束")
+		return result(), fmt.Errorf("SSE 流在 response.completed 之前结束")
 	}
-	return text.String(), outputTokens, nil
+	return result(), nil
 }
 
 // kongSSEMaxLine 是单行上限，与原先 bufio.Scanner 的口径一致。
@@ -533,6 +584,29 @@ func kongExtractOutputTokens(event map[string]any) (int, bool) {
 		return 0, false
 	}
 	return int(raw), true
+}
+
+// kongExtractReportedModel 取事件里上游回报的 model（`response.model`）。
+//
+// 口径与 kongExtractOutputTokens 一致：字段缺失或类型不对一律当"没观测到"返回空串，绝不猜。stg0
+// 把空串判成 unknown 而非不一致——猜错的方向是把一张好票判死（见 KongStg0Accept.Verdict）。
+//
+// 长度上限与上游的 observer 一致（upstreamResponseModelMaxLength）：异常长的值只可能是上游回了
+// 别的东西，截断后入库会让事件里躺着一段无法解释的文本。
+func kongExtractReportedModel(event map[string]any) string {
+	response, ok := event["response"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	model, ok := response["model"].(string)
+	if !ok {
+		return ""
+	}
+	model = strings.TrimSpace(model)
+	if model == "" || len(model) > upstreamResponseModelMaxLength {
+		return ""
+	}
+	return model
 }
 
 func kongExtractSSEError(event map[string]any, nested string) string {

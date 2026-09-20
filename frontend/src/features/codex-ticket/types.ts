@@ -30,6 +30,13 @@ export interface TicketDiagnosis {
   /** 为空表示这次没得出归因（拒答、数字不足、候选未被接受等）。 */
   fingerprint_model: string
   probability: number
+  /**
+   * 这个结论出自哪一层：0 = stg0（上游自己回报的 model），1 或 null = stg1（指纹归因）。
+   *
+   * 显示时必须据它区分来源，**不能按「概率是不是 1」去猜**：stg0 没有概率，上游声明与一次恰好很
+   * 确定的归因是两种可信度完全不同的证据。
+   */
+  stg: number | null
   ticket_source: string
   reason: string
   verification_id: string

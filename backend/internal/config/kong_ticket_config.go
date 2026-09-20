@@ -42,6 +42,27 @@ const DefaultKongTicketAcceptExtra = "gpt-5.6-sol:gpt-6-astra,gpt-5.5"
 // KongTicketAcceptExtraEnv 是 AcceptExtra 对应的环境变量名（viper 的 `.` → `_` 映射结果）。
 const KongTicketAcceptExtraEnv = "GATEWAY_KONG_CODEX_TICKET_ACCEPT_EXTRA"
 
+// KongTicketStg0AcceptEnv 是 Stg0Accept 对应的环境变量名。
+const KongTicketStg0AcceptEnv = "GATEWAY_KONG_CODEX_TICKET_STG0_ACCEPT"
+
+// DefaultKongTicketStg0Accept 是 stg0 白名单的内置默认：**空**，即每个门控模型只接受上游回报它
+// 自己（含快照后缀，如 `gpt-5.6-sol-2026-03-17`）。
+//
+// 默认为空而 AcceptExtra 默认非空，因为两者补偿的东西不同：AcceptExtra 补偿的是指纹归因的测量
+// 噪声，那噪声是客观存在的、不配就会误拒好票；而 stg0 读的是上游自己的声明，没有噪声，"回报了
+// 别的模型"就是确凿的降智证据，不需要预留任何宽容。
+//
+// 它的用途是**升级投放**：上游有时把新模型的流量投到旧模型名上（请求 `gpt-5.6-sol` 回
+// `gpt-6-sol`），那是拿到更好的东西、不该判死票，配 `gpt-5.6-sol:gpt-6-sol` 即可。
+//
+// ⚠️ 默认拒绝极性有代价：上游投放一个**没配过**的新模型时，该模型的票会被 stg0 判 fail，于是不断
+// 判死、不断重取（验证失败冷却限制了速率，但额度仍在烧）。
+//
+// **发现它要看逐模型的诊断行**（管理页面读最近一次最终验证事件，stg0 判死会显示成"上游回报 X"），
+// 而**不是**近三天的业务统计——票被判死后业务在注入前就拒服、压根不产生上游响应 model，那个统计
+// 因此反而会保持安静。两者是不同的数据通路，详见 DESIGN-codex-ticket.md §4.0。
+const DefaultKongTicketStg0Accept = ""
+
 // KongTicketBatchFetchEnv 是 BatchFetchAllModels 对应的环境变量名。
 const KongTicketBatchFetchEnv = "GATEWAY_KONG_CODEX_TICKET_BATCH_FETCH_ALL_MODELS"
 
@@ -87,6 +108,11 @@ const DefaultKongTicketFetchFusedFingerprint = true
 func applyKongTicketEnvOverrides(cfg *KongCodexTicketConfig) {
 	if raw, present := os.LookupEnv(KongTicketAcceptExtraEnv); present {
 		cfg.AcceptExtra = raw
+	}
+	// Stg0Accept 的默认是空串，所以空值语义不像 AcceptExtra 那样会"放宽判据"。仍然显式覆盖：
+	// 将来给它加内置默认时，这一行不在的话空串会被静默忽略，而那个方向同样是放宽。
+	if raw, present := os.LookupEnv(KongTicketStg0AcceptEnv); present {
+		cfg.Stg0Accept = raw
 	}
 }
 
@@ -143,6 +169,14 @@ type KongCodexTicketConfig struct {
 	// （`GATEWAY_KONG_CODEX_TICKET_ACCEPT_EXTRA`）——现网两个实例都没有挂 config 文件，配置全
 	// 从环境变量来，而 map 没法从单个环境变量表达。
 	AcceptExtra string `mapstructure:"accept_extra"`
+
+	// Stg0Accept 是「某个门控模型额外接受哪些**上游回报值**」的白名单，格式与 AcceptExtra 相同
+	// （见 DefaultKongTicketStg0Accept 的语义与代价）。
+	//
+	// ⚠️ **与 AcceptExtra 是两张表，不要合并、也不要互抄值。** AcceptExtra 里的项是指纹区分度
+	// 不足的补偿（sol 接受 gpt-5.5 的归因，因为指纹分不开两者）；stg0 读的是上游自己的声明，把
+	// 那条补偿抄过来会让一次上游明说的降智被放过。
+	Stg0Accept string `mapstructure:"stg0_accept"`
 
 	// FetchFusedFingerprint 决定取票请求是否顺带充当第一份指纹样本（见
 	// DefaultKongTicketFetchFusedFingerprint 的依据与差异说明）。

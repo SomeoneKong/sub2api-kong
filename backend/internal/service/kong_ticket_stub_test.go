@@ -38,7 +38,9 @@ type kongStubRepo struct {
 	insertEventErr  error
 	insertTicketErr error
 	insertProbesErr error
-	setStatusOK     *bool
+	// insertProbesHook 在探测落库时回调，供测试模拟"落库期间前提变了"。
+	insertProbesHook func()
+	setStatusOK      *bool
 	// commitErr 让用例模拟「资格与最终事件的提交失败」。
 	commitErr error
 	// tickets 是**按票 id 保存的真实状态**：status / expires_at / skip_until_new。
@@ -574,6 +576,14 @@ func (r *kongStubRepo) LastEventAt(_ context.Context, _ int64, _ string, eventTy
 }
 
 func (r *kongStubRepo) InsertProbes(_ context.Context, probes []*KongFingerprintProbe) error {
+	r.mu.Lock()
+	hook := r.insertProbesHook
+	r.mu.Unlock()
+	// 落库**期间**前提会变（模式被切走、代理被改、调度资格被取消）。这个钩子让那一段时间在测试里
+	// 真的存在——只在保存前后做断言，看不出"保存开始时成立、提交时已失效"这条路径。
+	if hook != nil {
+		hook()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.insertProbesErr != nil {

@@ -553,6 +553,11 @@ function diagnosisStale(d: TicketDiagnosis, accountID?: number): boolean {
 
 function diagnosisText(d: TicketDiagnosis): string {
   if (d.fingerprint_model) {
+    // stg0 的结论来自上游自己的声明，**没有概率**。显示成 p=1.000 会把它读成"一次恰好很确定的
+    // 归因"，而两者的可信度完全不同；显示成 p=0.000 更糟——看起来像归因失败。
+    if (d.stg === 0) {
+      return `上游回报 ${d.fingerprint_model}（stg0，非指纹归因）`
+    }
     return `${d.fingerprint_model}（p=${d.probability.toFixed(3)}）`
   }
   return d.reason ? `未得出结论：${reasonText(d.reason)}` : '未得出结论'

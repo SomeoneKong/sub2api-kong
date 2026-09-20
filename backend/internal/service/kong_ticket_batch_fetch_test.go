@@ -36,7 +36,9 @@ func kongBatchServiceWith(t *testing.T, repo *kongStubRepo, up *kongStubUpstream
 		KongTicketAccept{
 			kongBatchAstra: []string{kongBatchAstra},
 			kongBatchSol:   []string{kongBatchSol, kongBatchAstra},
-		}, 0.9)
+		},
+		// stg0 白名单留空：桩默认回报与请求一致的 model，用例要验 stg0 时各自放宽。
+		KongStg0Accept{}, 0.9)
 }
 
 // kongBatchSetup 造一个 full + 直连票据出口、业务走代理的账号，并把出口静默设到门槛之上。

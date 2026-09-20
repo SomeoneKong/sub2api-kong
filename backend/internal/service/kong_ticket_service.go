@@ -39,6 +39,11 @@ type KongTicketService struct {
 
 	// accept 记录每个门控模型接受哪些归因结果（永远含自己）。采纳判据只此一份。
 	accept KongTicketAccept
+	// stg0 记录每个门控模型额外接受哪些**上游回报值**。
+	//
+	// 与 accept 是两张表（见 kong_ticket_stg0.go）：那一张补偿指纹归因的测量噪声，这一张处理上游的
+	// 升级投放。互抄值会让一次上游明说的降智被当成测量噪声放过。
+	stg0 KongStg0Accept
 	// confidence 是采纳归因结论所需的概率；不够就再加一份挑战。
 	confidence float64
 
@@ -75,7 +80,7 @@ type kongTicketTask struct {
 }
 
 // NewKongTicketService 创建编排服务。
-func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream, accounts KongAccountLoader, bank *KongFingerprintBank, params KongTicketParams, gatedModels []string, batchFetch, fusedFingerprint bool, accept KongTicketAccept, confidence float64) *KongTicketService {
+func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream, accounts KongAccountLoader, bank *KongFingerprintBank, params KongTicketParams, gatedModels []string, batchFetch, fusedFingerprint bool, accept KongTicketAccept, stg0 KongStg0Accept, confidence float64) *KongTicketService {
 	if confidence <= 0 || confidence >= 1 {
 		confidence = 0.9
 	}
@@ -89,6 +94,7 @@ func NewKongTicketService(repo KongTicketRepository, upstream KongTicketUpstream
 		batchFetch:       batchFetch,
 		fusedFingerprint: fusedFingerprint,
 		accept:           accept,
+		stg0:             stg0,
 		confidence:       confidence,
 		inflight:         make(map[int64]*kongTicketTask),
 		inflightEgress:   make(map[string]*kongTicketTask),
@@ -696,13 +702,14 @@ type kongFetchOne struct {
 	answer *KongUpstreamAnswer
 	// fusedAttempted / fusedReadErr 让调用方区分"没融合"与"融合了但正文读失败"：后者额度已经花了，
 	// 按约定要留一条 inconclusive，而票本身是好的、照常入库。
-	fusedAttempted bool
-	fusedReadErr   string
-	model          string
-	ticketID       int64
-	state          string
-	expires        time.Time
-	err            error
+	fusedAttempted     bool
+	fusedReadErr       string
+	fusedReportedModel string
+	model              string
+	ticketID           int64
+	state              string
+	expires            time.Time
+	err                error
 }
 
 // otherGatedModels 返回除 exclude 之外的门控模型。
@@ -804,7 +811,8 @@ func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account
 					KongTicketSourceFetch, out.expires, capture, taskStartedAt, false,
 					&kongFusedSample{
 						Challenge: *fusedChallenge, Answer: out.answer, ReadErr: out.fusedReadErr,
-						Egress: ticketEgress, OnlyFused: true,
+						ReportedModel: out.fusedReportedModel,
+						Egress:        ticketEgress, OnlyFused: true,
 					})
 			}
 		}(i)
@@ -824,7 +832,8 @@ func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account
 	if lead.fusedAttempted && fusedChallenge != nil {
 		fused = &kongFusedSample{
 			Challenge: *fusedChallenge, Answer: lead.answer, ReadErr: lead.fusedReadErr,
-			Egress: ticketEgress,
+			ReportedModel: lead.fusedReportedModel,
+			Egress:        ticketEgress,
 		}
 	}
 	return s.verifyTicket(ctx, account, cfg, model, lead.ticketID, lead.state, KongTicketSourceFetch,
@@ -986,6 +995,7 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 	out.answer = probe.Answer
 	out.fusedAttempted = probe.FusedAttempted
 	out.fusedReadErr = probe.FusedReadErr
+	out.fusedReportedModel = probe.FusedReportedModel
 	return out
 }
 
@@ -1135,6 +1145,12 @@ type kongFusedSample struct {
 	Answer *KongUpstreamAnswer
 	// ReadErr 是读正文的失败原因，仅在 Answer 为 nil 时有值。
 	ReadErr string
+	// ReportedModel 是读正文失败时**仍然拿到的**上游回报 model。
+	//
+	// 单独一个字段而不是挂进 Answer：下游以 `Answer != nil` 作为"可归因"的条件，挂上残缺正文会被
+	// 送进 stg1 甚至凑够数字早停通过。它只进事件留档——融合样本的 stg0 不判死票（那次请求本来就
+	// 没带票），但"上游当时说它给了什么"必须留得下来，否则事后分不清真降智与该往白名单加一条。
+	ReportedModel string
 	// Egress 是这份样本产生时用的出口——**票据出口**，与常规样本的流量出口不同。
 	Egress string
 	// OnlyFused 为真表示不达标时不再发后续挑战。批内非触发模型用它：此刻没有请求在等那张票，
@@ -1322,6 +1338,106 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 		}
 	}
 
+	// stg0Failed 判上游在这次回答里回报的 model。返回 true 表示 stg0 已判 fail，调用方应当立刻
+	// 停止并把票作废——**不要继续发后面的挑战**，那是分层的全部收益：一道零成本的门已经给出结论，
+	// 再烧两份长答案不会改变它。
+	//
+	// 处置与 candidate_not_accepted 刻意一致（作废候选 + fetch 来源退避）：两者都意味着"这张票此刻
+	// 没法支持这个模型"，区别只在证据来自上游重发票还是上游回报别的模型。
+	//
+	// ⚠️ **必须在 EchoedState 检查之后调用**：上游重发了票说明这次注入压根没被接受，那时回报的 model
+	// 反映的不是被验证的那张票，据它判死票是把别人的锅记在它头上。
+	// stg0Reject 落 stg0 判死的结论：**把上游回报的 model 当作归因结果写进票行**，状态 rejected。
+	//
+	// 为什么借用归因这条通路而不另立一套：下游全都按 fingerprint_probs 工作——页面显示、
+	// kongPickCurrent 按当前白名单重判、离线重算。用同一种表达，这些地方自动得出正确结论（回报值
+	// 不在白名单里，那张票永远不会被选为当前票），不必在每处加一个 stg0 分支。
+	//
+	// P 记 1.0 并在事件里标 `stg: 0`：这不是概率估计，是上游自己的声明。两者的可信度不同，混起来看
+	// 会把一条确凿证据读成"归因恰好很确定"。
+	stg0Reject := func(probe *KongFingerprintProbe, reported string, part int) (int64, error) {
+		probe.InvalidReason = kongStrPtr(KongProbeInvalidStg0Mismatch)
+		probe.CountedInAverage = false
+		probes = append(probes, probe)
+
+		// **落结论之前复核前提**，与 stg1 那条路径同一道关口。
+		//
+		// CommitVerification 的条件（状态、期限、未被跳过）补不上这个保护——它看不到账号的 mode、
+		// 调度资格与出口配置。少了这一段，验证期间把流量代理换掉时，**旧出口上测到的 mismatch 会被
+		// 用来判死一张票**，而那个结论属于已经不存在的环境。那是无谓拒服。
+		//
+		// 前提失效时只留观测，不改票状态、不淘汰候选、不推进冷却：什么都没测出来。
+		if lost := s.recheckVerify(ctx, snap, time.Now()); lost != nil {
+			probe.InvalidReason = kongStrPtr(KongProbeInvalidStaleResult)
+			return failBeforeConclusion(KongOutcomeInconclusive,
+				map[string]any{
+					"reason": "stale_result", "stg": 0,
+					"reported_model": reported, "detail": lost.Error(),
+				},
+				fmt.Errorf("stg0 结论作废，前提已失效: %w", lost))
+		}
+
+		if insErr := saveProbes(); insErr != nil {
+			slog.Error("kong ticket: stg0 判死时证据落库失败",
+				"account_id", account.ID, "model", model, "ticket_id", ticketID, "error", insErr)
+		}
+
+		// **落库之后再复核一次**，与 stg1 那条路径同一道关口。证据落库可能耗上一段时间，期间前提照样
+		// 会变（模式被切走、代理被改、调度资格被取消），而 CommitVerification 的条件只看票状态、期限
+		// 与跳过标记，补不上这个保护。只在保存之前复核，等于拿一个「保存开始时成立」的前提去作废票。
+		//
+		// 这里用 `finish` 而不是 `failBeforeConclusion`：探测刚才已经存过，后者会再存一遍。
+		// 那几条观测的 invalid_reason 仍是 stg0_mismatch——观测本身是真的，作废的只是据它下的结论。
+		if lost := s.recheckVerify(ctx, snap, time.Now()); lost != nil {
+			return finish(0, KongOutcomeInconclusive,
+				map[string]any{
+					"reason": "stale_after_probe_persist", "stg": 0,
+					"reported_model": reported, "requested_model": model,
+					"part": part, "verification_id": verificationID, "detail": lost.Error(),
+				},
+				fmt.Errorf("stg0 结论作废，前提已失效: %w", lost))
+		}
+		detail := map[string]any{
+			"reason": "stg0_model_mismatch", "stg": 0,
+			// 回报值必须入库：判死一张票时要能回答"上游到底说它给了什么"，否则无从区分真降智与
+			// "该往 stg0_accept 加一条"。
+			"reported_model": reported, "requested_model": model,
+			"part": part, "verification_id": verificationID,
+			// fingerprint 这个键是 buildFinalEvent 填事件 FingerprintModel 的来源，而管理面的
+			// latestDiagnosis 读的是事件列、不读票行。不写它，页面会把一张**已经判死**的票显示成
+			// "未得出结论"，摘要里也看不到上游回报了什么。
+			"fingerprint": reported,
+		}
+		// **冷却写在提交之后**：`failCooldown` 会同步写一条冷却事件，那是一次数据库往返，期间前提照样
+		// 会变（改代理、切模式、取消调度资格），而提交只检查票状态、期限与跳过标记。放在提交之前等于在
+		// 最后一道复核与提交之间又开一个写库窗口，那个窗口里失效的前提没人再核。
+		pctx, cancel := persistCtx()
+		committed, commitErr := s.repo.CommitVerification(pctx, ticketID, KongTicketStatusRejected,
+			KongAttribution{Model: reported, P: 1, Probs: map[string]float64{reported: 1}},
+			buildFinalEvent(KongOutcomeFailure, detail))
+		cancel()
+		if commitErr != nil {
+			return 0, fmt.Errorf("落 stg0 结论: %w", commitErr)
+		}
+		if !committed {
+			// 票在这期间已过期、被撤销或被跳过。结论过时，不能凭它改写任何状态——但**回报值要留着**，
+			// 否则这条由上游自己给出的降档声明在并发撤销下会完全失去可追溯性。
+			return finish(0, KongOutcomeInconclusive,
+				map[string]any{
+					"reason": "ticket_changed_during_verify", "stg": 0,
+					"reported_model": reported, "requested_model": model,
+					"part": part, "verification_id": verificationID,
+				},
+				fmt.Errorf("票在验证期间已被改写，stg0 结论作废"))
+		}
+		// 同期其它旧候选一并淘汰：降智是账号/时段级的现象，逐张验只会把同一个结论重复烧一遍额度。
+		// 必须在提交**之后**——SkipCandidatesFor 会把 unverified 候选全标掉，含正在验的这张，而提交
+		// 的条件里有 skip_until_new = FALSE。冷却同理：结论没落库就不该罚出口。
+		failCooldown("stg0_model_mismatch")
+		skipDrySpell("stg0_model_mismatch")
+		return 0, fmt.Errorf("%w：上游回报 %s，不是请求的 %s", ErrKongTicketDowngraded, reported, model)
+	}
+
 	var (
 		answers []KongFingerprintAnswer
 		result  *KongFingerprintResult
@@ -1398,7 +1514,30 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 			}
 		}
 
-		if attrErr == nil && s.accept.Accepts(model, kongProbsOf(attributed), s.confidence) {
+		// stg0 在融合样本上的语义**与常规挑战相反**：这一份产生于取票请求，那次请求**本来就没带票**
+		// （票是它的产物）。所以上游回报别的模型，说的是"无票时会被降智"——那正是我们需要票的理由，
+		// 不是刚取到的这张票不合格。据它判死票会把一张好票扼掉，是无谓拒服。
+		//
+		// 处置因此是**丢弃这一份样本**，而不是作废票：与"归因不达标"走同一条路（leader 重跑常规挑战，
+		// 那时带着票、走流量出口，stg0 才有判定意义；非触发模型不重跑、票留候选池）。
+		stg0Bad := fused.Answer != nil && s.stg0.Verdict(model, fused.Answer.ReportedModel) == KongStg0Fail
+		// 正文读失败时回报值仍要入事件：样本不可用，但"上游当时说它给了什么"是这次调用唯一留下的
+		// 判据。空着就等于这条声明在断流时彻底消失。**不参与 stg0Bad**——票是这次请求的产物，
+		// 据无票时的回报判死它是无谓拒服。
+		stg0Reported := fused.ReportedModel
+		if stg0Bad {
+			reason = "fused_stg0_mismatch"
+			probe.InvalidReason = kongStrPtr(KongProbeInvalidStg0Mismatch)
+			stg0Reported = fused.Answer.ReportedModel
+			// 归因本身可能完全正常（回答能解析、甚至达标），只是它不是这个模型产出的。那时 attrErr
+			// 为 nil，而下面两处都要一个非 nil 的原因——缺了它 `%w` 会打出 `%!w(<nil>)`，事件里躺着
+			// 一条没人看得懂的记录。
+			if attrErr == nil {
+				attrErr = fmt.Errorf("上游回报 %s，不是请求的 %s", stg0Reported, model)
+			}
+		}
+
+		if !stg0Bad && attrErr == nil && s.accept.Accepts(model, kongProbsOf(attributed), s.confidence) {
 			// 达标：一次上游请求就完成了取票 + 验票，后面整个挑战循环都不必跑。
 			result = attributed
 			fusedAccepted = true
@@ -1422,7 +1561,7 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 				return failBeforeConclusion(KongOutcomeInconclusive,
 					map[string]any{
 						"reason": reason, "fused": true, "retry": false,
-						"detail": attrErrText(attrErr),
+						"detail": attrErrText(attrErr), "reported_model": stg0Reported,
 					},
 					fmt.Errorf("融合样本不足以判定，留作候选: %w", attrErr))
 			}
@@ -1434,6 +1573,7 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 				Detail: map[string]any{
 					"reason": reason, "fused": true, "verification_id": verificationID,
 					"final": false, "retry": true, "detail": attrErrText(attrErr),
+					"reported_model": stg0Reported,
 				},
 			})
 		}
@@ -1466,6 +1606,18 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 			}
 		}
 
+		// **stg0 的判定必须排在 runErr 之前**：回报的 model 在流首（response.created）就到了，
+		// 而"上游说它给了别的模型"这个结论不因正文残缺而失效。
+		//
+		// 顺序上仍然让 EchoedState 优先——上游重发了票说明这次注入压根没被接受，那时回报的 model
+		// 反映的不是被验证的那张票。读流失败时拿不到响应头以外的东西，EchoedState 照样有效。
+		//
+		// ⚠️ 少了这一段，上游只要「先在 created 里声明别的模型、然后断流」就能绕过整个 stg0：
+		// 这一份被 continue 跳过，后两份正常作答，stg1 放行——净效果是放行降智。
+		if answer != nil && answer.EchoedState == "" &&
+			s.stg0.Verdict(model, answer.ReportedModel) == KongStg0Fail {
+			return stg0Reject(probe, answer.ReportedModel, i+1)
+		}
 		if runErr != nil {
 			probe.InvalidReason = kongStrPtr(KongProbeInvalidTruncated)
 			probes = append(probes, probe)
@@ -1492,7 +1644,6 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 			return failBeforeConclusion(KongOutcomeFailure, map[string]any{"reason": "candidate_not_accepted"},
 				ErrKongTicketNotAccepted)
 		}
-
 		attributed, attrErr := takeAnswer(probe, answer.Text, challenge.ExpectedCount)
 		if attrErr != nil {
 			// 还没有任何可用回答。留下这一份的观测，继续下一条挑战。
@@ -1595,7 +1746,6 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 			result.Prediction, result.Probability, model, s.accept.Of(model),
 			s.accept.Mass(model, probs), s.confidence)
 		grantedID = 0
-		failCooldown("not_target_model")
 	}
 
 	// 资格与最终事件同一个事务。事件写失败时资格不得对任何请求可见。
@@ -1622,6 +1772,10 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 		//
 		// 提交之后这张票已是 rejected，不在 `SkipCandidatesFor` 的 unverified 范围内，只有别的
 		// 旧候选会被标掉，正是想要的效果。
+		// 冷却与候选预算同理，都要在提交之后：`failCooldown` 会同步写一条冷却事件（一次数据库往返），
+		// 放在提交之前等于在最后一道复核与提交之间开一个没人再核的写库窗口；结论没落库时罚出口本身也
+		// 没有依据。
+		failCooldown("not_target_model")
 		skipDrySpell("not_target_model")
 		// 结论已落库，这才是"本次测出的真降档"。包上 sentinel 供人工路径辨识（见
 		// ErrKongTicketDowngraded），文本原样保留——调用方与页面都按文本显示原因。
