@@ -10,7 +10,8 @@
         </h1>
         <p v-if="page?.account" class="mt-2 text-sm text-gray-500 dark:text-dark-300">
           #{{ page.account.account_id }} · 模式 {{ page.account.mode }} · 票据出口
-          {{ egressLabel(page.account.ticket_egress) }} · 流量出口 {{ egressLabel(page.account.traffic_egress) }}
+          <span :title="egressTitle(page.account.ticket_egress)">{{ egressLabel(page.account.ticket_egress) }}</span>
+          · 流量出口 <span :title="egressTitle(page.account.traffic_egress)">{{ egressLabel(page.account.traffic_egress) }}</span>
           <span v-if="!page.account.ready" class="text-amber-700 dark:text-amber-300">· 诊断暂停：{{ page.account.not_ready }}</span>
         </p>
       </header>
@@ -111,6 +112,18 @@
           </table>
         </div>
       </section>
+
+      <!-- 这个账号的事件。票表回答"手上有哪些票"，事件流回答"它们是怎么来的、为什么没成"——
+           排查时两者要对着看，跳回总览页再筛一次账号是多余的一步。表与总览页共用同一个组件。 -->
+      <TicketEventTable
+        v-if="page?.account"
+        class="mt-6"
+        :account-id="accountID"
+        :account-names="{ [accountID]: page.account.name }"
+        :model-options="modelOptions"
+        :proxies="proxies"
+        title="这个账号的事件"
+      />
     </div>
   </AppLayout>
 </template>
@@ -118,9 +131,12 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
+import { adminAPI } from '@/api/admin'
 import AppLayout from '@/components/layout/AppLayout.vue'
+import type { Proxy } from '@/types'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import codexTicketAPI from './api'
+import TicketEventTable from './TicketEventTable.vue'
 import type { TicketDetailPage, TicketDetailRow } from './types'
 
 const route = useRoute()
@@ -140,7 +156,23 @@ const now = ref(Date.now())
 let ticker: ReturnType<typeof setInterval> | null = null
 const notes = ref<Record<number, { text: string; ok: boolean }>>({})
 
+const proxies = ref<Proxy[]>([])
+
 const tickets = computed<TicketDetailRow[]>(() => page.value?.tickets ?? [])
+
+/**
+ * 事件筛选器的模型选项。
+ *
+ * **不能只从票推**：取票失败、`fetch_skipped`、312 被拒都产生事件却不产生票，而票还会被过期清理、
+ * 本页又有行数上限——正在排查的那个模型很可能一张票都没有，于是从筛选器里消失。所以以**这个账号的
+ * 门控模型**为主（`account.models` 就是逐门控模型的状态），再把票里出现过的补进来，后者覆盖"已退出
+ * 门控但留着历史票"的情况。
+ */
+const modelOptions = computed(() => {
+  const names = new Set<string>((page.value?.account?.models ?? []).map((m) => m.model))
+  for (const t of tickets.value) names.add(t.model)
+  return [...names].sort().map((m) => ({ value: m, label: m }))
+})
 
 function liveRemaining(t: TicketDetailRow): number {
   const elapsed = Math.floor((now.value - loadedAt.value) / 1000)
@@ -249,8 +281,38 @@ function probsText(t: TicketDetailRow): string {
     .join(' · ')
 }
 
+/**
+ * egressLabel 把出口键里的 `proxy:<id>` 显示成代理名。裸 id 在这一行毫无信息量——看的人要知道
+ * 走的是哪个代理，而不是去代理管理页对号。
+ *
+ * 只动这一种形态：`direct` / `none` / `proxy:unset` 是语义值，按原样显示。**查不到对应代理时
+ * 保留原串**（代理被删了，或列表还没加载完）——换成"未知"会把那个 id 丢掉，而排查"配置指向哪个
+ * 代理"恰恰需要它。
+ */
 function egressLabel(key: string): string {
-  return key || '—'
+  const m = /^proxy:(\d+)$/.exec(key ?? '')
+  if (!m) return key || '—'
+  const proxy = proxies.value.find((pr) => String(pr.id) === m[1])
+  return proxy ? proxy.name : key
+}
+
+// egressTitle 给出口键配一个完整形态的 tooltip：代理名之外还要能看到 id 与连接串。
+function egressTitle(key: string): string {
+  const m = /^proxy:(\d+)$/.exec(key ?? '')
+  if (!m) return key
+  const proxy = proxies.value.find((pr) => String(pr.id) === m[1])
+  return proxy ? `${key} · ${proxy.protocol}://${proxy.host}:${proxy.port}` : key
+}
+
+async function loadProxies(): Promise<void> {
+  try {
+    // 代理是运维级的量（十几个），一次取完；用分页默认的 20 会让靠后的代理查不到名字。
+    const list = await adminAPI.proxies.list(1, 200)
+    proxies.value = list.items ?? []
+  } catch {
+    // 拿不到代理只影响出口那一行的显示（退回 proxy:<id> 原串），不值得在页面上报错。
+    proxies.value = []
+  }
 }
 
 // 只有日期与今天不同时才带日期：同一天的票挤满日期会把时刻淹掉。
@@ -267,6 +329,7 @@ function formatTime(iso: string): string {
 
 onMounted(() => {
   void load()
+  void loadProxies()
   ticker = setInterval(() => {
     now.value = Date.now()
   }, 1000)
