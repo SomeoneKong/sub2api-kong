@@ -68,6 +68,25 @@
                       <span :title="egressTitle(row.traffic_egress)">{{ egressLabel(row.traffic_egress) }}</span>
                     </p>
                     <p v-if="!row.ready" class="mt-1 text-xs text-amber-700 dark:text-amber-300">诊断暂停：{{ row.not_ready }}</p>
+                    <!-- stg0（上游回报的 model）近三天的观测。放在账号列而不是票那一列：它统计的是
+                         **业务请求**，与某一张票的生命周期无关，是这个账号"有没有在被降智"的读数。
+                         逐模型一行——票与结论都是 (账号, 模型) 绑定的，合成一个数就分不清是哪个模型。 -->
+                    <div v-if="row.models?.length" class="mt-2">
+                      <p class="text-xs text-gray-500 dark:text-dark-400">stg0（近三天）</p>
+                      <template v-for="m in row.models" :key="`stg0-${m.model}`">
+                        <p class="text-xs" :class="stg0Class(m.stg0)">
+                          {{ m.model }} {{ stg0Line(m.stg0) }}
+                        </p>
+                        <!-- 回报值原文是这块信息里最可操作的部分：上游投放新模型时照着它往
+                             stg0_accept 加一条即可。只给比例的话不知道该加什么。 -->
+                        <p
+                          v-if="stg0Reported(m.stg0).length"
+                          class="pl-3 text-xs text-rose-700 dark:text-rose-300"
+                        >
+                          回报：{{ stg0Reported(m.stg0).map((r) => `${r.model} ×${r.count}`).join('、') }}
+                        </p>
+                      </template>
+                    </div>
                     <!-- 下一层：这个账号名下的全部票（含已过期与已拒的），每张都能单独验。 -->
                     <RouterLink
                       :to="`/admin/kong-ticket/accounts/${row.account_id}`"
@@ -196,19 +215,6 @@
                            几天前的旧结论上，只有这一行能看出现在根本没在采样。 -->
                       <p v-if="m.last_sample" class="text-xs text-gray-500 dark:text-dark-400">
                         取样 {{ sampleText(m.last_sample) }} · {{ formatTime(m.last_sample.at) }}
-                      </p>
-                      <!-- stg0（上游回报的 model）近三天的观测。它与上面两行的来源不同：这里统计的是
-                           **业务请求**，样本量比验票高两个数量级，所以比例才有意义。 -->
-                      <p class="text-xs" :class="stg0Class(m.stg0)">
-                        {{ stg0Text(m.stg0) }}
-                      </p>
-                      <!-- 回报值原文是这块信息里最可操作的部分：上游投放新模型时照着它往
-                           stg0_accept 加一条即可。只给比例的话不知道该加什么。 -->
-                      <p
-                        v-if="stg0Reported(m.stg0).length"
-                        class="text-xs text-rose-700 dark:text-rose-300"
-                      >
-                        回报：{{ stg0Reported(m.stg0).map((r) => `${r.model} ×${r.count}`).join('、') }}
                       </p>
                     </div>
                   </td>
@@ -598,15 +604,16 @@ function sampleText(n: TicketSampleNote): string {
   return parts.join('，')
 }
 
-// stg0（上游回报的 model）近三天的观测文案。
+// stg0（上游回报的 model）观测文案。窗口与标题由模板的块级标题给出，这里只留数字——每行前面
+// 还要带模型名，重复"stg0（近三天）"会把这一列挤满。
 //
 // 三种情况必须能分开：**无样本**（窗口内没请求，或统计没查到）、**全都没观测到回报值**、以及
 // 真的有不一致。把第一种显示成 "0%" 会被读成"查过了、没问题"，第二种更危险——它看起来像"没被
 // 降智"，其实是这项观测根本没工作。
-function stg0Text(s: TicketStg0Stats | null): string {
-  if (!s || s.total === 0) return 'stg0（近三天）：无样本'
+function stg0Line(s: TicketStg0Stats | null): string {
+  if (!s || s.total === 0) return '无样本'
   const rate = ((s.mismatch / s.total) * 100).toFixed(2)
-  const parts = [`stg0（近三天）：不一致 ${s.mismatch}/${s.total}（${rate}%）`]
+  const parts = [`不一致 ${s.mismatch}/${s.total}（${rate}%）`]
   if (s.unknown > 0) parts.push(`未观测 ${s.unknown}`)
   if (s.unknown === s.total) parts.push('← 全部未观测，这个 0 不代表没被降智')
   return parts.join(' · ')
