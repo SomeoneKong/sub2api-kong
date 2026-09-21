@@ -256,6 +256,9 @@ type OpenAIForwardResult struct {
 	// UpstreamEndpoint is the actual upstream API path used for this request.
 	// It avoids guessing when one downstream protocol can use multiple upstream endpoints.
 	UpstreamEndpoint string
+	// KongRequestFeatures 是本次上送的请求特征（fork 专有，见 kong_ticket_request_feature.go）。
+	// nil 表示这条通路没记到任何特征——非门控模型，或该通路尚未接采集。
+	KongRequestFeatures *KongRequestFeatures
 	// ServiceTier is the final tier sent upstream after policy rewriting.
 	// The upstream response declaration remains separate above and is reconciled
 	// at usage-recording time, where the credential protocol is available.

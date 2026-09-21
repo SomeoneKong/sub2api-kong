@@ -443,13 +443,16 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			UpstreamResponseServiceTier:   responseModelObserver.ServiceTier(),
 			ServiceTier:                   resolvedOpenAIUpstreamServiceTierFromObserver(responseModelObserver, extractOpenAIServiceTier(reqBody)),
 			ReasoningEffort:               extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel),
-			Stream:                        reqStream,
-			OpenAIWSMode:                  true,
-			UpstreamTerminalEvent:         upstreamTerminalEvent,
-			ResponseHeaders:               lease.HandshakeHeaders(),
-			Duration:                      time.Since(startTime),
-			FirstTokenMs:                  firstTokenMs,
-			ClientDisconnect:              clientDisconnected,
+			// [kong] 请求特征：payload 是上送的那个 map，票据注入原地改过它的 client_metadata。
+			// [kong] 请求特征：准入时记下的那份（含上游回发的 state，由 GuardWSDownstream 补记）。
+			KongRequestFeatures:   kongTicketAttempt.FeatureSnapshot(),
+			Stream:                reqStream,
+			OpenAIWSMode:          true,
+			UpstreamTerminalEvent: upstreamTerminalEvent,
+			ResponseHeaders:       lease.HandshakeHeaders(),
+			Duration:              time.Since(startTime),
+			FirstTokenMs:          firstTokenMs,
+			ClientDisconnect:      clientDisconnected,
 		}
 	}
 

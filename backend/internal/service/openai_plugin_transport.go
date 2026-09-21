@@ -16,6 +16,12 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 	if err != nil {
 		return nil, err
 	}
+	// [kong] 把本次发送的特征记录器挂到出站请求上，调用方据它组装用量行（见
+	// kong_ticket_request_feature.go）。就地换 context 而不是返回一个新请求：调用方持有的就是这个
+	// 指针，换掉整个对象会让它手里那份失去记录器，而发送尚未开始，此刻没有并发读者。
+	if attempt != nil && attempt.Features != nil {
+		*request = *request.WithContext(kongWithFeatures(request.Context(), attempt.Features))
+	}
 	response, err := s.sendOpenAIUpstream(request, proxyURL, account)
 	if err != nil {
 		return response, err

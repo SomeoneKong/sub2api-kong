@@ -28,8 +28,9 @@ func (g *KongTicketGateway) PrepareWSMapPayload(ctx context.Context, account *Ac
 	if err != nil {
 		return nil, kongEnsureDenial(ctx, err)
 	}
+	clientState := kongOutboundStateFromWSMap(payload)
 	if grant.NotApplicable {
-		return &KongUpstreamAttempt{Model: model}, nil
+		return kongNewAttempt(model, nil, clientState, clientState), nil
 	}
 	if !grant.Allowed {
 		denied := &KongErrTicketDenied{Reason: grant.DenyReason}
@@ -41,13 +42,22 @@ func (g *KongTicketGateway) PrepareWSMapPayload(ctx context.Context, account *Ac
 	meta, ok := payload["client_metadata"]
 	if !ok || meta == nil {
 		payload["client_metadata"] = map[string]any{kongWSTurnStateMetadataKey: grant.State}
-		return &KongUpstreamAttempt{Model: model, Grant: grant}, nil
+		return kongNewAttempt(model, grant, clientState, kongObservedState(grant.State)), nil
 	}
 	typed, ok := meta.(map[string]any)
 	if !ok {
 		// 已有的 client_metadata 不是对象，无法在不破坏它的前提下注入。放行等于这一轮不受保障。
 		return nil, &KongErrTicketDenied{Reason: "client_metadata_not_object"}
 	}
-	typed[kongWSTurnStateMetadataKey] = grant.State
-	return &KongUpstreamAttempt{Model: model, Grant: grant}, nil
+	// **不能就地改这个内层 map**：调用方的 payload 只在顶层做过浅拷贝
+	// （buildOpenAIWSCreatePayload），`client_metadata` 与客户端原始请求体是同一个对象。就地写会
+	// 把票留在那份请求体里，而 WS 重试循环复用它——下一次准入读到的"客户端自带票"就成了上一次
+	// 注入的那张（换账号重试时更糟：上一个账号的票会跟着发给下一个账号）。
+	next := make(map[string]any, len(typed)+1)
+	for k, v := range typed {
+		next[k] = v
+	}
+	next[kongWSTurnStateMetadataKey] = grant.State
+	payload["client_metadata"] = next
+	return kongNewAttempt(model, grant, clientState, kongObservedState(grant.State)), nil
 }

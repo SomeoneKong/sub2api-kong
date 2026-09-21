@@ -138,6 +138,9 @@ type openAIWSPassthroughUsageMeta struct {
 	requestedReasoningEffort atomic.Pointer[string]
 	requestModel             atomic.Pointer[string]
 	upstreamModel            atomic.Pointer[string]
+	// [kong] 本轮准入记下的请求特征记录器（见 kong_ticket_request_feature.go）。
+	// 与上面几项同样是**逐轮**的：一次会话每轮各有自己的票，记连接级的值会把上一轮算到这一轮头上。
+	kongFeatures atomic.Pointer[KongFeatureRecorder]
 
 	// 仅在 client->upstream filter goroutine 中读写；Load 侧通过上方原子指针同步。
 	sessionRequestModel string
@@ -196,6 +199,21 @@ func (m *openAIWSPassthroughUsageMeta) updateFromResponseCreate(policyOutput []b
 	m.serviceTier.Store(extractOpenAIServiceTierFromBody(policyOutput))
 	m.reasoningEffort.Store(extractOpenAIReasoningEffortFromBody(policyOutput, mappedModel, requestModelForFrame))
 	m.storeTurnModels(requestModelForFrame, policyOutput)
+}
+
+// storeKongFeatures 记下这一轮准入产出的特征记录器。
+//
+// 每轮都要存，**未注入的轮次存 nil**：沿用上一轮的记录器会让这一轮的用量行顶着上一轮的票 id 与
+// 指纹显示，那是彻头彻尾的错误陈述。
+func (m *openAIWSPassthroughUsageMeta) storeKongFeatures(attempt *KongUpstreamAttempt) {
+	if m == nil {
+		return
+	}
+	if attempt == nil {
+		m.kongFeatures.Store(nil)
+		return
+	}
+	m.kongFeatures.Store(attempt.Features)
 }
 
 func (m *openAIWSPassthroughUsageMeta) storeTurnModels(requestModel string, upstreamPayload []byte) {
@@ -1138,6 +1156,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 				payload = next
 				kongTurnAttempt.Store(attempt)
+				usageMeta.storeKongFeatures(attempt)
 			}
 			out, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, model, payload)
 			// 多轮 passthrough usage：仅在成功（non-block / non-err）
@@ -1197,6 +1216,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	} else {
 		firstClientMessage = next
 		kongTurnAttempt.Store(attempt)
+		// 首帧不经逐帧过滤器，这里是它唯一的记录点。
+		usageMeta.storeKongFeatures(attempt)
 	}
 	upstreamFirstMessageSent := false
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
@@ -1286,6 +1307,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 					Stream:                        true,
 					OpenAIWSMode:                  true,
+					KongRequestFeatures:           usageMeta.kongFeatures.Load().Snapshot(),
 					UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(turn.TerminalEventType),
 					ResponseHeaders:               cloneHeader(handshakeHeaders),
 					Duration:                      turn.Duration,
@@ -1459,6 +1481,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 		Stream:                        true,
 		OpenAIWSMode:                  true,
+		KongRequestFeatures:           usageMeta.kongFeatures.Load().Snapshot(),
 		UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(relayResult.TerminalEventType),
 		ResponseHeaders:               cloneHeader(handshakeHeaders),
 		Duration:                      relayResult.Duration,

@@ -65,12 +65,26 @@ type KongUpstreamAttempt struct {
 	// Grant 非空表示本次注入了票，交付前要判定上游是否接受。为空表示本次未受保护
 	// （账号不是 full 模式），此时只收票、不判定。
 	Grant *KongTicketGrant
+	// Features 是这次发送的请求特征记录器（见 kong_ticket_request_feature.go）。
+	//
+	// 挂在 attempt 上而不是请求级的某个地方：它与票同为**单次发送**的属性，failover 换账号重发时
+	// 上一次的特征不该跟着算到下一个账号的用量行上。
+	Features *KongFeatureRecorder
 	// ResponseID 是上游给这一轮分配的 id，由本轮第一个带 id 的下行事件绑上。
 	//
 	// 有了它才能判断一个终端或 error 事件到底属于哪一轮——否则一个针对上一轮的控制帧错误回包会被
 	// 当成本轮结束，把保护提前摘掉。它只在绑定的那一刻写一次（WS 上用 CAS 换一份新副本），
 	// 之后只读。
 	ResponseID string
+}
+
+// FeatureSnapshot 取这次发送记下的请求特征。**attempt 为 nil 是常态**（非门控模型、功能未启用），
+// 所以取值必须容得下它——调用点散在各协议的用量行组装处，那里漏一个 nil 判断就是一次 panic。
+func (a *KongUpstreamAttempt) FeatureSnapshot() *KongRequestFeatures {
+	if a == nil {
+		return nil
+	}
+	return a.Features.Snapshot()
 }
 
 // KongTicketGateway 把编排服务接到转发链路上。
@@ -103,6 +117,20 @@ func (g *KongTicketGateway) IsGatedModel(model string) bool {
 	return g.gatedModels[strings.TrimSpace(model)]
 }
 
+// kongNewAttempt 建一次发送的 attempt，并把请求侧的特征一次记全。
+//
+// 三条通路共用它，所以"记哪些、怎么记"只有一份：漏在某一条通路上不会报错，只会让那条路的用量行
+// 永远缺特征，而那正是最难发现的一种缺陷。
+func kongNewAttempt(model string, grant *KongTicketGrant, clientState, outbound kongStateObservation) *KongUpstreamAttempt {
+	ticketID := int64(0)
+	if grant != nil {
+		ticketID = grant.TicketID
+	}
+	recorder := &KongFeatureRecorder{}
+	recorder.recordOutbound(clientState, outbound, ticketID)
+	return &KongUpstreamAttempt{Model: model, Grant: grant, Features: recorder}
+}
+
 // PrepareUpstream 在一次上游发送之前做准入并注入票。
 //
 // 返回的 attempt 必须交给 AfterUpstream。拿不到合格票时返回 *KongErrTicketDenied，
@@ -131,6 +159,12 @@ func (g *KongTicketGateway) PrepareUpstream(ctx context.Context, req *http.Reque
 	if model == "" || !g.gatedModels[model] {
 		return nil, nil
 	}
+	// 客户端自带的那个 state 要在注入**之前**取：注入会覆盖这个头，之后就再也读不到它了。
+	// full 模式下它正是"客户端手里那张是什么档"的唯一证据。
+	clientState := kongOutboundStateFromHeader(req.Header)
+	attempt := func(grant *KongTicketGrant) *KongUpstreamAttempt {
+		return kongNewAttempt(model, grant, clientState, kongOutboundStateFromHeader(req.Header))
+	}
 	// Live 这条通路**承载不了票据**：创建之后是 sideband 原始双向转发，既没有逐轮注入点，也没有
 	// 「上游是否接受了这张票」的证据。按默认拒绝极性拒服，而不是放行一次不受保障的门控会话。
 	// 非账号级原因（换号也是同一个结论），所以它带 NextAccountStop、立刻进入耗尽呈现。
@@ -155,7 +189,7 @@ func (g *KongTicketGateway) PrepareUpstream(ctx context.Context, req *http.Reque
 	// 这是当前唯一可达的非生成端点：embeddings / images / realtime 各有自己的模型白名单校验，受门控的
 	// codex 文本模型到不了那里。
 	if kongIsNonGeneratingUpstreamPath(req.URL) {
-		return &KongUpstreamAttempt{Model: model}, nil
+		return attempt(nil), nil
 	}
 
 	grant, err := g.svc.EnsureTicket(ctx, account.ID, model)
@@ -166,7 +200,7 @@ func (g *KongTicketGateway) PrepareUpstream(ctx context.Context, req *http.Reque
 	if grant.NotApplicable {
 		// 该账号没开 full。哪个账号要保护是人工按观察结果配的，没配的照常服务——
 		// 只是这次输出不受票据保障，也不做交付判定。
-		return &KongUpstreamAttempt{Model: model}, nil
+		return attempt(nil), nil
 	}
 	if !grant.Allowed {
 		denied := &KongErrTicketDenied{Reason: grant.DenyReason}
@@ -176,7 +210,7 @@ func (g *KongTicketGateway) PrepareUpstream(ctx context.Context, req *http.Reque
 		return nil, denied
 	}
 	req.Header.Set(openAICodexTurnStateHeader, grant.State)
-	return &KongUpstreamAttempt{Model: model, Grant: grant}, nil
+	return attempt(grant), nil
 }
 
 // kongNonGeneratingUpstreamPathSuffix 是不产出模型内容的上游端点。
@@ -207,9 +241,11 @@ func (g *KongTicketGateway) AfterUpstream(ctx context.Context, account *Account,
 		return nil
 	}
 	state := strings.TrimSpace(extractOpenAICodexTurnState(resp.Header))
+	// 上游回发的 state 一律记进特征，**三种模式都记**：对 full 它等于"没接受我们注入的那张"，
+	// 对 off / observe 它是这条请求上游给了哪一档的直接读数。收票在前，这样入库的 id 也能一并记上。
 	if state != "" {
 		// 三种模式都收票：模式切到 full 时缓存里已有票可用，observe 也靠它触发诊断探测。
-		g.svc.ObserveState(ctx, account.ID, attempt.Model, state)
+		attempt.Features.RecordReissued(state, g.svc.ObserveState(ctx, account.ID, attempt.Model, state))
 	}
 	if attempt.Grant == nil || state == "" {
 		return nil
@@ -371,9 +407,10 @@ func (g *KongTicketGateway) PrepareWSTurn(ctx context.Context, account *Account,
 	if err != nil {
 		return payload, nil, kongEnsureDenial(ctx, err)
 	}
+	clientState := kongOutboundStateFromWSFrame(payload)
 	if grant.NotApplicable {
 		// 该账号没开 full，照常服务：不注入、不判定。
-		return payload, &KongUpstreamAttempt{Model: model}, nil
+		return payload, kongNewAttempt(model, nil, clientState, clientState), nil
 	}
 	if !grant.Allowed {
 		denied := &KongErrTicketDenied{Reason: grant.DenyReason}
@@ -391,7 +428,7 @@ func (g *KongTicketGateway) PrepareWSTurn(ctx context.Context, account *Account,
 	if reason := kongWSVerifyInjectedState(next, grant.State); reason != "" {
 		return payload, nil, &KongErrTicketDenied{Reason: "inject_unverified: " + reason}
 	}
-	return next, &KongUpstreamAttempt{Model: model, Grant: grant}, nil
+	return next, kongNewAttempt(model, grant, clientState, kongOutboundStateFromWSFrame(next)), nil
 }
 
 // GuardWSDownstream 在一帧下行事件交付客户端之前判定本轮注入是否被接受。
@@ -411,20 +448,48 @@ func (g *KongTicketGateway) GuardWSDownstream(ctx context.Context, account *Acco
 	if state == "" {
 		return nil
 	}
-	model := ""
-	if attempt != nil {
-		model = attempt.Model
-	}
-	if model != "" {
-		// 三种模式都收票：模式切到 full 时缓存里已有票可用，observe 也靠它触发诊断探测。
-		// 这条是原生 WS 路径上唯一的收票入口——只走 HTTP 的话，纯 WS 业务的账号永远采不到样本。
-		g.svc.ObserveState(ctx, account.ID, model, state)
-	}
+	g.observeWSReissued(ctx, account, attempt, state)
 	if attempt == nil || attempt.Grant == nil {
 		return nil
 	}
+	model := attempt.Model
 	g.svc.RevokeUsedTicket(ctx, account.ID, model, attempt.Grant.TicketID)
 	return &KongErrDeliveryBlocked{AccountID: account.ID, Model: model}
+}
+
+// ObserveWSDownstream 只做**收票与记特征**，不做交付判定。
+//
+// 它存在的理由是 ctx_pool 那条路上有一个死角：下行帧的处理整块挂在"还能写客户端"这个条件下
+// （见 openai_ws_forwarder_ingress.go 的 clientDisconnected 分支），客户端中途断开后，上游后续发来的
+// `response.metadata` 仍被读到、用量行照常结算，却既不收票也不记特征。收票是免费样本、特征是那条
+// 用量行唯一的降智证据，两者都不该取决于客户端还连不连着。
+//
+// **刻意不含交付判定**：断连之后没有任何业务输出会送出去，此时再产出 KongErrDeliveryBlocked 只会
+// 给调用方凭空加一条错误路径。判定仍然只在写客户端那条路上做（GuardWSDownstream）。
+func (g *KongTicketGateway) ObserveWSDownstream(ctx context.Context, account *Account, attempt *KongUpstreamAttempt, payload []byte) {
+	if !g.Enabled() || account == nil || len(payload) == 0 {
+		return
+	}
+	if eventType, _, _ := parseOpenAIWSEventEnvelope(payload); eventType != "response.metadata" {
+		return
+	}
+	state := kongWSTurnStateFromEvent(payload)
+	if state == "" {
+		return
+	}
+	g.observeWSReissued(ctx, account, attempt, state)
+}
+
+// observeWSReissued 是两条 WS 下行入口共用的收票 + 记特征。
+//
+// 三种模式都收票：模式切到 full 时缓存里已有票可用，observe 也靠它触发诊断探测。这条是原生 WS
+// 路径上唯一的收票入口——只走 HTTP 的话，纯 WS 业务的账号永远采不到样本。与 HTTP 侧同一条：
+// 回发的 state 连同它入库的 id 一起记进特征。
+func (g *KongTicketGateway) observeWSReissued(ctx context.Context, account *Account, attempt *KongUpstreamAttempt, state string) {
+	if attempt == nil || attempt.Model == "" {
+		return
+	}
+	attempt.Features.RecordReissued(state, g.svc.ObserveState(ctx, account.ID, attempt.Model, state))
 }
 
 // kongWSTurnStateFromEvent 从 `response.metadata` 事件里取票。

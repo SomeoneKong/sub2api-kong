@@ -2146,9 +2146,11 @@ func (s *KongTicketService) RevokeUsedTicket(ctx context.Context, accountID int6
 //
 // observe 模式下它还负责触发诊断探测——那是这个模式存在的理由：告诉运维「这个账号当前在什么
 // 档位」，人工据此决定要不要给它开 full。探测走业务出口，不占用票据出口的静默。
-func (s *KongTicketService) ObserveState(ctx context.Context, accountID int64, model, state string) {
+// 返回这张票在库里的 id（0 表示没入库：空串、长度黑名单这类预期拒绝，或持久化失败）。**重复出现
+// 的同一张票也返回它原来的 id**——那是同一张票，用量行据此就能看出"上游一直在回发同一个东西"。
+func (s *KongTicketService) ObserveState(ctx context.Context, accountID int64, model, state string) int64 {
 	if strings.TrimSpace(state) == "" {
-		return
+		return 0
 	}
 	n := len(state)
 	s.logEvent(ctx, &KongTicketEvent{
@@ -2169,7 +2171,7 @@ func (s *KongTicketService) ObserveState(ctx context.Context, accountID int64, m
 				Detail: map[string]any{"error": err.Error(), "phase": "store_ticket"},
 			})
 		}
-		return
+		return 0
 	}
 	if !inserted {
 		// 同一张票重复出现不是新信息：不解除跳过标记，也不触发诊断探测。
@@ -2181,7 +2183,7 @@ func (s *KongTicketService) ObserveState(ctx context.Context, accountID int64, m
 			Outcome: KongOutcomeSkipped, StateLen: &n, TicketID: &ticketID,
 			Detail: map[string]any{"reason": "duplicate_state"},
 		})
-		return
+		return ticketID
 	}
 	// 新到的 observed 票是「新信息」：解除本段无票期里的跳过标记。
 	if clearErr := s.repo.ClearSkipMarks(ctx, accountID, model); clearErr != nil {
@@ -2192,6 +2194,7 @@ func (s *KongTicketService) ObserveState(ctx context.Context, accountID int64, m
 		})
 	}
 	s.maybeObserveProbe(ctx, accountID, model, ticketID, state, expiresAt)
+	return ticketID
 }
 
 // maybeObserveProbe 在 observe 模式下用刚收到的票跑一次诊断探测。
