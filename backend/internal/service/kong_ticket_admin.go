@@ -79,6 +79,9 @@ type KongTicketModelStatus struct {
 	// 归因结论只在验证真正跑起来时才有。一个账号可能一直在收票、但每张都因长度黑名单（312）
 	// 或间隔未满被挡在验证之前——那时 Diagnosis 只会停在上一次的旧结论上，运维看不出「现在
 	// 根本没在采样」。两者必须分开表达。
+	//
+	// ⚠️ 判据是取样的**全部**出口（见 kongSampleEventTypes）。漏掉一个的后果不是少显示一条，
+	// 而是这一行停在某个更早的事件上、继续声称一件已经不成立的事。
 	LastSample *KongTicketSampleNote `json:"last_sample"`
 }
 
@@ -410,35 +413,39 @@ func (s *KongTicketAdminService) latestDiagnosis(ctx context.Context, accountID 
 	return nil, nil
 }
 
-// lastSample 取最近一次取样处置（observe 事件）。
+// kongSampleEventTypes 是「取样」的全部出口。判据是**这个事件是否回答"现在在采什么样"**：
 //
-// 它回答的是「现在还在采样吗、采到的是什么」：312 被长度黑名单挡掉、间隔未满跳过、去重命中，
-// 这些都只写 observe 事件，一条也不会进 verify 流。只读 verify 的话，一个持续只能拿到降智票的
-// 账号会显示成「最近一次结论是 astra」——那个结论可能是好几天前的。
+//   - fetch —— 主动取票，成败都算一次取样（失败那条也带 state_len，正是"取到的是降智档"）
+//   - fetch_skipped —— 取票请求压根没发出（缺凭据这类本地失败）
+//   - observe —— 被动收票，含长度黑名单挡掉与按原值去重
+//   - probe_skipped —— 间隔未满、账号不可调度，没有采
+//
+// 集中列一次而不是在调用处枚举：漏掉任一个都不会报错，只会让这一行停在某个更早的事件上、
+// 声称一件已经不成立的事。verify 与 observe_probe 不在其中——前者是结论（归 Diagnosis），
+// 后者只标记"observe 探测开始了"，两者都不说明采到的是什么。
+var kongSampleEventTypes = []string{
+	KongEventFetch, KongEventFetchSkipped, KongEventObserve, KongEventProbeSkipped,
+}
+
+// lastSample 取最近一次取样处置。
+//
+// 它回答的是「现在还在采样吗、采到的是什么」，与 Diagnosis 的「最近一次归因结论」是两件事：
+// 一个账号可能一直在收票、而每张都被长度黑名单或间隔未满挡在验证之前，那时 Diagnosis 只会停在
+// 好几天前的旧结论上，只有这一行能看出现在采到的是什么。
 func (s *KongTicketAdminService) lastSample(ctx context.Context, accountID int64, model string) (*KongTicketSampleNote, error) {
-	// 两类事件都要看，取较新的那条。取样的处置分散在两处：收票本身与长度黑名单、去重写 observe，
-	// 而「间隔未满」「账号不可调度」写的是 probe_skipped。只查一种就会漏掉一半原因，页面显示成
-	// 空原因——那恰恰是「为什么这个账号一直没有新结论」最常见的答案。
-	var latest *KongTicketEvent
-	for _, eventType := range []string{KongEventObserve, KongEventProbeSkipped} {
-		events, _, err := s.repo.ListEvents(ctx, &KongTicketEventFilter{
-			AccountIDs: []int64{accountID},
-			Models:     []string{model},
-			EventTypes: []string{eventType},
-			Limit:      1,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("查取样事件: %w", err)
-		}
-		for _, event := range events {
-			if latest == nil || event.CreatedAt.After(latest.CreatedAt) {
-				latest = event
-			}
-		}
+	events, _, err := s.repo.ListEvents(ctx, &KongTicketEventFilter{
+		AccountIDs: []int64{accountID},
+		Models:     []string{model},
+		EventTypes: kongSampleEventTypes,
+		Limit:      1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("查取样事件: %w", err)
 	}
-	if latest == nil {
+	if len(events) == 0 {
 		return nil, nil
 	}
+	latest := events[0]
 	note := &KongTicketSampleNote{
 		At:       latest.CreatedAt,
 		Outcome:  latest.Outcome,

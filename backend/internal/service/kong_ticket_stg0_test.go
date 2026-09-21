@@ -605,3 +605,79 @@ func TestKongTicketDetailDistinguishesStg0Conclusion(t *testing.T) {
 		t.Errorf("#%d 没有已提交的结论，来源应当未知，实得 %s", noEventTicket.ID, got[noEventTicket.ID])
 	}
 }
+
+// 取样行回答的是「现在还在采什么样」，判据必须覆盖取样的**每一个**出口。
+//
+// 线上现象：账号连续几天只能取到 312（被长度黑名单挡在验证之前，写 observe/skipped），之后取到一张
+// 292 并进了验证流。那次取票只写 fetch 事件，于是这一行仍停在几天前那条 312 上——它声称"现在被黑
+// 名单挡着、没在采样"，而实际此刻采到的是 292 且正在验证。这一行的全部用途就是这个信号，信号本身
+// 反了比没有更糟。
+func TestKongLastSampleReflectsLatestFetch(t *testing.T) {
+	const model = kongBatchAstra
+	repo, _, svc := kongManualFixture(t, model)
+	now := time.Now()
+	ticket := kongSeedCurrentTicket(repo, model, now)
+	ctx := context.Background()
+
+	denylisted := 312
+	accepted := 292
+	events := []*KongTicketEvent{
+		// 昨天：收到 312，被长度黑名单挡在验证之前。
+		{
+			AccountID: 1, Model: model, EventType: KongEventObserve, Outcome: KongOutcomeSkipped,
+			StateLen: &denylisted, CreatedAt: now.Add(-12 * time.Hour),
+			Detail: map[string]any{"reason": "state_len_denylisted"},
+		},
+		// 此刻：取到 292，直接进验证流——这一步只写 fetch。
+		{
+			AccountID: 1, Model: model, EventType: KongEventFetch, Outcome: KongOutcomeSuccess,
+			StateLen: &accepted, TicketID: &ticket.ID, CreatedAt: now.Add(-time.Minute),
+			Detail: map[string]any{},
+		},
+		// 验证事件不是取样：它属于结论侧（诊断行），不该顶替取样行。
+		{
+			AccountID: 1, Model: model, EventType: KongEventVerify, Outcome: KongOutcomeFailure,
+			TicketID: &ticket.ID, CreatedAt: now,
+			Detail: map[string]any{"reason": "candidate_not_accepted", "final": true},
+		},
+	}
+	for _, ev := range events {
+		if err := repo.InsertEvent(ctx, ev); err != nil {
+			t.Fatalf("写事件: %v", err)
+		}
+	}
+
+	views := &kongStubAdminAccounts{views: []KongAccountView{
+		{ID: 1, Ready: true, Extra: map[string]any{KongTicketModeKey: string(KongTicketModeFull)}},
+	}}
+	admin := NewKongTicketAdminService(repo, views, KongDefaultTicketParams(),
+		[]string{model}, svc.accept, svc.confidence)
+	admin.SetTicketService(svc)
+
+	status, err := admin.statusOf(ctx, &views.views[0], now)
+	if err != nil {
+		t.Fatalf("查账号状态: %v", err)
+	}
+	if len(status.Models) != 1 {
+		t.Fatalf("模型数 = %d, want 1", len(status.Models))
+	}
+	sample := status.Models[0].LastSample
+	if sample == nil {
+		t.Fatal("取样行不该为空：刚取到过票")
+	}
+	// 解引用再打印：`%v` 打指针只会给出地址，看不出实际停在哪一张票上。
+	gotLen := "无"
+	if sample.StateLen != nil {
+		gotLen = strconv.Itoa(*sample.StateLen)
+	}
+	if gotLen != strconv.Itoa(accepted) {
+		t.Errorf("取样长度应当是最近一次取到的 %d，实得 %s——页面会显示成仍被黑名单挡着",
+			accepted, gotLen)
+	}
+	if sample.Reason == "state_len_denylisted" {
+		t.Error("取样原因仍是长度黑名单，那是十二小时前那张票的处置")
+	}
+	if sample.Outcome != KongOutcomeSuccess {
+		t.Errorf("取样结果 = %q, want %q", sample.Outcome, KongOutcomeSuccess)
+	}
+}

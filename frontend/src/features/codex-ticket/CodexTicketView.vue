@@ -582,10 +582,18 @@ function diagnosisText(d: TicketDiagnosis): string {
   return d.reason ? `未得出结论：${reasonText(d.reason)}` : '未得出结论'
 }
 
+// 取样处置的 outcome 兜底文案。成功取票不带 reason（没什么可解释的），直出 `success` 会让这一行
+// 看起来像半成品，而它恰恰是"现在采到的是什么"最常见的那一档。
+const SAMPLE_OUTCOME_TEXT: Record<string, string> = {
+  success: '取到票',
+  failure: '取票失败',
+  skipped: '未取样',
+}
+
 function sampleText(n: TicketSampleNote): string {
   const parts: string[] = []
   if (n.reason) parts.push(reasonText(n.reason))
-  else parts.push(n.outcome)
+  else parts.push(SAMPLE_OUTCOME_TEXT[n.outcome] ?? n.outcome)
   if (n.state_len !== null) parts.push(`长度 ${n.state_len}`)
   return parts.join('，')
 }
