@@ -26,6 +26,8 @@ type kongStubUpstream struct {
 	fetchErrFor   map[string]error
 	// fetchHook 在取票时被调用，用于构造并发时序。
 	fetchHook func()
+	// credHook 模拟凭据准备阶段（在 SentAt 之前），用来验证那一段不进取票耗时。
+	credHook func()
 
 	// answers 按调用顺序返回；用尽后重复最后一个。
 	answers []*KongUpstreamAnswer
@@ -72,6 +74,7 @@ func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, mode
 	u.mu.Lock()
 	u.fetchCalls++
 	hook := u.fetchHook
+	credHook := u.credHook
 	// 按模型覆盖：批量取票要能构造「触发模型成功、另一个模型失败」这种局面。
 	modelErr, hasModelErr := u.fetchErrFor[model]
 	modelState, hasModelState := u.fetchStateFor[model]
@@ -79,20 +82,26 @@ func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, mode
 		u.fusedCalls++
 	}
 	u.mu.Unlock()
+	// 顺序与生产实现一致：凭据准备（buildCodexRequest → GetAccessToken，可能读缓存或同步刷新
+	// OAuth）在前，之后才把请求交给传输层。SentAt 取在两者之间，所以凭据那段不计入耗时。
+	if credHook != nil {
+		credHook()
+	}
+	sentAt := time.Now()
 	if hook != nil {
 		hook()
 	}
 	if hasModelErr {
-		return &KongUpstreamProbe{StatusCode: 500}, modelErr
+		return &KongUpstreamProbe{StatusCode: 500, SentAt: sentAt}, modelErr
 	}
 	if u.fetchErr != nil {
-		return &KongUpstreamProbe{StatusCode: 500}, u.fetchErr
+		return &KongUpstreamProbe{StatusCode: 500, SentAt: sentAt}, u.fetchErr
 	}
 	state := u.fetchState
 	if hasModelState {
 		state = modelState
 	}
-	probe := &KongUpstreamProbe{State: state, StatusCode: 200}
+	probe := &KongUpstreamProbe{State: state, StatusCode: 200, SentAt: sentAt}
 	// 生产侧在融合时把正文读回来当第一份样本。桩照做，否则融合路径在测试里根本走不到。
 	//
 	// **FusedAttempted 必须照生产设**：它表示"发起过融合"，与是否读到答案分开。下游用它判断要不要

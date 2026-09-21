@@ -41,6 +41,13 @@ type KongUpstreamProbe struct {
 	// 与 Answer 分开正是因为两者的可用性不同：正文残缺不能拿去归因，而 model 声明在流首就到了、
 	// 独立成立。读成功时这个字段为空，回报值在 Answer.ReportedModel 里。
 	FusedReportedModel string
+	// SentAt 是**请求交给传输层的时刻**，零值表示一个字节都没发出去。
+	//
+	// 调用方拿它算这次取票的上游耗时。起点必须是这里而不是"进入取票函数"：凭据准备（读 token
+	// 缓存、必要时同步刷新 OAuth、等刷新锁）在它之前，把那段算进耗时会让同批成员的反推起点
+	// **凭空对齐**——批内共用一个账号，第一个成员触发刷新、其余等锁，实际发送本就错开，而那
+	// 正是要看见的信号。
+	SentAt time.Time
 }
 
 // KongUpstreamAnswer 是一次指纹挑战的结果。
@@ -275,7 +282,9 @@ func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Accoun
 		if errors.As(err, &notSent) {
 			return nil, &KongErrUpstreamNotAttempted{Err: err}
 		}
-		return nil, fmt.Errorf("取票请求失败: %w", err)
+		// 真实传输失败：包已经出去了，所以仍要带回 SentAt——调用方据它记耗时，而"多久之后失败的"
+		// 与"多久之后成功的"同样是诊断信息。
+		return &KongUpstreamProbe{SentAt: started}, fmt.Errorf("取票请求失败: %w", err)
 	}
 	fusedRead := false
 	defer func() {
@@ -290,6 +299,7 @@ func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Accoun
 	probe := &KongUpstreamProbe{
 		State:      extractOpenAICodexTurnState(resp.Header),
 		StatusCode: resp.StatusCode,
+		SentAt:     started,
 	}
 	if resp.StatusCode >= 400 {
 		return probe, fmt.Errorf("取票请求返回 %d", resp.StatusCode)

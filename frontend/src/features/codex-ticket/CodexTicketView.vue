@@ -322,6 +322,12 @@
                       >{{ i > 0 ? ' · ' : ' ' }}{{ tm.model }} {{ tm.p.toFixed(3) }}</span>
                     </span>
                     <span v-else-if="ev.fingerprint_model">归因 {{ ev.fingerprint_model }} </span>
+                    <!-- 耗时单独提出来：事件的时间列是请求**完成**时刻，同一批的两条 fetch 因此
+                         按各自耗时先后排开，看起来像串行。把耗时摆在旁边，减回发起时刻就知道
+                         它们是同时发出的。 -->
+                    <span v-if="durationOf(ev) !== null" class="whitespace-nowrap">
+                      耗时 {{ durationText(durationOf(ev)!) }}
+                    </span>
                     <span v-if="ev.detail && compactDetail(ev.detail)" class="font-mono">{{ compactDetail(ev.detail) }}</span>
                     <button
                       v-if="verificationIDOf(ev)"
@@ -1030,10 +1036,23 @@ function topModelsOf(ev: TicketEvent): { model: string; p: number }[] {
   return out
 }
 
-// top_models 已在前面逐项展开，这里去掉以免同一份数据出现两次——它也是 detail 里最长的一项。
+// durationOf 取这条事件对应的上游请求耗时（毫秒），没有则 null。
+function durationOf(ev: TicketEvent): number | null {
+  const raw = ev.detail?.duration_ms
+  return typeof raw === 'number' ? raw : null
+}
+
+// 秒是这里的自然刻度：融合取票实测 27–44s，毫秒数只会让人去数位数。
+function durationText(ms: number): string {
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
+}
+
+// top_models 已在前面逐项展开，duration_ms 也已单独显示，这里都去掉以免同一份数据出现两次
+// ——top_models 还是 detail 里最长的一项。
 function compactDetail(detail: Record<string, unknown>): string {
   const rest: Record<string, unknown> = { ...detail }
   delete rest.top_models
+  delete rest.duration_ms
   if (!Object.keys(rest).length) return ''
   const text = JSON.stringify(rest)
   return text.length > 160 ? `${text.slice(0, 160)}…` : text

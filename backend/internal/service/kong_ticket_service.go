@@ -878,15 +878,28 @@ type kongFetchArgs struct {
 func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in kongFetchArgs) kongFetchOne {
 	out := kongFetchOne{model: in.model}
 	leader := in.batchIndex == 0
-	// batched 只在真的成批时才往事件里加字段：非批量路径的事件形状保持原样。
 	batched := in.batchTotal > 1
+	// **取票耗时必须进事件，否则并发看起来像串行。** 事件的 CreatedAt 是请求**完成**时刻（理由见
+	// 下面的 sentAt），批内各条 fetch 于是在事件流里显示成一前一后——而它们是同一瞬间发出的，
+	// 时间差只是各自响应耗时之差。融合取票要等整份挑战答案生成完（实测 27–44s），这个差可以有
+	// 几十秒，足以让人得出"批量取票是串行的"这个错误结论。记下耗时，读事件的人各自减回发起时刻
+	// 就能自证。
+	//
+	// 起点取自 `probe.SentAt`（请求交给传输层的那一刻），**不是**进入本函数的时刻：凭据准备在那
+	// 之前，而批内共用一个账号——第一个成员触发 OAuth 刷新、其余等锁时实际发送本就错开，把那段
+	// 算进耗时会让反推起点凭空对齐，恰好掩盖要看的信号。一个字节都没发出去时它是零值，那时没有
+	// 上游耗时可言（与 resolve_proxy 那条 fetch_skipped 一致，两处都不记这个字段）。
+	var sentAt, sendStart time.Time
 	detail := func(extra map[string]any) map[string]any {
-		if !batched {
-			return extra
+		d := map[string]any{}
+		if !sendStart.IsZero() && !sentAt.IsZero() {
+			d["duration_ms"] = sentAt.Sub(sendStart).Milliseconds()
 		}
-		d := map[string]any{"batch": map[string]any{
-			"leader_model": in.leaderModel, "index": in.batchIndex, "total": in.batchTotal,
-		}}
+		if batched {
+			d["batch"] = map[string]any{
+				"leader_model": in.leaderModel, "index": in.batchIndex, "total": in.batchTotal,
+			}
+		}
 		for k, v := range extra {
 			d[k] = v
 		}
@@ -902,7 +915,10 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 	// 活动结束时刻在这里定死，后面存票、清标记、写事件的耗时都不再影响它。事件的 CreatedAt 与
 	// 内存事实用同一个值，两者才对得上——不固定的话持久化的 A 会比真实活动晚上百毫秒，而调度
 	// 判的是「距上次活动多久」。
-	sentAt := time.Now()
+	sentAt = time.Now()
+	if probe != nil {
+		sendStart = probe.SentAt
+	}
 	if KongIsUpstreamNotAttempted(err) {
 		// 请求还没送出去就失败了（缺凭据这类本地错误）：没有清零任何静默，不能推进 A。
 		s.logEvent(ctx, &KongTicketEvent{
@@ -922,7 +938,11 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 		CreatedAt: sentAt,
 	}
 	if probe != nil {
-		event.StatusCode = &probe.StatusCode
+		// StatusCode 为 0 表示没等到响应头（传输层就失败了）。记 0 会让事件看起来像"上游回了 0"，
+		// 而那一列的语义是"上游返回的状态码"。
+		if probe.StatusCode > 0 {
+			event.StatusCode = &probe.StatusCode
+		}
 		if probe.State != "" {
 			n := len(probe.State)
 			event.StateLen = &n
@@ -1011,9 +1031,7 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 		extra["clear_skip_marks_error"] = clearErr.Error()
 	}
 	event.Outcome = KongOutcomeSuccess
-	if len(extra) > 0 {
-		event.Detail = detail(extra)
-	}
+	event.Detail = detail(extra)
 	s.logEvent(ctx, event)
 
 	out.ticketID = ticketID

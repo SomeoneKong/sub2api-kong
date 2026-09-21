@@ -644,3 +644,59 @@ func TestKongFusedReadFailureKeepsTicketAndRecords(t *testing.T) {
 		t.Fatal("读失败要留一条融合的 inconclusive 记录")
 	}
 }
+
+// 事件里必须留下取票耗时，否则并发在事件流上读起来就是串行。
+//
+// 事件的 CreatedAt 是请求**完成**时刻（它同时是出口活动 A，不能改成发起时刻）。同一批的两条
+// fetch 因此按各自响应耗时先后落库——线上实测过 27s 与 43s 这样的一对，事件时间差 16 秒，看起来
+// 就像第二发等第一发返回才开始。有了耗时，读事件的人各自减回发起时刻，两者相等就自证了并发。
+//
+// **耗时的起点必须是请求交给传输层那一刻，不是进入取票函数的时刻。** 凭据准备在那之前，而批内
+// 共用一个账号：第一个成员触发 OAuth 刷新、其余等锁时实际发送本就错开，把那段算进耗时会让反推
+// 起点凭空对齐，恰好把要看的信号抹掉。
+func TestKongBatchFetchEventsCarryUpstreamDuration(t *testing.T) {
+	const credSpent = 120 * time.Millisecond
+	const sendSpent = 40 * time.Millisecond
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		fetchState: strings.Repeat("a", 292),
+		answers:    kongVerifyAnswers(),
+	}
+	up.credHook = func() { time.Sleep(credSpent) }
+	up.fetchHook = func() { time.Sleep(sendSpent) }
+	svc, repo := kongBatchSetup(t, up, true)
+
+	if _, err := svc.EnsureTicket(context.Background(), 1, kongBatchSol); err != nil {
+		t.Fatalf("准入: %v", err)
+	}
+
+	seen := 0
+	for _, e := range repo.events {
+		if e.EventType != KongEventFetch {
+			continue
+		}
+		seen++
+		raw, ok := e.Detail["duration_ms"]
+		if !ok {
+			t.Errorf("%s 的取票事件没记耗时：只有完成时刻的话，同批两条读起来就是一前一后", e.Model)
+			continue
+		}
+		ms, ok := raw.(int64)
+		if !ok {
+			t.Errorf("%s 的耗时类型 = %T, want int64", e.Model, raw)
+			continue
+		}
+		if ms < sendSpent.Milliseconds() {
+			t.Errorf("%s 的耗时 = %dms，短于上游实际花掉的 %dms——那不是这次请求的耗时",
+				e.Model, ms, sendSpent.Milliseconds())
+		}
+		// 上界卡在两段之和以下：含了凭据准备的话反推起点会落在真实发送之前。
+		if ms >= (credSpent + sendSpent).Milliseconds() {
+			t.Errorf("%s 的耗时 = %dms，把凭据准备的 %dms 也算进去了——反推起点会比真实发送早那么多，"+
+				"批内成员实际错开发送时会被抹成同一瞬间", e.Model, ms, credSpent.Milliseconds())
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("取票事件数 = %d, want 2（批内两个模型各一条）", seen)
+	}
+}
