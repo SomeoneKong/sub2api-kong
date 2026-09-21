@@ -27,6 +27,20 @@
             受保护的上游模型：
             <span v-for="m in gatedModels" :key="m" class="badge badge-primary mr-1">{{ m }}</span>
           </p>
+          <!-- 白名单同属生效范围：门控集合说的是「保护谁」，这两张表说的是「上游给了别的东西时
+               算不算合格」。不显示它们，下面那行 stg0 红字就无法判断是没配上、还是配上了但按别的
+               口径在标红。两张表分开列——stg0 读上游自己回报的 model 名，归因那张补偿的是指纹区分度
+               不足，互抄值会放过真的降智。 -->
+          <dl v-if="gatedModels.length" class="mt-2 space-y-1 text-xs text-gray-500 dark:text-dark-400">
+            <div>
+              <dt class="inline">stg0 额外接受的上游回报值：</dt>
+              <dd class="inline font-mono">{{ acceptLines(overview.stg0_accept) }}</dd>
+            </div>
+            <div>
+              <dt class="inline">指纹归因额外接受：</dt>
+              <dd class="inline font-mono">{{ acceptLines(overview.fingerprint_accept) }}</dd>
+            </div>
+          </dl>
           <dl class="mt-3 grid grid-cols-2 gap-x-6 gap-y-1 text-xs text-gray-500 dark:text-dark-400 sm:grid-cols-3 lg:grid-cols-5">
             <div v-for="p in paramRows" :key="p.label">
               <dt class="inline">{{ p.label }}：</dt>
@@ -74,16 +88,24 @@
                     <div v-if="row.models?.length" class="mt-2">
                       <p class="text-xs text-gray-500 dark:text-dark-400">stg0（近三天）</p>
                       <template v-for="m in row.models" :key="`stg0-${m.model}`">
-                        <p class="text-xs" :class="stg0Class(m.stg0)">
+                        <p class="text-xs" :class="stg0Tone(m.stg0)">
                           {{ m.model }} {{ stg0Line(m.stg0) }}
                         </p>
                         <!-- 回报值原文是这块信息里最可操作的部分：上游投放新模型时照着它往
-                             stg0_accept 加一条即可。只给比例的话不知道该加什么。 -->
+                             stg0_accept 加一条即可。只给比例的话不知道该加什么。
+                             未接受与已接受**分两行**：同色混排时，一条真的降智会被一批已接受的
+                             投放淹没，而那恰恰是唯一要人动手的那条。 -->
                         <p
-                          v-if="stg0Reported(m.stg0).length"
+                          v-if="stg0Reported(m.stg0, false).length"
                           class="pl-3 text-xs text-rose-700 dark:text-rose-300"
                         >
-                          回报：{{ stg0Reported(m.stg0).map((r) => `${r.model} ×${r.count}`).join('、') }}
+                          回报（未接受）：{{ stg0ReportedText(stg0Reported(m.stg0, false)) }}
+                        </p>
+                        <p
+                          v-if="stg0Reported(m.stg0, true).length"
+                          class="pl-3 text-xs text-gray-500 dark:text-dark-400"
+                        >
+                          回报（白名单已接受）：{{ stg0ReportedText(stg0Reported(m.stg0, true)) }}
                         </p>
                       </template>
                     </div>
@@ -271,11 +293,18 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { adminAPI } from '@/api/admin'
 import type { Proxy } from '@/types'
 import codexTicketAPI from './api'
-import { reasonText, sampleText } from './labels'
+import {
+  acceptLines,
+  reasonText,
+  sampleText,
+  stg0Line,
+  stg0Reported,
+  stg0ReportedText,
+  stg0Tone,
+} from './labels'
 import TicketEventTable from './TicketEventTable.vue'
 import type {
   TicketDiagnosis,
-  TicketStg0Stats,
   TicketSummary,
   TicketAccountStatus,
   TicketEgress,
@@ -363,36 +392,6 @@ function diagnosisText(d: TicketDiagnosis): string {
     return `${d.fingerprint_model}（p=${d.probability.toFixed(3)}）`
   }
   return d.reason ? `未得出结论：${reasonText(d.reason)}` : '未得出结论'
-}
-
-// stg0（上游回报的 model）观测文案。窗口与标题由模板的块级标题给出，这里只留数字——每行前面
-// 还要带模型名，重复"stg0（近三天）"会把这一列挤满。
-//
-// 三种情况必须能分开：**无样本**（窗口内没请求，或统计没查到）、**全都没观测到回报值**、以及
-// 真的有不一致。把第一种显示成 "0%" 会被读成"查过了、没问题"，第二种更危险——它看起来像"没被
-// 降智"，其实是这项观测根本没工作。
-function stg0Line(s: TicketStg0Stats | null): string {
-  if (!s || s.total === 0) return '无样本'
-  const rate = ((s.mismatch / s.total) * 100).toFixed(2)
-  const parts = [`不一致 ${s.mismatch}/${s.total}（${rate}%）`]
-  if (s.unknown > 0) parts.push(`未观测 ${s.unknown}`)
-  if (s.unknown === s.total) parts.push('← 全部未观测，这个 0 不代表没被降智')
-  return parts.join(' · ')
-}
-
-// top_reported 可能是 null（Go 的 nil 切片序列化结果、历史数据、明细查询失败分支）。
-// **模板里一律经它取数组**：直接读 `.length` 会让零 mismatch 的正常账号打崩整个页面。
-function stg0Reported(s: TicketStg0Stats | null): Array<{ model: string; count: number }> {
-  return s?.top_reported ?? []
-}
-
-function stg0Class(s: TicketStg0Stats | null): string {
-  if (!s || s.total === 0) return 'text-gray-500 dark:text-dark-400'
-  // 有不一致就是红的：那是上游自己声明给了别的模型，比归因更硬的证据。
-  if (s.mismatch > 0) return 'text-red-600 dark:text-red-400'
-  // 一条都没观测到 = 这项观测没在工作，需要注意但不是降智的定论。
-  if (s.unknown === s.total) return 'text-amber-700 dark:text-amber-300'
-  return 'text-gray-500 dark:text-dark-400'
 }
 
 function diagnosisClass(d: TicketDiagnosis): string {

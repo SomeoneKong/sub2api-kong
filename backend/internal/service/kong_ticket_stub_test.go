@@ -799,6 +799,9 @@ func (r *kongStubRepo) Stg0Stats(_ context.Context, models []string, _ time.Time
 		// 照生产口径按模型过滤：用例传的门控集合变了、预置数据没跟着变时，这一条能让它露出来。
 		if s != nil && want[s.Model] {
 			clone := *s
+			// 明细也要深拷：服务层会就地给每条回报值打「是否被白名单接受」并重排截断，浅拷会让
+			// 一个用例的分类结果渗进预置数据、进而影响下一个用例。
+			clone.TopReported = append([]KongStg0Reported(nil), s.TopReported...)
 			out = append(out, &clone)
 		}
 	}

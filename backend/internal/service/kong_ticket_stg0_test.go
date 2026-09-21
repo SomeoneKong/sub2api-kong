@@ -578,7 +578,7 @@ func TestKongTicketDetailDistinguishesStg0Conclusion(t *testing.T) {
 		{ID: 1, Ready: true, Extra: map[string]any{KongTicketModeKey: string(KongTicketModeFull)}},
 	}}
 	admin := NewKongTicketAdminService(repo, views, KongDefaultTicketParams(),
-		[]string{model}, svc.accept, svc.confidence)
+		[]string{model}, svc.accept, svc.stg0, svc.confidence)
 	admin.SetTicketService(svc)
 
 	page, err := admin.TicketDetail(ctx, 1)
@@ -653,7 +653,7 @@ func TestKongLastSampleReflectsLatestFetch(t *testing.T) {
 		{ID: 1, Ready: true, Extra: map[string]any{KongTicketModeKey: string(KongTicketModeFull)}},
 	}}
 	admin := NewKongTicketAdminService(repo, views, KongDefaultTicketParams(),
-		[]string{model}, svc.accept, svc.confidence)
+		[]string{model}, svc.accept, svc.stg0, svc.confidence)
 	admin.SetTicketService(svc)
 
 	status, err := admin.statusOf(ctx, &views.views[0], now)
@@ -719,5 +719,161 @@ func TestKongStg0DefaultAcceptOnlyAllowsUpgrade(t *testing.T) {
 				t.Errorf("Verdict(%q, %q) = %v, want %v", tc.requested, tc.reported, got, tc.want)
 			}
 		})
+	}
+}
+
+// 统计侧按白名单拆分的三条不变量：两份相加等于 Mismatch、判据与验票同源（快照后缀也算接受）、
+// 未列进明细的部分归入未接受。
+//
+// 拆分错了不会报错，只会让页面长期标红或长期不标红——前者把这块读数变成背景噪音，后者放过降智。
+func TestKongStg0ClassifyStatsSplitsByAcceptList(t *testing.T) {
+	accept, warnings, err := KongParseStg0Accept([]string{"gpt-5.6-sol"}, "gpt-5.6-sol:gpt-6-sol")
+	if err != nil || len(warnings) != 0 {
+		t.Fatalf("解析白名单: err=%v warnings=%v", err, warnings)
+	}
+
+	t.Run("白名单内与快照后缀都算已接受", func(t *testing.T) {
+		stats := &KongStg0Stats{
+			Model: "gpt-5.6-sol", Total: 700, Mismatch: 140,
+			TopReported: []KongStg0Reported{
+				{Model: "gpt-6-sol", Count: 132},
+				// 上游换快照：审计口径把它记成不一致，而验票的 Verdict 认它是同一个模型。
+				{Model: "gpt-5.6-sol-2026-09-20", Count: 6},
+				{Model: "gpt-5.5", Count: 2},
+			},
+		}
+		accept.ClassifyStats(stats)
+		if stats.MismatchAccepted != 138 || stats.MismatchUnaccepted != 2 {
+			t.Errorf("已接受 138 / 未接受 2，实得 %d / %d", stats.MismatchAccepted, stats.MismatchUnaccepted)
+		}
+		if stats.MismatchAccepted+stats.MismatchUnaccepted != stats.Mismatch {
+			t.Errorf("两份相加必须等于 Mismatch=%d，实得 %d", stats.Mismatch,
+				stats.MismatchAccepted+stats.MismatchUnaccepted)
+		}
+		// 未接受的排最前：它是唯一要人动手的那条，排在 132 次的已接受投放后面就会被翻页埋掉。
+		if stats.TopReported[0].Model != "gpt-5.5" || stats.TopReported[0].Accepted {
+			t.Errorf("未接受的回报值要排第一且标记为未接受，实得 %+v", stats.TopReported[0])
+		}
+	})
+
+	t.Run("明细没覆盖到的部分归入未接受", func(t *testing.T) {
+		// 回报值种类超过仓储上限时，剩余的量只有汇总里有。它是未知——按已接受处理会把一次真正的
+		// 降智显示成中性色。
+		stats := &KongStg0Stats{
+			Model: "gpt-5.6-sol", Total: 100, Mismatch: 50,
+			TopReported: []KongStg0Reported{{Model: "gpt-6-sol", Count: 30}},
+		}
+		accept.ClassifyStats(stats)
+		if stats.MismatchAccepted != 30 || stats.MismatchUnaccepted != 20 {
+			t.Errorf("已接受 30 / 未接受 20，实得 %d / %d", stats.MismatchAccepted, stats.MismatchUnaccepted)
+		}
+	})
+
+	t.Run("明细多于汇总时不产生负数", func(t *testing.T) {
+		// 汇总与明细是两次查询，之间可能又落进新行。负值会让页面算出负百分比。
+		stats := &KongStg0Stats{
+			Model: "gpt-5.6-sol", Total: 10, Mismatch: 3,
+			TopReported: []KongStg0Reported{{Model: "gpt-6-sol", Count: 5}},
+		}
+		accept.ClassifyStats(stats)
+		if stats.MismatchAccepted != 3 || stats.MismatchUnaccepted != 0 {
+			t.Errorf("夹到 Mismatch=3 且未接受为 0，实得 %d / %d",
+				stats.MismatchAccepted, stats.MismatchUnaccepted)
+		}
+	})
+
+	t.Run("截断发生在排序之后", func(t *testing.T) {
+		stats := &KongStg0Stats{Model: "gpt-5.6-sol", Total: 1000, Mismatch: 606}
+		for i := 0; i < 6; i++ {
+			stats.TopReported = append(stats.TopReported,
+				KongStg0Reported{Model: "gpt-6-sol-2026-0" + strconv.Itoa(i+1) + "-01", Count: 100})
+		}
+		stats.TopReported = append(stats.TopReported, KongStg0Reported{Model: "gpt-5.5", Count: 6})
+		accept.ClassifyStats(stats)
+		if len(stats.TopReported) != kongStg0TopReportedMax {
+			t.Fatalf("要截断到 %d 条，实得 %d", kongStg0TopReportedMax, len(stats.TopReported))
+		}
+		if stats.TopReported[0].Model != "gpt-5.5" {
+			t.Errorf("未接受的那条不能被高频的已接受投放挤掉，实得 %+v", stats.TopReported)
+		}
+		if stats.MismatchUnaccepted != 6 {
+			t.Errorf("未接受 6，实得 %d", stats.MismatchUnaccepted)
+		}
+	})
+}
+
+// 空白名单（未配置 stg0_accept、或功能未启用时的 nil 表）下，一切不一致都是未接受——默认极性是拒绝。
+func TestKongStg0ClassifyStatsDefaultsToUnaccepted(t *testing.T) {
+	for name, accept := range map[string]KongStg0Accept{"nil 表": nil, "空表": {}} {
+		t.Run(name, func(t *testing.T) {
+			stats := &KongStg0Stats{
+				Model: "gpt-5.6-sol", Total: 10, Mismatch: 4,
+				TopReported: []KongStg0Reported{{Model: "gpt-6-sol", Count: 4}},
+			}
+			accept.ClassifyStats(stats)
+			if stats.MismatchAccepted != 0 || stats.MismatchUnaccepted != 4 {
+				t.Errorf("没配白名单时全部算未接受，实得 %d / %d",
+					stats.MismatchAccepted, stats.MismatchUnaccepted)
+			}
+			if stats.TopReported[0].Accepted {
+				t.Error("没配白名单时回报值不得标成已接受")
+			}
+		})
+	}
+}
+
+// 概览页拿到的统计必须已经按白名单拆过。
+//
+// 这条覆盖的是「规则只落在部分落点」那类缺陷：分类逻辑本身有测试，但管理服务没拿到白名单（装配漏传、
+// 或某个挂统计的入口绕过了 stg0Index）时，页面会把每一次已接受的投放重新标成降智——那是无谓告警，
+// 与放过降智同级。
+func TestKongAdminOverviewClassifiesStg0ByAcceptList(t *testing.T) {
+	now := time.Now()
+	model := "gpt-5.6-sol"
+	repo := newKongStubRepo()
+	repo.stg0Stats = []*KongStg0Stats{{
+		AccountID: 1, Model: model, Total: 691, Mismatch: 132,
+		TopReported: []KongStg0Reported{{Model: "gpt-6-sol", Count: 132}},
+	}}
+	accounts := &kongStubAdminAccounts{views: []KongAccountView{{
+		ID: 1, Name: "acc", Platform: PlatformOpenAI, Ready: true,
+		Extra: map[string]any{KongTicketModeKey: string(KongTicketModeOff)},
+	}}}
+	stg0, _, err := KongParseStg0Accept([]string{model}, model+":gpt-6-sol")
+	if err != nil {
+		t.Fatalf("解析白名单: %v", err)
+	}
+	admin := NewKongTicketAdminService(repo, accounts, KongDefaultTicketParams(),
+		[]string{model}, KongTicketAccept{}, stg0, 0.9)
+
+	list, err := admin.Overview(context.Background(), now)
+	if err != nil {
+		t.Fatalf("Overview: %v", err)
+	}
+	got := list[0].Models[0].Stg0
+	if got == nil {
+		t.Fatal("统计没挂到这一行上")
+	}
+	if got.MismatchAccepted != 132 || got.MismatchUnaccepted != 0 {
+		t.Errorf("132 次投放全在白名单内：已接受 132 / 未接受 0，实得 %d / %d",
+			got.MismatchAccepted, got.MismatchUnaccepted)
+	}
+	if len(got.TopReported) != 1 || !got.TopReported[0].Accepted {
+		t.Errorf("回报值要标成已接受，实得 %+v", got.TopReported)
+	}
+
+	// 白名单当前内容也要能被页面读到——看不到它，运维无法判断一行红字是没配上还是口径不同。
+	view, fingerprint := admin.AcceptView()
+	if len(view[model]) != 1 || view[model][0] != "gpt-6-sol" {
+		t.Errorf("stg0 白名单视图应含 %s → gpt-6-sol，实得 %v", model, view)
+	}
+	if len(fingerprint) != 0 {
+		t.Errorf("本例没配归因白名单，视图应为空，实得 %v", fingerprint)
+	}
+	// 视图是快照：改它不得影响判定。
+	view[model][0] = "tampered"
+	again, _ := admin.AcceptView()
+	if again[model][0] != "gpt-6-sol" {
+		t.Error("AcceptView 必须返回拷贝，否则调用方能改掉生效中的白名单")
 	}
 }

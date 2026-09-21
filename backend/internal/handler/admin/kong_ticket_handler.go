@@ -49,11 +49,17 @@ func (h *KongTicketHandler) GetOverview(c *gin.Context) {
 		return
 	}
 	params := h.svc.Params()
+	stg0Accept, fingerprintAccept := h.svc.AcceptView()
 	response.Success(c, gin.H{
 		"accounts": accounts,
 		// enabled 让界面区分「未启用」与「服务故障」，也决定配置能否编辑。
 		"enabled":      h.svc.Enabled(),
 		"gated_models": h.svc.GatedModels(),
+		// 两张白名单同属生效范围：它们决定"上游给了别的东西时算不算合格"。页面上 stg0 的不一致
+		// 计数正是按前者拆成已接受 / 未接受的，不显示白名单本身，运维就无法判断一行红字是没配上
+		// 还是配上了但页面按别的口径标红。
+		"stg0_accept":        stg0Accept,
+		"fingerprint_accept": fingerprintAccept,
 		"params": gin.H{
 			"refresh_before_seconds":         int64(params.RefreshBefore.Seconds()),
 			"ticket_fetch_min_idle_seconds":  int64(params.TicketFetchMinIdle.Seconds()),

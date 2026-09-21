@@ -152,6 +152,14 @@ type KongStg0Stats struct {
 	Mismatch int64 `json:"mismatch"`
 	// Unknown 是没观测到回报值的次数。
 	Unknown int64 `json:"unknown"`
+	// MismatchAccepted / MismatchUnaccepted 把 Mismatch 按 stg0 白名单拆成两份，相加恒等于它。
+	//
+	// 拆开的理由是这两份的**处置完全不同**：已接受的那份是上游在投放我们认可的替代模型（升级投放），
+	// 验票不会判死票，运维无须动作；未接受的那份才是"上游自己声明给了别的模型且我们没放行"。混成一个
+	// 数时，一次真正的降智会被一大批已接受的投放稀释到看不见，而配好白名单之后页面仍然长期标红——
+	// 那等于让这块读数永久失去可操作性。
+	MismatchAccepted   int64 `json:"mismatch_accepted"`
+	MismatchUnaccepted int64 `json:"mismatch_unaccepted"`
 	// TopReported 列出 Mismatch 里回报值出现最多的几项。**永远是非 nil 切片**——nil 会序列化成
 	// JSON `null`，而前端按数组读它；零 mismatch 是最常见的情况，留 nil 等于让正常账号打崩页面。
 	//
@@ -164,6 +172,59 @@ type KongStg0Stats struct {
 type KongStg0Reported struct {
 	Model string `json:"model"`
 	Count int64  `json:"count"`
+	// Accepted 表示这个回报值在 stg0 白名单内（或只是同一模型的快照后缀），验票不会据它判死票。
+	Accepted bool `json:"accepted"`
+}
+
+// kongStg0TopReportedMax 是页面上每个 (账号, 模型) 列出的回报值种数上限。
+//
+// 它只为挡住"上游大面积回报各种模型时把这一列刷满"。取 5：运维需要的是"该往 stg0_accept 加哪一条"，
+// 前几名足以回答，而列全部只会把那个答案埋掉。截断发生在分类与排序**之后**——未接受的回报值正是
+// 要人动手的那些，先截断再排序会把它们挤掉。
+const kongStg0TopReportedMax = 5
+
+// ClassifyStats 按白名单把一条统计的 Mismatch 拆成已接受 / 未接受，并给明细排序截断。
+//
+// **判据必须是 Verdict，不能是"在不在白名单的列表里"**：仓储那侧的 mismatch 用的是上游审计口径
+// （字面相等），它把 `gpt-5.4-mini-2026-03-17` 这种快照后缀也算成不一致，而验票是否判死票由 Verdict
+// 说了算（它连快照匹配一起判）。两处口径不同源时，页面标红的与实际判死的就不是同一批请求。
+//
+// 明细里没列到的那部分（回报值种类超过仓储上限时的剩余）一律计入**未接受**：那是未知，而把未知
+// 当已接受会让一次真正的降智显示成中性色——放过降智比无谓地标一次红严重得多。
+func (a KongStg0Accept) ClassifyStats(s *KongStg0Stats) {
+	if s == nil {
+		return
+	}
+	var accepted int64
+	for i := range s.TopReported {
+		r := &s.TopReported[i]
+		r.Accepted = a.Verdict(s.Model, r.Model) == KongStg0Pass
+		if r.Accepted {
+			accepted += r.Count
+		}
+	}
+	// 汇总与明细是两次查询，之间可能又落进新行，于是明细的和可以超过 Mismatch。夹一下，
+	// 否则未接受数会变成负值、比例算出负百分比。
+	if accepted > s.Mismatch {
+		accepted = s.Mismatch
+	}
+	s.MismatchAccepted = accepted
+	s.MismatchUnaccepted = s.Mismatch - accepted
+
+	sort.SliceStable(s.TopReported, func(i, j int) bool {
+		a, b := s.TopReported[i], s.TopReported[j]
+		if a.Accepted != b.Accepted {
+			// 未接受的排前面：它是唯一需要人动手的那类。
+			return !a.Accepted
+		}
+		if a.Count != b.Count {
+			return a.Count > b.Count
+		}
+		return a.Model < b.Model
+	})
+	if len(s.TopReported) > kongStg0TopReportedMax {
+		s.TopReported = s.TopReported[:kongStg0TopReportedMax]
+	}
 }
 
 // MismatchRate 返回不一致占比。Total 为 0 时返回 0，调用方需自行区分"无样本"与"零不一致"

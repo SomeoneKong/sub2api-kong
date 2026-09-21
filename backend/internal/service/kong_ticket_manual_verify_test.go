@@ -542,7 +542,7 @@ func TestKongUnverifiedCountMatchesSelectableCandidates(t *testing.T) {
 		{ID: 1, Ready: true, Extra: map[string]any{KongTicketModeKey: string(KongTicketModeOff)}},
 	}}
 	admin := NewKongTicketAdminService(repo, views, KongDefaultTicketParams(),
-		[]string{model}, svc.accept, svc.confidence)
+		[]string{model}, svc.accept, svc.stg0, svc.confidence)
 	admin.SetTicketService(svc)
 
 	status, err := admin.statusOf(ctx, &views.views[0], time.Now())

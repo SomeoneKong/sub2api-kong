@@ -249,7 +249,7 @@ func TestKongTicketDetailModePolicies(t *testing.T) {
 				{ID: 1, Ready: true, Extra: map[string]any{KongTicketModeKey: string(mode)}},
 			}}
 			admin := NewKongTicketAdminService(repo, views, KongDefaultTicketParams(),
-				[]string{model}, svc.accept, svc.confidence)
+				[]string{model}, svc.accept, svc.stg0, svc.confidence)
 			admin.SetTicketService(svc)
 
 			page, err := admin.TicketDetail(context.Background(), 1)

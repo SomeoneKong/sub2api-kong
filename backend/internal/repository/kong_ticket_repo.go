@@ -918,11 +918,12 @@ func kongNullString(s string) any {
 // 管理页面可接受；若将来窗口内行数涨到百万级，这里需要重新看计划。
 const kongStg0EffectiveModel = `COALESCE(NULLIF(BTRIM(upstream_model), ''), model)`
 
-// kongStg0TopReportedMax 是每个 (账号, 模型) 保留的回报值种数上限。
+// kongStg0ReportedKindsMax 是每个 (账号, 模型) 取回的回报值种数上限。
 //
-// 它只为挡住"上游大面积回报各种模型时查出过多行"。取 5：运维需要的是"该往 stg0_accept 加哪一条"，
-// 前几名足以回答，而列全部只会把那个答案埋掉。
-const kongStg0TopReportedMax = 5
+// 它只为挡住"上游大面积回报各种模型时查出过多行"。**页面上真正显示几条由服务层决定**
+// （ClassifyStats）——分类要先看全部候选才能把未接受的排到前面，这里截太狠会让那条被白名单覆盖的
+// 高频投放把它挤掉。取 20：实测窗口内不同回报值只有个位数，20 留足余量又仍然有界。
+const kongStg0ReportedKindsMax = 20
 
 // Stg0Stats 汇总近期业务请求里上游回报 model 的一致性，按 (账号, 有效模型) 分组。
 //
@@ -931,8 +932,9 @@ const kongStg0TopReportedMax = 5
 // （例如只数请求数的计数器），两侧口径不同会让比例变成两个不同总体的商。
 //
 // mismatch 判据用的是**上游的审计口径**（字面相等），比验票路径的 stg0 判据更严——它会把
-// `gpt-5.4-mini-2026-03-17` 这种快照后缀也算成不一致。这里刻意不做二次收窄：这一侧只用于观测与告警，
-// 宁可多报几条让人看见，也不要在统计里悄悄抹掉上游确实回报过别的字符串这个事实。
+// `gpt-5.4-mini-2026-03-17` 这种快照后缀也算成不一致。这里刻意不做二次收窄：SQL 里没有快照匹配与
+// 白名单这两套判据，重写一份就会与验票那份分叉。**按白名单拆成已接受 / 未接受由服务层做**
+// （KongStg0Accept.ClassifyStats），它与验票用的是同一个 Verdict。
 func (r *kongTicketRepository) Stg0Stats(ctx context.Context, models []string, since time.Time) ([]*service.KongStg0Stats, error) {
 	models = kongNonEmpty(models)
 	if len(models) == 0 {
@@ -1005,7 +1007,7 @@ func (r *kongTicketRepository) Stg0Stats(ctx context.Context, models []string, s
 			return out, nil
 		}
 		s := byKey[kongStg0Key(accountID, model)]
-		if s == nil || len(s.TopReported) >= kongStg0TopReportedMax {
+		if s == nil || len(s.TopReported) >= kongStg0ReportedKindsMax {
 			continue
 		}
 		s.TopReported = append(s.TopReported, service.KongStg0Reported{Model: reported, Count: n})

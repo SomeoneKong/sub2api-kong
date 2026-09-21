@@ -65,7 +65,7 @@ func TestKongAdminOffModeStillReportsModels(t *testing.T) {
 	}}}
 
 	admin := NewKongTicketAdminService(repo, accounts, KongDefaultTicketParams(),
-		[]string{"gpt-6-astra"}, KongTicketAccept{}, 0.9)
+		[]string{"gpt-6-astra"}, KongTicketAccept{}, KongStg0Accept{}, 0.9)
 
 	list, err := admin.Overview(context.Background(), now)
 	if err != nil {

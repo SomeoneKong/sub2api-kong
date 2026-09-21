@@ -97,7 +97,16 @@ export interface TicketStg0Stats {
   mismatch: number
   unknown: number
   /**
-   * 不一致时上游回报过的 model 及次数（最多几项）。
+   * `mismatch` 按 stg0 白名单拆成的两份，相加恒等于它。
+   *
+   * 两份的处置完全不同：`mismatch_accepted` 是上游在投放我们认可的替代模型（验票不会判死票，
+   * 无须动作），`mismatch_unaccepted` 才是「上游自己声明给了别的模型且我们没放行」。**标红只看后者**
+   * ——配好白名单之后仍然长期标红，会让这块读数永久失去可操作性。
+   */
+  mismatch_accepted: number
+  mismatch_unaccepted: number
+  /**
+   * 不一致时上游回报过的 model 及次数（最多几项）。未接受的排在前面——它们是唯一要人动手的那类。
    *
    * 它是这块信息里最可操作的部分：上游投放新模型时，运维照着它往 stg0_accept 加一条即可。只给
    * 比例的话，看到「mismatch 87%」也不知道该加什么。
@@ -105,7 +114,7 @@ export interface TicketStg0Stats {
    * **声明成可能为 null**：Go 的 nil 切片序列化成 `null`，历史数据与明细查询失败的分支都可能给
    * 这个值。按数组直接读 `.length` 会打崩整个页面，所以一律经归一化再用。
    */
-  top_reported: Array<{ model: string; count: number }> | null
+  top_reported: Array<{ model: string; count: number; accepted: boolean }> | null
 }
 
 export interface TicketAccountStatus {
@@ -153,6 +162,13 @@ export interface TicketOverview {
   enabled: boolean
   /** 门控模型集合。为空即整个功能不生效，界面要显式说明这一点。 */
   gated_models: string[] | null
+  /**
+   * 两张白名单当前生效的内容（`模型 → 接受值`），同属生效范围：它们决定「上游给了别的东西时算不算
+   * 合格」。`stg0_accept` 收的是上游回报的 model 名，`fingerprint_accept` 补偿的是指纹归因的区分度
+   * 不足——**两者互抄值会放过真的降智**，所以页面也分两行显示。
+   */
+  stg0_accept: Record<string, string[]> | null
+  fingerprint_accept: Record<string, string[]> | null
   params: TicketParams
   idle_seconds_caveat: string
 }

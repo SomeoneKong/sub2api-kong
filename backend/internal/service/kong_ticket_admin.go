@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -163,6 +164,9 @@ type KongTicketAdminService struct {
 	// 不会注入的票（目标改过之后留下的旧 verified 票），运维据此判断「有票可用」就错了。
 	accept     KongTicketAccept
 	confidence float64
+	// stg0 与编排服务同源，理由同 accept：页面据它把「已被白名单接受的上游回报值」与「真的降智」
+	// 分开显示，口径与验票判死票的那份必须是同一个，否则标红的与判死的不是同一批请求。
+	stg0 KongStg0Accept
 	// svc 只用于手工触发。装配时注入而不进构造函数：未启用时 Admin 照常装配而 Service 为 nil，
 	// 放进参数表会让"未启用"这条路径也得传个 nil 进来。
 	svc      *KongTicketService
@@ -175,10 +179,10 @@ type KongTicketAdminService struct {
 }
 
 // NewKongTicketAdminService 创建管理面服务。
-func NewKongTicketAdminService(repo KongTicketRepository, accounts KongAccountAccess, params KongTicketParams, gatedModels []string, accept KongTicketAccept, confidence float64) *KongTicketAdminService {
+func NewKongTicketAdminService(repo KongTicketRepository, accounts KongAccountAccess, params KongTicketParams, gatedModels []string, accept KongTicketAccept, stg0 KongStg0Accept, confidence float64) *KongTicketAdminService {
 	return &KongTicketAdminService{
 		repo: repo, accounts: accounts, params: params, gatedModels: gatedModels,
-		accept: accept, confidence: confidence,
+		accept: accept, stg0: stg0, confidence: confidence,
 	}
 }
 
@@ -192,6 +196,35 @@ func (s *KongTicketAdminService) GatedModels() []string {
 
 // Params 返回当前生效的时间参数。
 func (s *KongTicketAdminService) Params() KongTicketParams { return s.params }
+
+// AcceptView 返回两张白名单当前生效的内容，供页面的「生效范围」显示。
+//
+// 它们决定"上游给了别的东西时算不算合格"，与门控集合同属生效范围——不显示的话，运维看到一行红字
+// 也说不出是白名单没配上、还是配上了但页面按别的口径在标红。两张表必须分开列：
+// stg0 读的是上游自己回报的 model 名，归因那张补偿的是指纹的区分度不足，互抄值会放过真的降智。
+//
+// 复制一份再返回：调用方拿到的是展示用快照，改它不该影响判定。
+func (s *KongTicketAdminService) AcceptView() (stg0, fingerprint map[string][]string) {
+	return kongCopyAcceptTable(s.stg0), kongCopyAcceptTable(s.accept)
+}
+
+// kongCopyAcceptTable 深拷一张 `模型 → 接受值` 表。两张白名单是同一形状，共用一份拷贝逻辑。
+//
+// 键即使没有接受值也要保留（值为空切片）：那代表"这个门控模型只接受它自己"，与"这个模型不在门控
+// 集合里"是两件事，页面要能分开说。
+func kongCopyAcceptTable(in map[string][]string) map[string][]string {
+	if len(in) == 0 {
+		return map[string][]string{}
+	}
+	out := make(map[string][]string, len(in))
+	for model, accepted := range in {
+		list := make([]string, len(accepted))
+		copy(list, accepted)
+		sort.Strings(list)
+		out[model] = list
+	}
+	return out
+}
 
 // Overview 汇总所有账号的票据状态。
 func (s *KongTicketAdminService) Overview(ctx context.Context, now time.Time) ([]KongTicketAccountStatus, error) {
@@ -238,6 +271,9 @@ func (s *KongTicketAdminService) stg0Index(ctx context.Context, now time.Time) m
 	byKey := make(map[string]*KongStg0Stats, len(stats))
 	for _, st := range stats {
 		if st != nil {
+			// 分类放在这里而不是各调用点：每个挂统计的入口都要拆（理由同 applyStg0 的注释），
+			// 漏一处那条路径就会把已接受的投放重新显示成降智。
+			s.stg0.ClassifyStats(st)
 			byKey[kongStg0StatsKey(st.AccountID, st.Model)] = st
 		}
 	}

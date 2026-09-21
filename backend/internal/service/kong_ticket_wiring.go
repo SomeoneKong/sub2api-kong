@@ -156,7 +156,7 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 		return &KongTicketComponents{
 			Enabled: false,
 			// 未启用时接受关系与阈值取不到也无所谓：没有门控模型，就不会查任何「当前票」。
-			Admin: NewKongTicketAdminService(repo, NewKongAccountAccess(accountRepo, proxyRepo), KongDefaultTicketParams(), nil, nil, 0),
+			Admin: NewKongTicketAdminService(repo, NewKongAccountAccess(accountRepo, proxyRepo), KongDefaultTicketParams(), nil, nil, nil, 0),
 		}, nil
 	}
 
@@ -227,7 +227,7 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 	access := NewKongAccountAccess(accountRepo, proxyRepo)
 	ticketService := NewKongTicketService(repo, upstream, accountRepo, bank, params,
 		gated, ticketCfg.BatchFetchAllModels, ticketCfg.FetchFusedFingerprint, accept, stg0, confidence)
-	adminService := NewKongTicketAdminService(repo, access, params, gated, accept, confidence)
+	adminService := NewKongTicketAdminService(repo, access, params, gated, accept, stg0, confidence)
 	// 手工触发要走编排服务的正常决策路径，所以 Admin 需要它。
 	adminService.SetTicketService(ticketService)
 	return &KongTicketComponents{
