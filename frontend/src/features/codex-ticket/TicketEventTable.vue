@@ -2,7 +2,7 @@
   事件表。总览页与单账号明细页共用——两处看的是同一份事件流，各写一份的话每次改动（比如给取票
   事件加耗时）都得改两遍，漏一边就变成两种口径。
 
-  固定了 accountID 时它是「这个账号的事件」：账号筛选器与账号列一起收起来，那一列全是同一个值。
+  固定了 accountId 时它是「这个账号的事件」：账号筛选器与账号列一起收起来，那一列全是同一个值。
 -->
 <template>
   <section class="card px-4 py-4 sm:px-6">
@@ -12,7 +12,7 @@
            清除入口一起藏掉——票被过期清理后 modelOptions 变空，而 modelFilter 里那个模型还在，
            "查询"仍带着它，页面上却再也没有地方能取消。 -->
       <EventFilterSelect
-        v-if="!accountID && (accountOptions.length || accountFilter.length)"
+        v-if="!accountId && (accountOptions.length || accountFilter.length)"
         v-model="accountFilter"
         class="w-48"
         all-label="全部账号"
@@ -44,7 +44,7 @@
         <thead class="text-left text-xs uppercase tracking-wider text-gray-500 dark:text-dark-400">
           <tr>
             <th class="px-3 py-2">时间</th>
-            <th v-if="!accountID" class="px-3 py-2">账号</th>
+            <th v-if="!accountId" class="px-3 py-2">账号</th>
             <th class="px-3 py-2">模型</th>
             <th class="px-3 py-2">类型</th>
             <th class="px-3 py-2">结果</th>
@@ -56,7 +56,7 @@
           <template v-for="ev in events" :key="ev.id">
             <tr class="align-top">
               <td class="whitespace-nowrap px-3 py-2 text-xs text-gray-600 dark:text-dark-300">{{ formatTime(ev.created_at) }}</td>
-              <td v-if="!accountID" class="px-3 py-2 text-xs text-gray-600 dark:text-dark-300">{{ accountName(ev.account_id) }}</td>
+              <td v-if="!accountId" class="px-3 py-2 text-xs text-gray-600 dark:text-dark-300">{{ accountName(ev.account_id) }}</td>
               <td class="px-3 py-2 text-xs text-gray-600 dark:text-dark-300">{{ ev.model || '—' }}</td>
               <td class="px-3 py-2 text-xs font-mono text-gray-700 dark:text-dark-200">{{ ev.event_type }}</td>
               <td class="px-3 py-2">
@@ -102,7 +102,7 @@
               </td>
             </tr>
             <tr v-if="expandedEventID === ev.id">
-              <td :colspan="accountID ? 6 : 7" class="bg-gray-50 px-3 py-3 dark:bg-dark-800/40">
+              <td :colspan="accountId ? 6 : 7" class="bg-gray-50 px-3 py-3 dark:bg-dark-800/40">
                 <p v-if="probesError" class="text-xs text-red-600 dark:text-red-400">{{ probesError }}</p>
                 <p v-else-if="probesLoading" class="text-xs text-gray-500 dark:text-dark-400">加载中…</p>
                 <p v-else-if="probes.length === 0" class="text-xs text-gray-500 dark:text-dark-400">这次验证没有探测记录。</p>
@@ -163,8 +163,15 @@ import type { FingerprintProbe, TicketEvent } from './types'
 
 const props = withDefaults(
   defineProps<{
-    /** 只看这个账号的事件。给了它，账号筛选器与账号列都收起来。 */
-    accountID?: number | null
+    /**
+     * 只看这个账号的事件。给了它，账号筛选器与账号列都收起来。
+     *
+     * ⚠️ 名字必须是 `accountId` 而不是 `accountID`：模板上的 `:account-id` 经 Vue 的
+     * kebab→camel 规则得到的是 `accountId`（连续大写不会被还原）。写成 `accountID` 时这个
+     * prop 永远收不到值，于是悄悄退回默认的 null——**事件表会列出全部账号**，而 vue-tsc
+     * 不会报错（多余的 attr 落到 fallthrough，缺失的 prop 有默认值）。
+     */
+    accountId?: number | null
     /** 账号 id → 名字。缺的显示成 #id。 */
     accountNames?: Record<number, string>
     accountOptions?: { value: string; label: string }[]
@@ -174,7 +181,7 @@ const props = withDefaults(
     title?: string
   }>(),
   {
-    accountID: null,
+    accountId: null,
     accountNames: () => ({}),
     accountOptions: () => [],
     modelOptions: () => [],
@@ -233,7 +240,7 @@ async function load(next: number): Promise<void> {
   probesSeq++
   try {
     const page = await codexTicketAPI.listEvents({
-      account_ids: props.accountID ? [props.accountID] : accountFilter.value.map(Number),
+      account_ids: props.accountId ? [props.accountId] : accountFilter.value.map(Number),
       models: modelFilter.value,
       event_types: typeFilter.value,
       limit: PAGE_SIZE,
