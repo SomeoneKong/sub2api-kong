@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1097,8 +1098,58 @@ type kongVerifySnapshot struct {
 	// 全程复用验证开始时解析出的那个 URL——于是结论是在旧连接上得出的，却被提交为 verified，之后
 	// 业务走的是新连接。指纹存哈希而不是 URL 本身：URL 里可能带认证信息，不该进日志或事件。
 	TrafficProxyDigest string
-	TicketID           int64
-	ExpiresAt          time.Time
+	// IdentityDigest 是挑战**实际使用的上游账号身份**的指纹。
+	//
+	// 理由与 TrafficProxyDigest 同一条：挑战全程复用验证开始时读到的那个 `account`，而管理端可以
+	// 在验证期间把它换绑到另一个上游账号（改 setup token、改 chatgpt-account-id）。那时后续挑战
+	// 仍以旧身份出站，结论却会被提交成当前账号的合格票——把一张别人的票的证据授予了这个账号。
+	//
+	// **刻意不含 OAuth access token**：它会正常刷新，比它会让每次刷新都误杀一次验证。换绑时变的
+	// 是账号类型与 chatgpt-account-id，比这两项足够。存哈希而不是原值：setup token 是凭据。
+	IdentityDigest string
+	TicketID       int64
+	ExpiresAt      time.Time
+}
+
+// kongAccountIdentityDigest 把「这次挑战以谁的身份出站」压成短指纹。
+//
+// 判据是**这个值参与了出站请求的构造吗**，不是"它看起来像不像配置"。逐项对应：
+//
+//   - 账号主体走 `codexAccountIdentityNamespace`——项目已有的投影，按
+//     `(chatgpt_account_id, chatgpt_user_id)` → 指纹 seed → setup token 指纹三级退化。同一个
+//     Team 换用户、账号 id 缺失这两种情况它都能区分，而**正常的 token 轮换不影响它**（比
+//     access token 会让每次刷新都误杀一次验证）。
+//   - FedRAMP 决定 `x-openai-fedramp`（见 setOpenAIChatGPTAccountHeaders）。
+//   - 账号级 User-Agent 参与重建最终的 `User-Agent / originator / version`（见
+//     enforceCodexIdentityHeadersWithUA）。
+//   - setup token 本身就是 bearer，换它就是换身份；主体投影只在没有账号 id 与 seed 时才退到它，
+//     所以这里要单列。
+//
+// 各项**带长度前缀**再拼：直接用分隔符拼接时，值里含分隔符能让不同组合撞同一个摘要。
+//
+// ⚠️ 已知边界：一个既没有 chatgpt_account_id、也没有指纹 seed 的 OAuth 账号，主体投影为空，此时
+// 换绑检测不到。不拿 refresh token 去补——它在刷新时会轮换，补上等于把正常刷新也判成换绑。
+//
+// 账号级头覆写不在其中：`headerOverrideBlockedNames` 已经挡住了 authorization / session_id /
+// chatgpt-account-id 这些身份类头，能覆写的不构成"以谁的身份出站"。
+func kongAccountIdentityDigest(account *Account) string {
+	if account == nil {
+		return ""
+	}
+	parts := []string{
+		string(account.Type),
+		codexAccountIdentityNamespace(account),
+		strconv.FormatBool(account.IsChatGPTAccountFedRAMP()),
+		account.GetOpenAIUserAgent(),
+	}
+	if account.Type == AccountTypeSetupToken {
+		parts = append(parts, account.GetOpenAIAccessToken())
+	}
+	encoded := make([]string, 0, len(parts))
+	for _, part := range parts {
+		encoded = append(encoded, strconv.Itoa(len(part))+":"+part)
+	}
+	return kongProxyDigest(strings.Join(encoded, ""))
 }
 
 // kongProxyDigest 把一个代理连接串压成短指纹。
@@ -1128,17 +1179,20 @@ func (s *KongTicketService) recheckVerify(ctx context.Context, snap kongVerifySn
 		return fmt.Errorf("账号已不可调度")
 	}
 	cfg, _ := ParseKongTicketConfig(account.Extra)
+	// 判的是**模式变没变**，不是"当前是哪个模式"。off 同样可以验票：验证走流量出口、只是发几份
+	// 挑战问上游"这张票对应哪个模型"，不注入、不占票据出口静默。一个 off 账号手上的 observed 票
+	// 照样值得问——那正是"该不该给它开 full"的判据。
 	if cfg.Mode != snap.Mode {
 		return fmt.Errorf("模式已从 %s 改为 %s", snap.Mode, cfg.Mode)
-	}
-	if cfg.Mode == KongTicketModeOff {
-		return fmt.Errorf("已退出保护")
 	}
 	if KongEgressKey(cfg.Egress, cfg.ProxyID) != snap.TicketEgress {
 		return fmt.Errorf("票据出口已改变")
 	}
 	if KongTrafficEgressKey(account.ProxyID) != snap.TrafficEgress {
 		return fmt.Errorf("流量出口已从 %s 改为 %s", snap.TrafficEgress, KongTrafficEgressKey(account.ProxyID))
+	}
+	if kongAccountIdentityDigest(account) != snap.IdentityDigest {
+		return fmt.Errorf("账号的上游身份已改变")
 	}
 	// 同一个代理 id 下的连接配置也可能被改掉。重新解析并比指纹——不比较 URL 本身，避免把带认证
 	// 信息的串写进错误消息。
@@ -1225,7 +1279,8 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	snap := kongVerifySnapshot{
 		AccountID: account.ID, Model: model, Mode: cfg.Mode, TicketEgress: ticketEgress,
 		TrafficEgress: trafficEgress, TrafficProxyDigest: kongProxyDigest(trafficProxyURL),
-		TicketID: ticketID, ExpiresAt: expiresAt,
+		IdentityDigest: kongAccountIdentityDigest(account),
+		TicketID:       ticketID, ExpiresAt: expiresAt,
 	}
 
 	// 无论走到哪个终点，已经拿到的观测都要落库——它们是这次验证唯一的证据，事后补不回来。
@@ -1302,6 +1357,18 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	}
 
 	// failBeforeConclusion 用在还没落过证据的终点上：先存观测，再记事件。
+	// withProbeInsertError 把证据写库的失败并进 detail。**不覆盖原始失败原因**：证据写失败不该把
+	// 「为什么这次没成」盖掉。
+	withProbeInsertError := func(detail map[string]any, insErr error) map[string]any {
+		if insErr == nil {
+			return detail
+		}
+		if detail == nil {
+			detail = map[string]any{}
+		}
+		detail["probe_insert_error"] = insErr.Error()
+		return detail
+	}
 	failBeforeConclusion := func(outcome string, detail map[string]any, retErr error) (int64, error) {
 		if insErr := saveProbes(); insErr != nil {
 			if detail == nil {
@@ -1684,11 +1751,26 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 			// 不能用来判定它合格（否则会把一张坏票标成 verified）。
 			probe.InvalidReason = kongStrPtr(KongProbeInvalidCandidateNotAccept)
 			probes = append(probes, probe)
+			// **顺序是刻意的：先落证据，再复核，最后才施加处置。**
+			//
+			// 三件事都不可逆——排除候选让它不再被自动选中、冷却把下一个正常周期往后推、返回的
+			// sentinel 会让人工入口撤销这张票。而落库本身要花时间，期间模式可能被切走、出口被改、
+			// 账号被换绑；那之后这一份失败说明不了那张票的任何问题，它是在另一套前提下拿到的。
+			// 复核放在落库**之后**而不是之前，才覆盖得住这段窗口（stg0 / stg1 两条路径同一口径）。
+			probeErr := saveProbes()
+			if lost := s.recheckVerify(ctx, snap, time.Now()); lost != nil {
+				return finish(0, KongOutcomeInconclusive,
+					withProbeInsertError(map[string]any{
+						"reason": "precondition_lost", "detail": lost.Error(),
+					}, probeErr),
+					fmt.Errorf("验证前提已失效: %w", lost))
+			}
 			skipCandidate("candidate_not_accepted")
 			// 这是一次真实的挑战开销，且说明刚采到的票已经作废。fetch 来源必须退避，否则
 			// `min_idle=0` 下相邻两个请求会各取一张新票、各烧一次挑战，全部无效。
 			failCooldown("candidate_not_accepted")
-			return failBeforeConclusion(KongOutcomeFailure, map[string]any{"reason": "candidate_not_accepted"},
+			return finish(0, KongOutcomeFailure,
+				withProbeInsertError(map[string]any{"reason": "candidate_not_accepted"}, probeErr),
 				ErrKongTicketNotAccepted)
 		}
 		attributed, attrErr := takeAnswer(probe, answer.Text, challenge.ExpectedCount)
@@ -1711,6 +1793,15 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	}
 
 	if result == nil {
+		// 同 EchoedState 分支：先落证据，复核放在落库之后，再施加不可逆的处置。
+		probeErr := saveProbes()
+		if lost := s.recheckVerify(ctx, snap, time.Now()); lost != nil {
+			return finish(0, KongOutcomeInconclusive,
+				withProbeInsertError(map[string]any{
+					"reason": "precondition_lost", "detail": lost.Error(),
+				}, probeErr),
+				fmt.Errorf("验证前提已失效: %w", lost))
+		}
 		// 淘汰本段无票期里的 observed 候选：它们会被逐张验证，每次都绕过取票冷却。
 		// fetch 候选**不在**批量淘汰范围内（见 SkipCandidatesFor 的注释），所以正在验的这张要
 		// 单独标——不标的话 OldestCandidate 下一次照样选中它，同一张票被无限重验。
@@ -1721,7 +1812,8 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 		// F 会让升级白等一个冷却期。
 		failCooldown("no_valid_answer")
 		// 没有有效回答是"没测出来"，不是"票不合格"——票留在候选池等下一次机会。
-		return failBeforeConclusion(KongOutcomeInconclusive, map[string]any{"reason": "no_valid_answer"},
+		return finish(0, KongOutcomeInconclusive,
+			withProbeInsertError(map[string]any{"reason": "no_valid_answer"}, probeErr),
 			fmt.Errorf("没有可用回答，无法判定"))
 	}
 
@@ -2244,7 +2336,10 @@ type KongManualVerify struct {
 	// 它与 Revoked 互斥，两者都为假且 Accepted 为假时说明压根没开始验（见 DenyReason）。
 	Inconclusive bool `json:"inconclusive"`
 	// Candidate 为真表示验的是一张**候选**，不是正在服务的票。调用方据它措辞：候选通过是
-	// "升为当前票"、被拒是"从候选池排除"，与作废一张在服务的票不是一回事。
+	// "进入可用集合"、被拒是"从候选池排除"，与作废一张在服务的票不是一回事。
+	//
+	// **不承诺"成为当前票"**：当前票按剩余寿命最长的合格票选，一张更早过期的验过了也不会接替；
+	// 而 off / observe 压根不注入，那两个模式下永远不会有当前票。
 	Candidate bool `json:"candidate"`
 	// BudgetExhausted 为真表示还有一张候选没验——本端点是同步的，余量不够再跑一张（最坏约 90s）
 	// 时宁可不开始，调用方据它提示"可以再点一次"。
@@ -2255,7 +2350,7 @@ type KongManualVerify struct {
 	Steps []KongManualVerifyStep `json:"steps"`
 	// Reason 是没通过的原因，取 verifyTicket 的错误文本。
 	Reason string `json:"reason"`
-	// NotApplicable 表示压根没票可验，或该账号已退出保护（mode=off）。
+	// NotApplicable 表示压根没票可验（当前票与可验候选都没有）。模式不是它的成因——三种模式都能验。
 	NotApplicable bool `json:"not_applicable"`
 	// DenyReason 说明为什么没能开始验（同账号有任务在途之类）。
 	DenyReason string `json:"deny_reason"`
@@ -2304,13 +2399,9 @@ func (s *KongTicketService) TriggerVerify(ctx context.Context, accountID int64, 
 	}
 	out := &KongManualVerify{}
 	cfg, _ := ParseKongTicketConfig(account.Extra)
-	// off 连不上这条路：`recheckVerify` 会以「已退出保护」中止，于是这次验证**必然**以"未得出
-	// 结论"收尾——不是会误伤票（三态已经不会了），而是压根问不出答案，没有让人点的理由。
-	if cfg.Mode == KongTicketModeOff {
-		out.NotApplicable = true
-		out.DenyReason = KongDenyModeNotFull
-		return out, nil
-	}
+	// **三种模式都能验**：验证走流量出口、不注入、不消耗票据出口的静默，问的是"手上这张票对应
+	// 哪个模型"。off 账号照样收票入库（见 ObserveState），它那些票的档位正是"该不该开 full"的
+	// 判据。只有**取票**是 full 专属（那是保护行为，见 ensureTicket 的模式判定）。
 	if !account.IsSchedulable() {
 		out.DenyReason = KongDenyAccountUnready
 		return out, nil
@@ -2535,12 +2626,7 @@ func (s *KongTicketService) TriggerVerifyTicket(ctx context.Context, accountID, 
 	}
 	out := &KongManualVerify{}
 	cfg, _ := ParseKongTicketConfig(account.Extra)
-	if cfg.Mode == KongTicketModeOff {
-		// 同 TriggerVerify：off 下 recheckVerify 会以「已退出保护」中止，问不出答案。
-		out.NotApplicable = true
-		out.DenyReason = KongDenyModeNotFull
-		return out, nil
-	}
+	// 模式不参与判定，理由同 TriggerVerify。
 	if !account.IsSchedulable() {
 		out.DenyReason = KongDenyAccountUnready
 		return out, nil

@@ -160,6 +160,8 @@ func (r *kongTicketRepository) OldestCandidate(ctx context.Context, accountID in
 // NewestCandidate 返回最新的一张可验证候选（人工「立即验票」用，顺序与上面相反的理由见接口注释）。
 // 同样不选 skip_until_new 的：那些是「未被上游接受」留下的，重选只会重复同一个无效尝试。
 func (r *kongTicketRepository) NewestCandidate(ctx context.Context, accountID int64, model string, now time.Time) (*service.KongTicket, error) {
+	// 条件与 CountTickets 成对：那边是"有几张可验"，这边是"验哪一张"，两边不一致就会长出一个
+	// 点下去必然报"没有票可验"的按钮。改任一处都要同时改另一处。
 	query := `SELECT ` + kongTicketColumns + ` FROM kong_ticket_cache
 		WHERE account_id = $1 AND model = $2 AND status = $3
 		  AND expires_at > $4 AND NOT skip_until_new
@@ -507,9 +509,13 @@ func (r *kongTicketRepository) ReviveRejectedCandidate(ctx context.Context, acco
 
 func (r *kongTicketRepository) CountTickets(ctx context.Context, accountID int64, model string, status string) (int, error) {
 	var n int
+	// **必须与 NewestCandidate 同一套条件**（含 `NOT skip_until_new`）：这个数字是页面判断"有没有
+	// 东西可验"的依据，宽于实际可选集合就会显示一个点下去必然报"没有票可验"的按钮，而页面同时还
+	// 写着"候选 N 张待验"——两句互相打脸。被跳过的票仍由明细页逐行列出、逐行可验。
 	err := r.db.QueryRowContext(ctx,
 		`SELECT count(*) FROM kong_ticket_cache
-		 WHERE account_id = $1 AND model = $2 AND status = $3 AND expires_at > now()`,
+		 WHERE account_id = $1 AND model = $2 AND status = $3
+		   AND expires_at > now() AND NOT skip_until_new`,
 		accountID, model, status).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("count tickets: %w", err)

@@ -435,6 +435,8 @@ type KongTicketRepository interface {
 	// RevokeTicket 撤销一张票的服务资格。撤销对象必须是本次实际使用的票，不是「当前票」：
 	// 并发下前者可能已被新票接替，按后者撤销会作废无辜的新票。
 	RevokeTicket(ctx context.Context, id int64) error
+	// CountTickets 数**可选**的票：未过期，且没有被排出候选池（`skip_until_new`）。口径必须与
+	// NewestCandidate 一致——它的结果是页面"有没有东西可验"的依据。
 	CountTickets(ctx context.Context, accountID int64, model string, status string) (int, error)
 	DeleteExpiredTickets(ctx context.Context, cutoff time.Time, batchSize int) (int64, error)
 

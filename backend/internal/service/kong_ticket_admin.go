@@ -654,14 +654,14 @@ type KongTicketDetail struct {
 	// Preferred 为真表示按当前判据它是该模型的首选票——与 IsCurrent 的差别只在模式。`off` /
 	// `observe` 下看的就是这个：存量票里哪张最合格，而它并没有在被注入。
 	Preferred bool `json:"preferred"`
-	// Verifiable 为真表示这张票现在可以手工验。四个条件缺一不可：功能已启用、模式非 off
-	// （那下面 recheckVerify 必然以「已退出保护」中止，问不出答案）、账号可调度、票未过期。
+	// Verifiable 为真表示这张票现在可以手工验：功能已启用、账号可调度、票未过期。
+	// **模式不参与**——三种模式都能手动验票。
 	//
 	// **不含"票据出口可用"**：验证走流量出口。已拒的与被跳过的都可以验——服务端会先按 id 准备
 	// （复位 + 清跳过标记），否则结论必然提交不上。
 	Verifiable bool `json:"verifiable"`
 	// NotVerifiableReason 说明为什么不能验。空字符串表示可以验。不给原因的话页面只能猜，而
-	// "已过期"与"该模式不验票"是完全不同的两件事。
+	// "已过期"与"账号不可调度"是完全不同的两件事。
 	NotVerifiableReason string `json:"not_verifiable_reason"`
 }
 
@@ -724,12 +724,12 @@ func (s *KongTicketAdminService) TicketDetail(ctx context.Context, accountID int
 	}
 	// 账号级的"能不能验"只算一次：它与具体哪张票无关。顺序是刻意的——先报最根本的原因，
 	// 否则页面会把"功能没开"显示成"账号不可调度"。
+	// **模式不在这里判**：三种模式都能手动验票（验证走流量出口、不注入、不占票据出口静默），
+	// off 账号照样收票入库，它那些票的档位正是"该不该开 full"的判据。
 	accountReason := ""
 	switch {
 	case len(s.gatedModels) == 0 || s.svc == nil:
 		accountReason = "票据功能未启用"
-	case cfg.Mode == KongTicketModeOff:
-		accountReason = "该账号已退出保护（off），验证流程必然以「已退出保护」中止"
 	case !status.Ready:
 		accountReason = "账号当前不可调度：" + status.NotReady
 	}

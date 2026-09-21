@@ -266,9 +266,9 @@ export interface TicketDetailRow {
   is_current: boolean
   /** 按当前判据它是该模型的首选票。与 is_current 的差别只在模式——off / observe 并不注入。 */
   preferred: boolean
-  /** 现在可以手工验。已拒的与被跳过的都可以（服务端会先准备）；已过期、off、不可调度的不行。 */
+  /** 现在可以手工验。已拒的与被跳过的都可以（服务端会先准备）；已过期、账号不可调度的不行。 */
   verifiable: boolean
-  /** 为什么不能验。空串表示可以验——「已过期」与「该账号已退出保护」是不同的两件事。 */
+  /** 为什么不能验。空串表示可以验——「已过期」与「账号不可调度」是不同的两件事，原因由服务端给。 */
   not_verifiable_reason: string
 }
 
@@ -312,7 +312,7 @@ export interface TicketVerifyResult {
   /** 本次实际验过的每一张，按执行顺序；顶层字段等于最后一步。 */
   steps: TicketManualVerifyStep[]
   reason: string
-  /** 压根没票可验，或该账号已退出保护（mode=off）。 */
+  /** 压根没票可验（当前票与可验候选都没有）。模式不是它的成因——三种模式都能验。 */
   not_applicable: boolean
   /** 没能开始验的原因（同账号有任务在途之类）。 */
   deny_reason: string

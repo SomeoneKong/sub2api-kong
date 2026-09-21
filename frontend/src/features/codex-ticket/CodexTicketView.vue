@@ -164,11 +164,12 @@
                              「有当前票」＝「还在受保护」。 -->
                         <span v-if="row.mode === 'off'" class="text-gray-400">· off 不注入</span>
                       </p>
-                      <!-- off 本就不该有服务中的票，缺票不是异常，别用警示色。 -->
-                      <p v-else-if="row.mode === 'off'" class="text-xs text-gray-500 dark:text-dark-400">无当前票（off 不取票）</p>
+                      <!-- off 本就不该有服务中的票，缺票不是异常，别用警示色。它仍可能有候选——
+                           off 照样收业务响应带回的票，只是不注入、不自动探测。 -->
+                      <p v-else-if="row.mode === 'off'" class="text-xs text-gray-500 dark:text-dark-400">无当前票（off 不注入）</p>
                       <p v-else class="text-xs text-amber-700 dark:text-amber-300">无可用当前票</p>
                       <p v-if="m.unverified_count > 0" class="text-xs text-gray-500 dark:text-dark-400">
-                        候选 {{ m.unverified_count }} 张待验
+                        可验候选 {{ m.unverified_count }} 张
                       </p>
                       <div class="mt-1 flex items-center gap-2">
                         <!-- 人工干预：立刻走一遍取票/验票，**跳过静默与冷却**（那两条是自动运行用的
@@ -188,7 +189,7 @@
                         <!-- 立即验票针对**现有的票**：有当前票就重验它，没有就验最新的那张候选
                              （批量取票之后"有票但未验"是常态）。本端点永不取票，那是上一个按钮的事。
                              验证走流量出口，不消耗票据出口的静默，所以不受 canFetch 那几条约束。
-                             off 除外——那时验证流程必然以「已退出保护」中止，问不出答案。 -->
+                             模式不参与判定——off 照样收票入库，验它才知道该不该开 full。 -->
                         <button
                           v-if="canVerify(row, m)"
                           type="button"
@@ -580,19 +581,24 @@ function canFetch(row: TicketAccountStatus): boolean {
   return row.mode === 'full' && row.ready
 }
 
-// 立即验票的判据：**手上有票可验**就行，与它验没验过、与票据出口能不能用都无关（验证走流量
-// 出口）。批量取票之后「有一张未验候选、但没有当前票」是常态局面——那时正是最需要人工把它验
-// 起来的时候，藏掉按钮等于只能干等该模型自己来一个请求。
-// off 是唯一例外：验证流程在那下面必然以「已退出保护」中止，点了也问不出答案。
+// 立即验票的判据：**手上有票可验**就行。与它验没验过、与票据出口能不能用、与是哪个模式都无关
+// ——验证走流量出口、不注入、不占票据出口的静默，问的只是"这张票对应哪个模型"。
+//
+// **off 也能验**：那个模式照样收票入库（只是不注入、不自动探测），而它手上那些票的档位正是
+// "该不该给这个账号开 full"的判据。批量取票之后「有一张未验候选、但没有当前票」是常态局面——
+// 那时正是最需要人工把它验起来的时候，藏掉按钮等于只能干等该模型自己来一个请求。
 function canVerify(row: TicketAccountStatus, m: TicketModelStatus): boolean {
-  if (row.mode === 'off' || !row.ready) return false
+  if (!row.ready) return false
   return liveRemaining(m.current_ticket, row.account_id) > 0 || m.unverified_count > 0
 }
 
 function verifyTitle(row: TicketAccountStatus, m: TicketModelStatus): string {
   const base = '走流量出口，不占票据出口静默；本端点永不取票。'
   if (liveRemaining(m.current_ticket, row.account_id) > 0) {
-    return `重验正在服务的这张票。${base}真验出问题才作废，探测失败只报未得出结论、旧票保留`
+    // 只有 full 在注入。off / observe 下这张票是"已验证、但这个模式不用它"，说成"正在服务"
+    // 与同一行的「off 不注入」自相矛盾。
+    const what = row.mode === 'full' ? '重验正在服务的这张票' : '重验这张已验证的票（该模式不注入它）'
+    return `${what}。${base}真验出问题才作废，探测失败只报未得出结论、旧票保留`
   }
   return `验最新的那张待验候选（跳过 min_ticket_age）。${base}合格即进入可用集合`
 }

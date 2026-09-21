@@ -238,7 +238,7 @@ func TestKongManualVerifyEarlierExpiryDoesNotReplaceCurrent(t *testing.T) {
 	}
 }
 
-// 详情页必须按模式区分「能不能验」与「在不在注入」，并且任何模式下都不下发票原值。
+// 详情页对三种模式的口径：**都能验**，但只有 full 宣称"在服务"，且任何模式下都不下发票原值。
 func TestKongTicketDetailModePolicies(t *testing.T) {
 	for _, mode := range []KongTicketMode{KongTicketModeOff, KongTicketModeObserve, KongTicketModeFull} {
 		t.Run(string(mode), func(t *testing.T) {
@@ -257,17 +257,10 @@ func TestKongTicketDetailModePolicies(t *testing.T) {
 				t.Fatalf("票据详情: %v", err)
 			}
 			row := page.Tickets[0]
-			// off 下 recheckVerify 必然以「已退出保护」中止，问不出答案，所以不该给验票入口。
-			if mode == KongTicketModeOff {
-				if row.Verifiable {
-					t.Error("off 仍把票标成可验")
-				}
-				if row.NotVerifiableReason == "" {
-					t.Error("不可验必须给出原因，否则页面只能猜")
-				}
-			} else if !row.Verifiable {
-				t.Errorf("%s 应当可以验票（验证走流量出口，不要求票据出口可用）：%s",
-					mode, row.NotVerifiableReason)
+			// **三种模式都能验**：验证走流量出口、不注入、不要求票据出口可用。off 手上那些被动
+			// 收下的票，档位正是"该不该给它开 full"的判据——藏掉入口就只能靠猜。
+			if !row.Verifiable {
+				t.Errorf("%s 应当可以验票，实得不可验：%s", mode, row.NotVerifiableReason)
 			}
 			// 只有 full 在注入；off / observe 的存量票只是"首选"，不是"在用"。
 			if mode != KongTicketModeFull && row.IsCurrent {

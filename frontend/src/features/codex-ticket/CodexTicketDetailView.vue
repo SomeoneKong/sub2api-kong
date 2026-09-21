@@ -100,7 +100,7 @@
                   >
                     {{ verifyingID === t.id ? '验证中…' : t.is_current ? '重验' : '验证' }}
                   </button>
-                  <!-- 原因由服务端给：「已过期」与「该账号已退出保护」是完全不同的两件事，
+                  <!-- 原因由服务端给：「已过期」与「账号不可调度」是完全不同的两件事，
                        页面自己猜会把后者说成前者。 -->
                   <span v-else class="text-xs text-gray-400 dark:text-dark-500">{{ t.not_verifiable_reason || '不可验' }}</span>
                   <p v-if="notes[t.id]" class="mt-1 text-xs" :class="notes[t.id].ok ? 'text-green-700 dark:text-green-300' : 'text-amber-700 dark:text-amber-300'">
@@ -267,7 +267,14 @@ function verifyTitle(t: TicketDetailRow): string {
   if (t.status === 'rejected') {
     return '先把这张已拒票复位成候选再验——改过接受白名单或阈值之后，同一份证据可能就合格了'
   }
-  return '验这张候选；合格即可成为当前票'
+  // 按 status 分：verified 的是备用票（重验），unverified 才是首次验证的候选。
+  //
+  // **不承诺"成为当前票"**：当前票按剩余寿命最长的合格票选，一张更早过期的验过了也不会接替；
+  // 而 off / observe 压根不注入，那两个模式下永远不会有"当前票"。
+  if (t.status === 'verified') {
+    return '重验这张已验证的备用票：真验出问题才作废，探测失败只报未得出结论、票保留'
+  }
+  return '验这张候选；合格即进入可用集合'
 }
 
 // 只显示排在前面的几个档位：全列出来一行放不下，而看的人要的是「被归到了哪一档」。

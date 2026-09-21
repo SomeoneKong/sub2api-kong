@@ -534,8 +534,20 @@ func (r *kongStubRepo) RevokeTicket(_ context.Context, id int64) error {
 	return nil
 }
 
-func (r *kongStubRepo) CountTickets(_ context.Context, _ int64, _ string, _ string) (int, error) {
-	return 0, nil
+// CountTickets 按生产口径实现：未过期、未被排出候选池。返回 0 的桩会让"按钮与计数口径一致"
+// 这类断言永远为真，测不出任何东西。
+func (r *kongStubRepo) CountTickets(_ context.Context, accountID int64, model string, status string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, t := range r.tickets {
+		if t.AccountID == accountID && t.Model == model && t.Status == status &&
+			t.ExpiresAt.After(now) && !t.SkipUntilNew {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (r *kongStubRepo) DeleteExpiredTickets(_ context.Context, _ time.Time, _ int) (int64, error) {

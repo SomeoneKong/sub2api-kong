@@ -18,7 +18,9 @@ const reasonTexts: Record<string, string> = {
   candidate_not_accepted: '上游未接受这张候选票',
   ticket_expired: '票已过期',
   // 验证未得出结论
-  precondition_lost: '开始前前提已失效',
+  // 三个产生点：挑战发出前、拿到「上游又下发票」之后、以及三份挑战都没有有效回答之后。
+  // 后两个都在挑战**已经发出**（额度已经花掉）之后，所以文案必须是阶段中性的。
+  precondition_lost: '验证前提已失效',
   no_valid_answer: '没有一份有效回答',
   stale_result: '前提已失效，结论作废',
   probe_persist_failed: '探测证据入库失败',

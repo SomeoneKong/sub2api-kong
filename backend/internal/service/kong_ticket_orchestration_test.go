@@ -28,6 +28,10 @@ type kongStubUpstream struct {
 	fetchHook func()
 	// credHook 模拟凭据准备阶段（在 SentAt 之前），用来验证那一段不进取票耗时。
 	credHook func()
+	// beforeChallenge 在每份挑战发出前调用，用来在验证途中改掉前提。
+	beforeChallenge func()
+	// echoState 非空时每份挑战都回显一张票（上游未接受注入）。
+	echoState string
 
 	// answers 按调用顺序返回；用尽后重复最后一个。
 	answers []*KongUpstreamAnswer
@@ -133,9 +137,20 @@ func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, mode
 
 func (u *kongStubUpstream) RunChallenge(_ context.Context, _ *Account, _, _ string, _ KongFingerprintChallenge, _ string) (*KongUpstreamAnswer, error) {
 	u.mu.Lock()
+	hook := u.beforeChallenge
+	u.mu.Unlock()
+	// 挑战发出之后、判定之前的钩子：用来把"前提在挑战期间变了"这件事精确插进去。
+	if hook != nil {
+		hook()
+	}
+	u.mu.Lock()
 	defer u.mu.Unlock()
 	idx := u.challengeCall
 	u.challengeCall++
+	// echoState 非空 = 上游又下发了票，即本次注入没被接受。
+	if u.echoState != "" {
+		return &KongUpstreamAnswer{Text: "1,2,3", EchoedState: u.echoState, ReportedModel: u.reportedModel}, nil
+	}
 	if err, ok := u.answerErrFor[idx]; ok {
 		return nil, err
 	}

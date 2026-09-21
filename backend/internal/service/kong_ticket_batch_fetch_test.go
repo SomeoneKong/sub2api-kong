@@ -94,10 +94,27 @@ func kongFinalVerifyCount(repo *kongStubRepo) int {
 	return n
 }
 
+// 持锁读：observe 路径会起后台 goroutine，它经 InsertEvent（持锁）往同一个切片追加。无锁遍历
+// 与它并发就是数据竞争，而普通 `go test` 不会报出来。
 func kongCountEvents(repo *kongStubRepo, eventType string) int {
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
 	n := 0
 	for _, e := range repo.events {
 		if e.EventType == eventType {
+			n++
+		}
+	}
+	return n
+}
+
+// kongCountTickets 同样持锁：票表也会被后台任务写。
+func kongCountTickets(repo *kongStubRepo, accountID int64, model string) int {
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	n := 0
+	for _, t := range repo.tickets {
+		if t.AccountID == accountID && t.Model == model {
 			n++
 		}
 	}
@@ -698,5 +715,49 @@ func TestKongBatchFetchEventsCarryUpstreamDuration(t *testing.T) {
 	}
 	if seen != 2 {
 		t.Fatalf("取票事件数 = %d, want 2（批内两个模型各一条）", seen)
+	}
+}
+
+// **三种模式都收票入库，只有 observe 会自动探测。**
+//
+// off 的语义是"不参与保护"——不注入、不主动取票、不自动烧额度探测。它**不**是"看见票就扔掉"：
+// 业务响应带回的票是免费的（不消耗任何出口静默），留着它，模式切到 full 时缓存里立刻有票可用，
+// 而在 off 期间也能靠人工验票问出"这张票是什么档位"，那正是"该不该开 full"的判据。
+func TestKongObserveStateStoresInEveryModeAndProbesOnlyInObserve(t *testing.T) {
+	const model = kongBatchAstra
+	for _, tc := range []struct {
+		mode      KongTicketMode
+		wantProbe bool
+	}{
+		{KongTicketModeOff, false},
+		{KongTicketModeObserve, true},
+		{KongTicketModeFull, false},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			repo := newKongStubRepo()
+			accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+			account := kongTestAccount(1, tc.mode, KongTicketEgressNone)
+			proxyID := int64(100)
+			account.ProxyID = &proxyID
+			accounts.set(account)
+			up := &kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}, answers: kongVerifyAnswers()}
+			svc := kongTestService(t, repo, up, accounts)
+			svc.accept = KongTicketAccept{model: []string{model}}
+
+			state := strings.Repeat("b", 292)
+			svc.ObserveState(context.Background(), 1, model, state)
+
+			stored := kongCountTickets(repo, 1, model)
+			if stored != 1 {
+				t.Fatalf("%s 模式下收到的票也要入库，实际库里有 %d 张", tc.mode, stored)
+			}
+			// observe_probe 的起始事件是**同步**写的（间隔靠它推进），所以这里已经能判。后台任务
+			// 之后只会追加同类事件，不会让"存在"变回"不存在"，所以不必等它收尾——两个计数都持锁读。
+			probed := kongCountEvents(repo, KongEventObserveProbe) > 0
+			if probed != tc.wantProbe {
+				t.Errorf("%s 模式下自动探测 = %v, want %v——off 与 full 都不该自动烧额度探测"+
+					"（full 靠验票流程，off 只在人工点击时才验）", tc.mode, probed, tc.wantProbe)
+			}
+		})
 	}
 }
