@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/config"
 )
 
 func TestKongStg0VerdictThreeStates(t *testing.T) {
@@ -679,5 +681,43 @@ func TestKongLastSampleReflectsLatestFetch(t *testing.T) {
 	}
 	if sample.Outcome != KongOutcomeSuccess {
 		t.Errorf("取样结果 = %q, want %q", sample.Outcome, KongOutcomeSuccess)
+	}
+}
+
+// 内置默认的 stg0 白名单：格式必须能解析，方向必须只放开"升级投放"。
+//
+// 这张表每加一项都要能说清"为什么这个替换不算降智"。默认收 `gpt-5.6-sol → gpt-6-sol`：上游把更新的
+// 模型投到旧模型名上，拿到的是更好的东西，判死票等于为了一次升级白搭一整段出口静默。反方向（回报
+// 更旧或更小的模型）绝不能被这张表放过——那正是要拦的降智。
+func TestKongStg0DefaultAcceptOnlyAllowsUpgrade(t *testing.T) {
+	gated := []string{"gpt-5.6-sol", "gpt-6-astra"}
+	accept, warnings, err := KongParseStg0Accept(gated, config.DefaultKongTicketStg0Accept)
+	if err != nil {
+		t.Fatalf("内置默认必须能解析：%v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("内置默认不该产生告警：%v", warnings)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		requested string
+		reported  string
+		want      KongStg0Verdict
+	}{
+		{"升级投放被接受", "gpt-5.6-sol", "gpt-6-sol", KongStg0Pass},
+		{"升级投放带日期快照", "gpt-5.6-sol", "gpt-6-sol-2026-03-17", KongStg0Pass},
+		// 下面几条是这张表**不能**放过的：都是上游明说给了别的（更旧或更小）模型。
+		{"降到 5.5 仍判死", "gpt-5.6-sol", "gpt-5.5", KongStg0Fail},
+		{"降到 mini 仍判死", "gpt-5.6-sol", "gpt-5-mini", KongStg0Fail},
+		// 白名单是逐模型的：给 sol 开的项不该顺带放宽 astra。
+		{"astra 收到 sol 仍判死", "gpt-6-astra", "gpt-6-sol", KongStg0Fail},
+		{"astra 收到 5.6-sol 仍判死", "gpt-6-astra", "gpt-5.6-sol", KongStg0Fail},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := accept.Verdict(tc.requested, tc.reported); got != tc.want {
+				t.Errorf("Verdict(%q, %q) = %v, want %v", tc.requested, tc.reported, got, tc.want)
+			}
+		})
 	}
 }
