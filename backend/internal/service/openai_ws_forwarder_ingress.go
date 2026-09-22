@@ -1145,6 +1145,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 			eventType, eventResponseID, _ := parseOpenAIWSEventEnvelope(upstreamMessage)
 			responseModelObserver.ObserveOpenAI(upstreamMessage, eventType)
+			// [kong] 逐轮的额度快照：原生 WS 没有逐轮响应头，上游把它放在这个带外事件里
+			// （见 noteOpenAIWSCodexRateLimits）。
+			s.noteOpenAIWSCodexRateLimits(ctx, account, eventType, upstreamMessage)
 			if responseID == "" && eventResponseID != "" {
 				responseID = eventResponseID
 			}
@@ -1385,8 +1388,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					OpenAIWSMode:                  true,
 					UpstreamTerminalEvent:         terminalEvent,
 					ResponseHeaders:               lease.HandshakeHeaders(),
-					Duration:                      time.Since(turnStart),
-					FirstTokenMs:                  firstTokenMs,
+					// [kong] 这是连接级的握手头，不是本轮响应头（见 KongCodexQuotaHeaders）。
+					KongResponseHeadersFromWSHandshake: true,
+					Duration:                           time.Since(turnStart),
+					FirstTokenMs:                       firstTokenMs,
 					// [kong] 请求特征：本轮准入记下的那份（含上游回发的 state，由 GuardWSDownstream 补记）。
 					KongRequestFeatures: kongFeatures.Snapshot(),
 				}

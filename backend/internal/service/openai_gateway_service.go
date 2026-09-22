@@ -259,6 +259,12 @@ type OpenAIForwardResult struct {
 	// KongRequestFeatures 是本次上送的请求特征（fork 专有，见 kong_ticket_request_feature.go）。
 	// nil 表示这条通路没记到任何特征——非门控模型，或该通路尚未接采集。
 	KongRequestFeatures *KongRequestFeatures
+	// KongResponseHeadersFromWSHandshake 标记 ResponseHeaders 装的是**连接级的 WS 握手响应头**，
+	// 不是本轮的响应头（fork 专有）。原生 WS 逐轮没有响应头，三条通路把握手头放进来供限流信号与
+	// retry-after 使用，但那份额度是**拨号时刻**的，而连接池的连接活得很久——拿它回填逐轮额度会把
+	// 带内 `codex.rate_limits` 事件刚写进去的实时水位覆盖成旧值。取额度的响应头一律经
+	// KongCodexQuotaHeaders，不要直接读 ResponseHeaders。
+	KongResponseHeadersFromWSHandshake bool
 	// ServiceTier is the final tier sent upstream after policy rewriting.
 	// The upstream response declaration remains separate above and is reconciled
 	// at usage-recording time, where the credential protocol is available.

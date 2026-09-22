@@ -993,7 +993,9 @@ func ParseCodexRateLimitHeaders(headers http.Header) *OpenAICodexUsageSnapshot {
 		snapshot.PrimaryUsedPercent = v
 		hasData = true
 	}
-	if v := parseInt("x-codex-primary-reset-after-seconds"); v != nil {
+	// [kong] 荒谬的倒计时会让 reset_at 溢出成过去时间，进而被当成"该窗口已重置"而跳过额度暂停
+	// （见 kongSaneResetAfterSeconds）。两条采集路共用同一道校验，否则同一份输入两侧结论不同。
+	if v := kongSaneResetAfterSeconds(parseInt("x-codex-primary-reset-after-seconds")); v != nil {
 		snapshot.PrimaryResetAfterSeconds = v
 		hasData = true
 	}
@@ -1007,7 +1009,7 @@ func ParseCodexRateLimitHeaders(headers http.Header) *OpenAICodexUsageSnapshot {
 		snapshot.SecondaryUsedPercent = v
 		hasData = true
 	}
-	if v := parseInt("x-codex-secondary-reset-after-seconds"); v != nil {
+	if v := kongSaneResetAfterSeconds(parseInt("x-codex-secondary-reset-after-seconds")); v != nil {
 		snapshot.SecondaryResetAfterSeconds = v
 		hasData = true
 	}
