@@ -1045,6 +1045,30 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		turnStart := time.Now()
 		wroteDownstream := false
+		mappedModel := ""
+		needModelReplace := false
+		var mappedModelBytes []byte
+		if originalModel != "" {
+			mappedModel = strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+			if mappedModel == "" {
+				mappedModel = normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel))
+			}
+			needModelReplace = mappedModel != "" && mappedModel != originalModel
+			if needModelReplace {
+				mappedModelBytes = []byte(mappedModel)
+			}
+		}
+		// [kong] 上游在握手响应里给的那张票也要收（见 ObserveHandshakeState）。
+		//
+		// 位置有三个约束：连接已握手（拿到 lease 之后）、上游模型已定（所以先算 mappedModel）、
+		// **早于首帧上送**——首帧写失败会直接返回，挂在它后面等于让免费样本取决于本轮业务是否成功。
+		// 一条物理连接只收一次，而"该不该消费"必须先判门控：非门控轮把票消费掉又不入库，同一条
+		// 连接后续的门控轮就再也收不到了（见 ShouldObserveHandshakeState）。
+		if s.kongTicket.ShouldObserveHandshakeState(mappedModel) {
+			if handshakeState := lease.ConsumeHandshakeTurnState(); handshakeState != "" {
+				s.kongTicket.ObserveHandshakeState(ctx, account, mappedModel, handshakeState)
+			}
+		}
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
 			return nil, wrapOpenAIWSIngressTurnError(
 				"write_upstream",
@@ -1078,20 +1102,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		replayCollector := &openAIWSToolCallReplayCollector{}
 		firstEventType := ""
 		lastEventType := ""
-		needModelReplace := false
 		clientDisconnected := false
-		mappedModel := ""
-		var mappedModelBytes []byte
-		if originalModel != "" {
-			mappedModel = strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-			if mappedModel == "" {
-				mappedModel = normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel))
-			}
-			needModelReplace = mappedModel != "" && mappedModel != originalModel
-			if needModelReplace {
-				mappedModelBytes = []byte(mappedModel)
-			}
-		}
 		for {
 			upstreamMessage, readErr := lease.ReadMessageWithContextTimeout(ctx, s.openAIWSReadTimeout())
 			if readErr != nil {
@@ -1327,6 +1338,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					)
 				}
 				imageCount := imageCounter.Count()
+				// [kong] ctx_pool 的 state 是连接级的：客户端放在 upgrade 请求头，本服务放进与上游
+				// 那条连接的握手头，帧内没有它。所以快照之前要从连接级补两项——
+				// 出站那份只认**这条连接握手时真正发出去的**值（复用连接时客户端本次带来的那个一个
+				// 字节都没上送），客户端那份取客户端自己的请求头（详见两个 Record* 的说明）。
+				kongFeatures.RecordOutboundIfAbsent(lease.SentHandshakeTurnState())
+				kongFeatures.RecordClientStateIfAbsent(strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader)))
 				result := &OpenAIForwardResult{
 					RequestID:                     responseID,
 					Usage:                         usage,

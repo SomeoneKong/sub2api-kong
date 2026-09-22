@@ -491,3 +491,400 @@ func TestKongFeaturesTravelOnOutboundRequest(t *testing.T) {
 		t.Error("没有请求对象时应当是 nil")
 	}
 }
+
+// 原生 WS 的 ctx_pool / passthrough 通路上，客户端的 state **不在帧里**：它由客户端放在 WebSocket
+// upgrade 的请求头上，再由本服务放到与上游那条连接的握手头上。逐帧去量必然量不到——kong.11 上线后
+// ctx_pool 的特征全空正是这个原因，靠 WarnMissingRequestFeatures 那条守卫喊出来才发现。
+func TestKongRecordOutboundIfAbsentCoversConnectionLevelState(t *testing.T) {
+	connState := strings.Repeat("c", 292)
+
+	t.Run("帧里没有就取连接级那一个", func(t *testing.T) {
+		r := &KongFeatureRecorder{}
+		r.recordOutbound(kongStateObservation{}, kongStateObservation{}, 0)
+		if r.Snapshot() != nil {
+			t.Fatal("帧里没有 state 时本该什么都没记")
+		}
+		r.RecordOutboundIfAbsent(connState)
+		f := r.Snapshot()
+		if f == nil || f.StateLen == nil || *f.StateLen != 292 || f.StateFP != kongStateFingerprint(connState) {
+			t.Fatalf("连接级 state 没补上：%+v", f)
+		}
+	})
+
+	t.Run("帧里有值就不许被连接级盖掉", func(t *testing.T) {
+		// 我们注入的票写在帧内 client_metadata，那才是本轮生效的那一个。
+		ticket := strings.Repeat("a", 292)
+		r := &KongFeatureRecorder{}
+		r.recordOutbound(kongStateObservation{}, kongObservedState(ticket), 7)
+		r.RecordOutboundIfAbsent(connState)
+		f := r.Snapshot()
+		if f.StateFP != kongStateFingerprint(ticket) {
+			t.Errorf("帧内的值被连接级覆盖了：%q", f.StateFP)
+		}
+	})
+
+	t.Run("带空串上送也算已记，连接级不再补", func(t *testing.T) {
+		r := &KongFeatureRecorder{}
+		r.recordOutbound(kongStateObservation{}, kongObservedState(""), 0)
+		r.RecordOutboundIfAbsent(connState)
+		f := r.Snapshot()
+		if f == nil || f.StateLen == nil || *f.StateLen != 0 {
+			t.Fatalf("空串上送应当保持长度 0，实得 %+v", f)
+		}
+	})
+
+	t.Run("空值与 nil 接收者都不炸", func(t *testing.T) {
+		var nilRecorder *KongFeatureRecorder
+		nilRecorder.RecordOutboundIfAbsent(connState)
+		var nilAttempt *KongUpstreamAttempt
+		nilAttempt.RecordOutboundIfAbsentOnFeatures(connState)
+		r := &KongFeatureRecorder{}
+		r.RecordOutboundIfAbsent("")
+		if r.Snapshot() != nil {
+			t.Error("空 state 不该记出东西")
+		}
+	})
+}
+
+// 原生 WS 的握手响应头里上游也会给一张 state，它同样要进票缓存。
+//
+// 这条覆盖三个口径：收进来的票能查到；非门控模型一张都不许收（否则会替一个我们并不判档的模型攒
+// 票）；空 state 不收。
+func TestKongObserveHandshakeStateStoresTicket(t *testing.T) {
+	ticket := strings.Repeat("a", 292)
+	g, account, repo := kongFeatureTestGateway(t, KongTicketModeObserve, ticket)
+
+	handshake := strings.Repeat("h", 292)
+	g.ObserveHandshakeState(context.Background(), account, "gpt-6-astra", handshake)
+
+	found := false
+	for _, tk := range repo.poolOf(1, "gpt-6-astra") {
+		if tk.State == handshake {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("握手响应头里的 state 没进票缓存")
+	}
+
+	t.Run("非门控模型不收票", func(t *testing.T) {
+		g.ObserveHandshakeState(context.Background(), account, "gpt-4o", strings.Repeat("x", 292))
+		if got := repo.poolOf(1, "gpt-4o"); len(got) != 0 {
+			t.Errorf("非门控模型的票池必须是空的，实得 %d 张", len(got))
+		}
+	})
+
+	t.Run("空 state 不收票", func(t *testing.T) {
+		before := len(repo.poolOf(1, "gpt-6-astra"))
+		g.ObserveHandshakeState(context.Background(), account, "gpt-6-astra", "   ")
+		if after := len(repo.poolOf(1, "gpt-6-astra")); after != before {
+			t.Errorf("空 state 不该收票：%d → %d", before, after)
+		}
+	})
+}
+
+// 消费握手票是一次性的，所以"该不该消费"必须先判门控。
+//
+// 非门控轮若先去消费再由 ObserveHandshakeState 丢弃，票就白白没了——同一条物理连接完全可以接着服务
+// 门控模型（连接兼容键里没有模型），那一轮再想收就收不到。三条 WS 通路都用这个判据守在消费之前。
+func TestKongShouldObserveHandshakeStateGatesBeforeConsuming(t *testing.T) {
+	ticket := strings.Repeat("a", 292)
+	for _, mode := range []KongTicketMode{KongTicketModeOff, KongTicketModeObserve, KongTicketModeFull} {
+		g, _, _ := kongFeatureTestGateway(t, mode, ticket)
+		// off / observe 也要收票（样本靠它攒），所以判据只看门控模型、不看模式。
+		if !g.ShouldObserveHandshakeState("gpt-6-astra") {
+			t.Errorf("mode=%s：门控模型必须允许消费握手票", mode)
+		}
+		if g.ShouldObserveHandshakeState("gpt-4o") {
+			t.Errorf("mode=%s：非门控模型不许消费那张一次性的票", mode)
+		}
+		if g.ShouldObserveHandshakeState("  ") {
+			t.Errorf("mode=%s：空模型不许消费", mode)
+		}
+	}
+	var nilGateway *KongTicketGateway
+	if nilGateway.ShouldObserveHandshakeState("gpt-6-astra") {
+		t.Error("网关未启用时不该去消费")
+	}
+}
+
+// 握手那张票**不许**被记成"本轮上游又下发了一张"。
+//
+// `reissued_*` 是交付判定的依据（上游本轮回发了什么档），而握手发生在任何一轮之前。用真实的准入 +
+// 收票链路走一遍，而不是另起一个 recorder——后者证明不了调用点没污染这三个字段。
+func TestKongHandshakeStateDoesNotTouchReissuedFeatures(t *testing.T) {
+	ticket := strings.Repeat("a", 292)
+	g, account, _ := kongFeatureTestGateway(t, KongTicketModeFull, ticket)
+	payload := []byte(`{"type":"response.create","model":"gpt-6-astra"}`)
+	_, attempt, err := g.PrepareWSTurn(context.Background(), account, "gpt-6-astra", payload)
+	if err != nil || attempt == nil {
+		t.Fatalf("WS 准入失败：attempt=%v err=%v", attempt, err)
+	}
+
+	handshake := strings.Repeat("h", 292)
+	g.ObserveHandshakeState(context.Background(), account, "gpt-6-astra", handshake)
+	attempt.RecordOutboundIfAbsentOnFeatures(handshake)
+
+	f := attempt.Features.Snapshot()
+	if f == nil {
+		t.Fatal("full 模式必须有特征")
+	}
+	if f.ReissuedFP != "" || f.ReissuedLen != nil || f.ReissuedTicketID != nil {
+		t.Errorf("握手票不该出现在 reissued_*：%+v", f)
+	}
+	// 出站那一份是注入的票（帧内有值），连接级不能盖掉它。
+	if f.StateFP != kongStateFingerprint(ticket) {
+		t.Errorf("出站 state 被连接级的值盖掉了：%s", f.StateFP)
+	}
+}
+
+// 连接级的客户端 state：注入替换掉它时必须留痕，没替换时不留。
+func TestKongRecordClientStateIfAbsent(t *testing.T) {
+	ticket := strings.Repeat("a", 292)
+	clientOwn := strings.Repeat("z", 312)
+
+	t.Run("被票替换掉时记下客户端那份", func(t *testing.T) {
+		rec := &KongFeatureRecorder{}
+		rec.RecordOutboundIfAbsent(ticket)
+		rec.RecordClientStateIfAbsent(clientOwn)
+		f := rec.Snapshot()
+		if f == nil || f.ClientStateLen == nil || *f.ClientStateLen != 312 || f.ClientStateFP != kongStateFingerprint(clientOwn) {
+			t.Fatalf("客户端那份没记对：%+v", f)
+		}
+	})
+
+	t.Run("与出站相同则不记", func(t *testing.T) {
+		rec := &KongFeatureRecorder{}
+		rec.RecordOutboundIfAbsent(clientOwn)
+		rec.RecordClientStateIfAbsent(clientOwn)
+		if f := rec.Snapshot(); f == nil || f.ClientStateFP != "" || f.ClientStateLen != nil {
+			t.Errorf("没发生替换却记了客户端那份：%+v", f)
+		}
+	})
+
+	t.Run("本轮压根没有出站 state 时不记", func(t *testing.T) {
+		// off 模式 + 复用连接就是这种形态：没有任何 state 上送，单独摆一个 client_state 出来，
+		// 管理页读起来就是"发生过一次并不存在的注入替换"。
+		rec := &KongFeatureRecorder{}
+		rec.RecordClientStateIfAbsent(clientOwn)
+		if f := rec.Snapshot(); f != nil {
+			t.Errorf("无出站 state 不该产出任何特征：%+v", f)
+		}
+	})
+
+	t.Run("出站是空串（带了个空 state）时照常记", func(t *testing.T) {
+		rec := &KongFeatureRecorder{}
+		rec.recordOutbound(kongStateObservation{}, kongObservedState(""), 0)
+		rec.RecordClientStateIfAbsent(clientOwn)
+		f := rec.Snapshot()
+		if f == nil || f.StateLen == nil || *f.StateLen != 0 {
+			t.Fatalf("空串出站要能表达成 state_len=0：%+v", f)
+		}
+		if f.ClientStateFP != kongStateFingerprint(clientOwn) {
+			t.Errorf("出站为空串≠没有出站，客户端那份该记：%+v", f)
+		}
+	})
+
+	t.Run("帧内已有客户端 state 且原样上送时不许补记连接头", func(t *testing.T) {
+		// 这是最容易误判的一种：off 模式原样上送帧内那张，recordOutbound 因"与出站相同"刻意不记
+		// 客户端那份；此时若把"刻意没记"当成"还没看过"，就会拿连接头补出一次并不存在的替换。
+		frameState := strings.Repeat("b", 292)
+		connHeaderState := strings.Repeat("c", 292)
+		rec := &KongFeatureRecorder{}
+		rec.recordOutbound(kongObservedState(frameState), kongObservedState(frameState), 0)
+		rec.RecordClientStateIfAbsent(connHeaderState)
+		f := rec.Snapshot()
+		if f == nil || f.StateFP != kongStateFingerprint(frameState) {
+			t.Fatalf("出站应当是帧内那张：%+v", f)
+		}
+		if f.ClientStateFP != "" || f.ClientStateLen != nil {
+			t.Errorf("原样上送就是没发生替换，不该补出 client_state：%+v", f)
+		}
+	})
+
+	t.Run("准入已经记过就不覆盖", func(t *testing.T) {
+		rec := &KongFeatureRecorder{}
+		first := strings.Repeat("b", 292)
+		rec.recordOutbound(kongObservedState(first), kongObservedState(ticket), 0)
+		rec.RecordClientStateIfAbsent(clientOwn)
+		f := rec.Snapshot()
+		if f == nil || f.ClientStateFP != kongStateFingerprint(first) {
+			t.Errorf("准入记下的客户端那份被覆盖了：%+v", f)
+		}
+	})
+}
+
+// 两个 nil-safe 转发既要容忍 nil attempt，也要真的转发下去。
+func TestKongAttemptFeatureWrappersDelegate(t *testing.T) {
+	var nilAttempt *KongUpstreamAttempt
+	nilAttempt.RecordOutboundIfAbsentOnFeatures("x")
+	nilAttempt.RecordClientStateIfAbsentOnFeatures("y")
+	if nilAttempt.FeatureSnapshot() != nil {
+		t.Error("nil attempt 不该产出快照")
+	}
+
+	ticket := strings.Repeat("a", 292)
+	clientOwn := strings.Repeat("z", 312)
+	attempt := &KongUpstreamAttempt{Model: "gpt-6-astra", Features: &KongFeatureRecorder{}}
+	attempt.RecordOutboundIfAbsentOnFeatures(ticket)
+	attempt.RecordClientStateIfAbsentOnFeatures(clientOwn)
+	f := attempt.FeatureSnapshot()
+	if f == nil || f.StateFP != kongStateFingerprint(ticket) {
+		t.Fatalf("出站没转发下去：%+v", f)
+	}
+	if f.ClientStateFP != kongStateFingerprint(clientOwn) {
+		t.Errorf("客户端那份没转发下去：%+v", f)
+	}
+}
+
+// kongCtxAwareRepo 让 InsertTicket 尊重 context 取消——真实仓储走 QueryRowContext，ctx 一取消就落不了库。
+// stub 默认忽略 ctx，所以"断连后还能不能入库"这件事只有换掉它才测得出来。
+type kongCtxAwareRepo struct {
+	*kongStubRepo
+}
+
+func (r *kongCtxAwareRepo) InsertTicket(ctx context.Context, t *KongTicket) (int64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	return r.kongStubRepo.InsertTicket(ctx, t)
+}
+
+// 客户端断连后的收票**不能**跟着请求 ctx 一起死。
+//
+// 三条 WS 通路都是在客户端已经走掉之后才走到 ObserveWSDownstream，那时请求 ctx 往往已经取消。若把它
+// 直接传下去，票就落不了库：指纹和长度照样记下，`reissued_ticket_id` 却空着，observe 的诊断也起不来。
+func kongCtxAwareTestGateway(t *testing.T, ticket string) (*KongTicketGateway, *Account, *kongStubRepo) {
+	t.Helper()
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	account := kongTestAccount(1, KongTicketModeFull, KongTicketEgressDirect)
+	proxyID := int64(100)
+	account.ProxyID = &proxyID
+	accounts.set(account)
+	repo.setCurrent(1, "gpt-6-astra", &KongTicket{
+		ID: 7, AccountID: 1, Model: "gpt-6-astra", State: ticket,
+		Status: KongTicketStatusVerified, ExpiresAt: time.Now().Add(time.Hour),
+		FingerprintModel: kongStrPtr("gpt-6-astra"), FingerprintP: kongFloatPtr(0.99),
+		FingerprintProbs: kongTestAttr(0.99).Probs,
+	})
+	bank, err := KongFingerprintBankLoad()
+	if err != nil {
+		t.Fatalf("加载校准资料: %v", err)
+	}
+	svc := NewKongTicketService(
+		&kongCtxAwareRepo{kongStubRepo: repo},
+		&kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}},
+		accounts, bank, KongDefaultTicketParams(),
+		[]string{"gpt-6-astra"}, false, false,
+		KongTicketAccept{"gpt-6-astra": []string{"gpt-6-astra"}}, KongStg0Accept{}, 0.9,
+	)
+	return NewKongTicketGateway(svc, []string{"gpt-6-astra"}), account, repo
+}
+
+func TestKongObserveWSDownstreamStoresTicketAfterRequestCancel(t *testing.T) {
+	ticket := strings.Repeat("a", 292)
+	g, account, repo := kongCtxAwareTestGateway(t, ticket)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, attempt, err := g.PrepareWSTurn(ctx, account, "gpt-6-astra", []byte(`{"type":"response.create","model":"gpt-6-astra"}`))
+	if err != nil || attempt == nil {
+		t.Fatalf("WS 准入失败：attempt=%v err=%v", attempt, err)
+	}
+	// 客户端走了：请求 ctx 取消，上游仍在发，用量行照常结算。
+	cancel()
+
+	reissued := strings.Repeat("r", 292)
+	event := []byte(`{"type":"response.metadata","response":{"headers":{"x-codex-turn-state":"` + reissued + `"}}}`)
+	g.ObserveWSDownstream(ctx, account, attempt, event)
+
+	f := attempt.Features.Snapshot()
+	if f == nil || f.ReissuedFP != kongStateFingerprint(reissued) {
+		t.Fatalf("回发的 state 没记下：%+v", f)
+	}
+	if f.ReissuedTicketID == nil {
+		t.Fatal("请求 ctx 已取消，票仍必须入库并带回 id")
+	}
+	if got := repo.ticketByID(*f.ReissuedTicketID); got == nil || got.State != reissued {
+		t.Errorf("id 指向的不是那张回发票：%+v", got)
+	}
+}
+
+// 交付判定那条路上的收票同样不能跟着请求 ctx 一起死。
+//
+// 判定本身就是一次同步落库，客户端完全可以正好在这期间取消请求。隔离下沉到两条入口共用的
+// observeWSReissued 里，正是为了不让任何一条入口漏掉它——也免得事后补收一次（补收会让同一帧产出第二条
+// 观察事件、多一条 duplicate_state，还可能在第二次落库失败时把首次拿到的 id 清空）。
+func TestKongGuardWSDownstreamStoresTicketAfterRequestCancel(t *testing.T) {
+	ticket := strings.Repeat("a", 292)
+	g, account, repo := kongCtxAwareTestGateway(t, ticket)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, attempt, err := g.PrepareWSTurn(ctx, account, "gpt-6-astra", []byte(`{"type":"response.create","model":"gpt-6-astra"}`))
+	if err != nil || attempt == nil || attempt.Grant == nil {
+		t.Fatalf("WS 准入应当注入了票：attempt=%v err=%v", attempt, err)
+	}
+	// 客户端在判定期间走掉。
+	cancel()
+
+	reissued := strings.Repeat("r", 292)
+	event := []byte(`{"type":"response.metadata","response":{"headers":{"x-codex-turn-state":"` + reissued + `"}}}`)
+	// 客户端还"在线"（调用方尚未察觉断连），所以走的是判定那条路：它照常拒交付。
+	if guardErr := g.GuardWSDownstream(ctx, account, attempt, event); !KongIsDeliveryBlocked(guardErr) {
+		t.Fatalf("上游回发了 state，判定必须拒交付，实得 %v", guardErr)
+	}
+
+	f := attempt.Features.Snapshot()
+	if f == nil || f.ReissuedFP != kongStateFingerprint(reissued) {
+		t.Fatalf("回发的 state 没记下：%+v", f)
+	}
+	if f.ReissuedTicketID == nil {
+		t.Fatal("请求 ctx 已取消，判定路径上的票仍必须入库并带回 id")
+	}
+	if got := repo.ticketByID(*f.ReissuedTicketID); got == nil || got.State != reissued {
+		t.Errorf("id 指向的不是那张回发票：%+v", got)
+	}
+}
+
+// 排空发起方给的**绝对截止时刻**必须穿过脱钩活下来。
+//
+// `context.WithoutCancel` 会把父 context 的 deadline 一并丢掉。只要落库这一步重新套一个完整的单次上限，
+// 排空里的多帧就各拿一次完整预算，累计起来能把 relay 的排空窗口耗光——窗口一到就取消上游并等这条
+// reader 返回，排在后面的终帧连同 usage 一起没了。所以两者取更早的那个。
+func TestKongPersistCtxKeepsCallerDeadline(t *testing.T) {
+	t.Run("调用方的截止时刻更早时用它", func(t *testing.T) {
+		caller, cancelCaller := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancelCaller()
+		ctx, cancel := kongPersistCtx(caller)
+		defer cancel()
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("落库 ctx 必须有期限")
+		}
+		if remaining := time.Until(deadline); remaining > 100*time.Millisecond {
+			t.Errorf("调用方给的更早截止时刻被丢掉了，剩余 %v", remaining)
+		}
+	})
+
+	t.Run("调用方没给或更晚时用单次上限", func(t *testing.T) {
+		ctx, cancel := kongPersistCtx(context.Background())
+		defer cancel()
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("落库 ctx 必须有期限")
+		}
+		if remaining := time.Until(deadline); remaining > kongObserveDetachedTimeout+50*time.Millisecond {
+			t.Errorf("单次上限没生效，剩余 %v", remaining)
+		}
+	})
+
+	t.Run("父 context 取消不影响落库", func(t *testing.T) {
+		caller, cancelCaller := context.WithCancel(context.Background())
+		ctx, cancel := kongPersistCtx(caller)
+		defer cancel()
+		cancelCaller()
+		if err := ctx.Err(); err != nil {
+			t.Errorf("客户端取消请求不该把落库一起掐掉：%v", err)
+		}
+	})
+}

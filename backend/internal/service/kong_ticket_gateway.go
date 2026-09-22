@@ -87,6 +87,22 @@ func (a *KongUpstreamAttempt) FeatureSnapshot() *KongRequestFeatures {
 	return a.Features.Snapshot()
 }
 
+// RecordOutboundIfAbsentOnFeatures 是 nil-safe 的转发，理由同 FeatureSnapshot：attempt 为 nil 是常态。
+func (a *KongUpstreamAttempt) RecordOutboundIfAbsentOnFeatures(state string) {
+	if a == nil {
+		return
+	}
+	a.Features.RecordOutboundIfAbsent(state)
+}
+
+// RecordClientStateIfAbsentOnFeatures 是 nil-safe 的转发，理由同 FeatureSnapshot。
+func (a *KongUpstreamAttempt) RecordClientStateIfAbsentOnFeatures(state string) {
+	if a == nil {
+		return
+	}
+	a.Features.RecordClientStateIfAbsent(state)
+}
+
 // KongTicketGateway 把编排服务接到转发链路上。
 type KongTicketGateway struct {
 	svc         *KongTicketService
@@ -448,13 +464,42 @@ func (g *KongTicketGateway) GuardWSDownstream(ctx context.Context, account *Acco
 	if state == "" {
 		return nil
 	}
-	g.observeWSReissued(ctx, account, attempt, state)
+	// 整条票据处理链共用同一份有界 ctx：收票、撤票、连带的事件写入都占着上游 reader，只给收票设上限
+	// 等于留了一条同样能把终帧拖没的路（撤票是一次同步写，慢起来一样要命）。
+	pctx, cancel := kongPersistCtx(ctx)
+	defer cancel()
+	g.observeWSReissued(pctx, account, attempt, state)
 	if attempt == nil || attempt.Grant == nil {
 		return nil
 	}
 	model := attempt.Model
-	g.svc.RevokeUsedTicket(ctx, account.ID, model, attempt.Grant.TicketID)
+	g.svc.RevokeUsedTicket(pctx, account.ID, model, attempt.Grant.TicketID)
 	return &KongErrDeliveryBlocked{AccountID: account.ID, Model: model}
+}
+
+// kongObserveDetachedTimeout 是 WS 下行票据处理**单次**落库的上限。
+//
+// 它必须明显小于排空预算：落库是在上游 reader 那条 goroutine 里同步做的，而客户端断开后 relay 只留
+// `UpstreamDrainTimeout`（passthrough 默认 1200ms）继续读上游，之后还要等这条 reader 返回才收尾。占着
+// reader 超过那个窗口，终帧就再也读不到——丢一条 usage 结算，比丢一次免费样本严重得多。
+//
+// **单次上限不等于整段有界**：一次排空里可能来好几帧 metadata，或者 metadata 本身就是排空开始之后才到
+// 的。所以调用方（排空发起方）可以额外给一个**绝对截止时刻**，kongPersistCtx 取两者里更早的那个。
+const kongObserveDetachedTimeout = 800 * time.Millisecond
+
+// kongPersistCtx 给 reader 上的同步落库一个"脱钩但有期限"的 context。
+//
+// 脱钩是因为客户端随时可能取消请求，而落库正是此刻唯一能留下证据的动作；有期限是因为这一步占的是
+// 上游 reader，超时不退会把终帧连同 usage 一起拖没。
+//
+// **先读调用方的 deadline 再脱钩**：`context.WithoutCancel` 会把父 context 的 deadline 一并丢掉，直接
+// 套一个新的 800ms 就等于把排空发起方给的绝对截止时刻抹掉了。取两者更早的那个。
+func kongPersistCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(kongObserveDetachedTimeout)
+	if caller, ok := ctx.Deadline(); ok && caller.Before(deadline) {
+		deadline = caller
+	}
+	return context.WithDeadline(context.WithoutCancel(ctx), deadline)
 }
 
 // ObserveWSDownstream 只做**收票与记特征**，不做交付判定。
@@ -489,7 +534,50 @@ func (g *KongTicketGateway) observeWSReissued(ctx context.Context, account *Acco
 	if attempt == nil || attempt.Model == "" {
 		return
 	}
+	// 落库用脱钩且有期限的 context（kongPersistCtx），而且下沉到这里——交付判定与只收票两条入口共用
+	// 同一份。客户端可以正好在落库期间取消请求（判定本身就是一次同步写），那时拿请求 ctx 去写必然
+	// 失败：指纹与长度记下了、票却没入库，observe 的诊断也起不来。放在这一层而不是各入口各做一次，
+	// 是为了不让任何一条入口"漏了隔离"，也免得事后再补收一次——补收会让同一帧产出第二条观察事件，
+	// 把"本地重复处理"陈述成"上游重复回票"。Guard 已经套过一层时，这里会继承它那个更早的截止时刻。
+	ctx, cancel := kongPersistCtx(ctx)
+	defer cancel()
 	attempt.Features.RecordReissued(state, g.svc.ObserveState(ctx, account.ID, attempt.Model, state))
+}
+
+// ObserveHandshakeState 收原生 WS **握手响应**里上游给的 state。只收票，不做任何判定。
+//
+// 补的是一个静默缺口：WS 上收票原先只挂在 `response.metadata` 事件那条路上，而上游也会在与它那条
+// 连接的**握手响应头**里给一个 state（三条 WS 通路都会把它采纳成连接级的 turnState）。漏掉它等于
+// 白扔一批免费样本——observe 模式靠样本判档，full 模式靠它在缓存里备着票。
+//
+// **只收上游给的那一个**，不收客户端 upgrade 请求头里自带的：后者在 HTTP 侧也不收
+// （`AfterUpstream` 只看响应头），两侧口径必须一致，否则 WS 会比 HTTP 多长出一类票，而票缓存的
+// 内容会传导到验票目标与席位。
+//
+// **不记进请求特征的 reissued**，也**不会成为本轮的出站特征**：reissued 专指"本轮上游又下发了一张"，
+// 是交付判定的依据，而握手发生在任何一轮之前。出站特征记的是我们在握手**请求**里发出去的那个
+// （RecordOutboundIfAbsent 只接受 lease.SentHandshakeTurnState()）；上游在响应里换回来的这个只进票池，
+// 要等它后续真被上送才会成为那一次发送的出站特征。
+// ShouldObserveHandshakeState 判断此刻值不值得去消费连接上那张待收的握手票。
+//
+// **消费是一次性的，所以判据必须前置到消费之前。** 握手票挂在物理连接上、只允许被收走一次（否则同
+// 一张票会反复入库，换模型时还会被记到另一个模型名下）；而 ObserveHandshakeState 内部对非门控模型
+// 是直接丢弃。两件事叠起来就成了漏收：预热连接或首轮非门控请求会把票"消费掉又不入库"，而同一条
+// 物理连接完全可以接着服务门控模型（连接兼容键里没有模型），那一轮再想收就没有了。
+func (g *KongTicketGateway) ShouldObserveHandshakeState(model string) bool {
+	return g.Enabled() && g.IsGatedModel(strings.TrimSpace(model))
+}
+
+func (g *KongTicketGateway) ObserveHandshakeState(ctx context.Context, account *Account, model, state string) {
+	if !g.Enabled() || account == nil {
+		return
+	}
+	state = strings.TrimSpace(state)
+	model = strings.TrimSpace(model)
+	if state == "" || !g.IsGatedModel(model) {
+		return
+	}
+	g.svc.ObserveState(ctx, account.ID, model, state)
 }
 
 // kongWSTurnStateFromEvent 从 `response.metadata` 事件里取票。

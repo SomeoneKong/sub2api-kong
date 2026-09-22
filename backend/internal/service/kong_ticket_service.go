@@ -2146,8 +2146,10 @@ func (s *KongTicketService) RevokeUsedTicket(ctx context.Context, accountID int6
 //
 // observe 模式下它还负责触发诊断探测——那是这个模式存在的理由：告诉运维「这个账号当前在什么
 // 档位」，人工据此决定要不要给它开 full。探测走业务出口，不占用票据出口的静默。
-// 返回这张票在库里的 id（0 表示没入库：空串、长度黑名单这类预期拒绝，或持久化失败）。**重复出现
-// 的同一张票也返回它原来的 id**——那是同一张票，用量行据此就能看出"上游一直在回发同一个东西"。
+// 返回这张票**可确认的**库内 id。0 表示这次没拿到：按规则拒收（空串、长度黑名单）、落库失败，或者
+// 落库结果未知（限期到了、`ON CONFLICT DO NOTHING` 之后回查没成功——那时库里那行可能已经存在）。
+// 所以 0 不等于"库里没有这张票"，调用方不能据此断言未入库。**重复出现的同一张票返回它原来的 id**
+// ——那是同一张票，用量行据此就能看出"上游一直在回发同一个东西"。
 func (s *KongTicketService) ObserveState(ctx context.Context, accountID int64, model, state string) int64 {
 	if strings.TrimSpace(state) == "" {
 		return 0

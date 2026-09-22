@@ -41,7 +41,8 @@ type KongRequestFeatures struct {
 	// TicketID 是我们注入的那张票（kong_ticket_cache.id）。票全量入库，所以这里能给精确身份而不是
 	// 指纹——凭它可以直接查到那张票的验证状态、采到它的出口与时刻。缺省表示这次没注入。
 	TicketID *int64 `json:"ticket_id,omitempty"`
-	// ReissuedFP / ReissuedLen / ReissuedTicketID 是上游**在响应里又下发**的 state。
+	// ReissuedFP / ReissuedLen / ReissuedTicketID 是上游**在响应里又下发**的 state。ReissuedTicketID
+	// 缺省只表示"没拿到可确认的库内 id"（拒收 / 落库失败 / 落库结果未知），不代表库里没有这张票。
 	//
 	// 两重意义：对 full 模式，它等于"上游没接受我们注入的那张"（交付会被拦下）；对所有模式，它是
 	// 逐请求可见的**上游当前档位读数**（292 正常档 / 312 降智档），比聚合统计更早暴露投放切换。
@@ -73,6 +74,12 @@ func (f *KongRequestFeatures) IsEmpty() bool {
 type KongFeatureRecorder struct {
 	mu sync.Mutex
 	f  KongRequestFeatures
+	// clientObserved 表示准入时**已经看过**客户端那一份（哪怕看到的是"与出站相同"因而刻意没记）。
+	//
+	// 少了它，"刻意没记"与"还没看过"在字段上长得一样，连接级补记就会把前者当后者：客户端 upgrade
+	// 头带 A、帧内带 B 且原样上送 B 时，会补出 state=B / client_state=A——管理页读起来是一次并不存在
+	// 的替换。不进 KongRequestFeatures：它只是采集过程的记账，不该落库。
+	clientObserved bool
 }
 
 // recordOutbound 记下这次实际发往上游的 state 与它的来源。
@@ -89,6 +96,9 @@ func (r *KongFeatureRecorder) recordOutbound(clientState, outbound kongStateObse
 		r.f.StateLen = kongIntPtr(len(outbound.value))
 	}
 	// 只在**确实被替换**时才记客户端那份：与出站相同就是同一件事，记两遍会让人以为发生过替换。
+	if clientState.present {
+		r.clientObserved = true
+	}
 	if clientState.present && clientState.value != outbound.value {
 		r.f.ClientStateFP = kongStateFingerprint(clientState.value)
 		r.f.ClientStateLen = kongIntPtr(len(clientState.value))
@@ -97,6 +107,65 @@ func (r *KongFeatureRecorder) recordOutbound(clientState, outbound kongStateObse
 		id := ticketID
 		r.f.TicketID = &id
 	}
+}
+
+// RecordOutboundIfAbsent 在"这次上送到底带了什么"还没记下来时补一个值。
+//
+// 用途只有一个：**原生 WS 上客户端的 state 不在帧里**。它由客户端放在 WebSocket upgrade 的请求头
+// 上，再由本服务放到与上游那条连接的握手头上。所以那条路上"本轮实际发往上游的 state"是**连接级**
+// 的，逐帧去量必然量不到——kong.11 上线后 ctx_pool 的特征全空就是这个原因。
+//
+// 传进来的必须是**那条上游连接握手时真正发出去的**那个值（池化通路取
+// `lease.SentHandshakeTurnState()`）。不能传客户端本次带来的那一份：连接池复用时本轮根本不发生
+// 握手，客户端那个值一个字节都没上送，记成出站就是伪造证据。它属于 RecordClientStateIfAbsent。
+//
+// **只在缺的时候补**：帧内 client_metadata 里有值时那才是本轮生效的那一个（我们注入就写在那里），
+// 连接级的值不能盖掉它。
+func (r *KongFeatureRecorder) RecordOutboundIfAbsent(state string) {
+	if r == nil || state == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.f.StateLen != nil || r.f.StateFP != "" {
+		return
+	}
+	r.f.StateFP = kongStateFingerprint(state)
+	r.f.StateLen = kongIntPtr(len(state))
+}
+
+// RecordClientStateIfAbsent 补记**客户端手里那张**，用于连接级载体。
+//
+// 原生 WS 的客户端把自己那张 state 放在 upgrade 请求头上，帧里没有；而准入只看帧。所以 full 模式
+// 在那条路上注入了票之后，"我们替换掉的是客户端哪一张"这条证据会静默丢失——它恰恰是判断客户端
+// 手里是正常档还是降级档的唯一读数。
+//
+// 与 recordOutbound 同一条口径：**只在确实被替换时记**。与出站相同就是同一件事，记两遍会让人以为
+// 发生过替换。已经记过就不覆盖（准入那次若已比出差异，它才是权威）。
+//
+// **出站那一项还空着时也不记**：那说明本轮压根没有 state 上送（off 模式 + 复用连接就是这种形态），
+// 此时单独摆一个 client_state 出来，管理页读起来就是"发生过一次并不存在的注入替换"。
+//
+// **准入已经看过客户端那一份时也不记**，哪怕它当时刻意没记（与出站相同）。帧内才是逐轮的载体，
+// 它有值时连接级那个头是上一次握手留下的旧值，补上去等于凭空造出一次替换。
+func (r *KongFeatureRecorder) RecordClientStateIfAbsent(state string) {
+	if r == nil || state == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.clientObserved || r.f.ClientStateLen != nil || r.f.ClientStateFP != "" {
+		return
+	}
+	if r.f.StateLen == nil && r.f.StateFP == "" {
+		return
+	}
+	fp := kongStateFingerprint(state)
+	if r.f.StateFP == fp {
+		return
+	}
+	r.f.ClientStateFP = fp
+	r.f.ClientStateLen = kongIntPtr(len(state))
 }
 
 // RecordReissued 记下上游在响应里又下发的 state 及它入库后的 id（0 表示没入库）。

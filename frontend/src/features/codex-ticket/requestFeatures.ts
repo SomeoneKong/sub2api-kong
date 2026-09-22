@@ -23,7 +23,8 @@ export interface KongRequestFeatures {
   client_state_len?: number
   /** 我们注入的那张票（kong_ticket_cache.id）。 */
   ticket_id?: number
-  /** 上游在响应里又下发的 state；入库了才有 reissued_ticket_id。 */
+  /** 上游在响应里又下发的 state。reissued_ticket_id 只在拿到可确认的库内 id 时才有——缺省涵盖
+   *  按规则拒收、落库失败与落库结果未知三种，不能读成"库里没有这张票"。 */
   reissued_fp?: string
   reissued_len?: number
   reissued_ticket_id?: number

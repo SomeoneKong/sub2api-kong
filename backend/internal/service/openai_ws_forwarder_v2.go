@@ -319,6 +319,15 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		handshakeTurnState != "",
 		len(handshakeTurnState),
 	)
+	// [kong] 上游在握手响应里给的那张票也要收（见 ObserveHandshakeState）。这条路的上游模型是函数
+	// 参数，此处就能判门控。一条物理连接只收一次（lease 内部保证）：这里每个 HTTP 请求都会借到连接
+	// 并读到同一份握手响应头，不设闸门会反复入库，同连接换门控模型时还会把旧票记到另一个模型名下。
+	// 消费是一次性的，所以门控判据必须前置——非门控轮消费掉又不入库，后续门控轮就收不到了。
+	if s.kongTicket.ShouldObserveHandshakeState(mappedModel) {
+		if consumed := lease.ConsumeHandshakeTurnState(); consumed != "" {
+			s.kongTicket.ObserveHandshakeState(ctx, account, mappedModel, consumed)
+		}
+	}
 	if handshakeTurnState != "" {
 		if stateStore != nil && sessionHash != "" {
 			stateStore.BindSessionTurnState(groupID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
@@ -432,6 +441,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 	}
 	resultWithUsage := func() *OpenAIForwardResult {
+		// [kong] payload 里没有 state 时，本轮实际发往上游的是**这条连接握手时发出去的**那一个：
+		// turnState 可能来自客户端本次请求或会话粘滞存储，而连接复用时它一个字节都没上送。
+		kongTicketAttempt.RecordOutboundIfAbsentOnFeatures(lease.SentHandshakeTurnState())
+		if c != nil && c.Request != nil {
+			kongTicketAttempt.RecordClientStateIfAbsentOnFeatures(strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader)))
+		}
 		return &OpenAIForwardResult{
 			RequestID:                     responseID,
 			ResponseID:                    responseID,
@@ -633,9 +648,28 @@ readLoop:
 		}
 		// [kong] codex 票据的交付边界：response.metadata 带回 state 说明上游没接受本轮注入。
 		// 该事件在 turn start 就到，先于任何内容分片，所以此处拦住即「零业务正文交付」。
-		if kongTicketGuardErr := s.kongTicket.GuardWSDownstream(ctx, account, kongTicketAttempt, message); kongTicketGuardErr != nil {
-			lease.MarkBroken()
-			return nil, kongTicketGuardErr
+		//
+		// 客户端已断连时只收票、不判交付：此刻正在排空上游以便结算，没有业务输出会送给任何人，
+		// 交付判定无从谈起；在这里返回错误会把排空掐断，连带丢掉终帧、usage 与 AfterTurn。
+		if clientDisconnected {
+			// 排空期间的落库共用**这条排空自己的**绝对截止时刻（读循环上方按同一个基准算剩余时间），
+			// 免得多帧各拿一次完整的单次上限、把排空窗口耗光。不在循环里 defer：那会攒到函数结束。
+			kongCtx := ctx
+			cancelKongCtx := context.CancelFunc(func() {})
+			if !clientDisconnectDrainStartedAt.IsZero() {
+				kongCtx, cancelKongCtx = context.WithDeadline(ctx, clientDisconnectDrainStartedAt.Add(readTimeout))
+			}
+			s.kongTicket.ObserveWSDownstream(kongCtx, account, kongTicketAttempt, message)
+			cancelKongCtx()
+		} else if kongTicketGuardErr := s.kongTicket.GuardWSDownstream(ctx, account, kongTicketAttempt, message); kongTicketGuardErr != nil {
+			// 判定本身是一次同步落库，客户端完全可能正好在这期间取消请求。**返回拒绝之前复查一次**：
+			// 已经算断连就转入排空继续读终帧——此刻没有业务输出会送给任何人，拒不拒都影响不到客户端，
+			// 而带着这条错误返回会让终帧连同 usage 一起丢掉。
+			markClientRequestCanceled()
+			if !clientDisconnected {
+				lease.MarkBroken()
+				return nil, kongTicketGuardErr
+			}
 		}
 		responseModelObserver.ObserveOpenAI(message, eventType)
 		eventCount++
