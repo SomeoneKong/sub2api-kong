@@ -449,3 +449,45 @@ func TestKongPrepareWSMapPayloadDoesNotMutateCallerMetadata(t *testing.T) {
 		}
 	}
 }
+
+// 出站请求对象是 HTTP 那条路的特征载体：准入时把记录器挂上去，结果构造时从它取。
+//
+// 这一对函数是 Responses 直通/转换两条路共用的唯一通道，取不回来就等于那条路的用量行永远没特征
+// ——上线后曾整天全空，靠的是翻库才发现。
+func TestKongFeaturesTravelOnOutboundRequest(t *testing.T) {
+	ticket := strings.Repeat("a", 292)
+	g, account, _ := kongFeatureTestGateway(t, KongTicketModeFull, ticket)
+	req := kongTestGatedRequest(t, `{"model":"gpt-6-astra"}`)
+
+	attempt, err := g.PrepareUpstream(context.Background(), req, account)
+	if err != nil {
+		t.Fatalf("准入失败: %v", err)
+	}
+	// 挂之前取不到：这正是"这条通路没接采集"时的表现。
+	if got := KongFeaturesFromRequest(req); got != nil {
+		t.Fatalf("还没挂就取到了特征：%+v", got)
+	}
+	// doOpenAIUpstream 就地换 context 的等价动作。
+	*req = *req.WithContext(kongWithFeatures(req.Context(), attempt.Features))
+
+	got := KongFeaturesFromRequest(req)
+	if got == nil || got.StateLen == nil || *got.StateLen != len(ticket) {
+		t.Fatalf("从出站请求取回的特征不对：%+v", got)
+	}
+	if got.TicketID == nil || *got.TicketID != 7 {
+		t.Errorf("注入的票 id = %v, want 7", got.TicketID)
+	}
+
+	// 交付判定之后再取，要能看到上游回发的那一份（同一个记录器，不是快照）。
+	resp := &http.Response{Header: http.Header{}}
+	reissued := strings.Repeat("r", 292)
+	resp.Header.Set(openAICodexTurnStateHeader, reissued)
+	_ = g.AfterUpstream(context.Background(), account, attempt, resp)
+	if after := KongFeaturesFromRequest(req); after == nil || after.ReissuedLen == nil || *after.ReissuedLen != 292 {
+		t.Fatalf("交付判定后应当能取到回发的 state：%+v", after)
+	}
+
+	if KongFeaturesFromRequest(nil) != nil {
+		t.Error("没有请求对象时应当是 nil")
+	}
+}

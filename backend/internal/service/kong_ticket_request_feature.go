@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -233,4 +234,23 @@ func KongFeaturesFromRequest(req *http.Request) *KongRequestFeatures {
 	}
 	recorder, _ := req.Context().Value(kongFeatureContextKey{}).(*KongFeatureRecorder)
 	return recorder.Snapshot()
+}
+
+// WarnMissingRequestFeatures 在一条**门控请求**的用量行没带特征时喊一声。
+//
+// 这条守卫的由来是一次真实的失手：采集接在了 Responses 的转换路径上，而线上 codex 流量走的是
+// 同一个端点的**直通**路径，于是那一列上线后整天全空——而这件事**不会以任何形式报错**，只能靠
+// 人去翻库才发现。门控模型有没有 state 这件事是确定的（要么我们注入、要么客户端自带、要么上游
+// 回发），所以"门控请求 + 零特征"几乎一定意味着那条通路没接采集，值得一条 Warn。
+//
+// 只在门控模型上喊：非门控请求本来就不该有特征，对它们喊会把日志淹掉、这条守卫也就废了。
+func (g *KongTicketGateway) WarnMissingRequestFeatures(model, inboundEndpoint string, wsMode bool, features *KongRequestFeatures) {
+	if g == nil || !g.Enabled() || !features.IsEmpty() {
+		return
+	}
+	if !g.IsGatedModel(model) {
+		return
+	}
+	slog.Warn("kong request features: 门控请求没有采到任何特征，这条通路可能没接采集",
+		"model", model, "inbound_endpoint", inboundEndpoint, "ws_mode", wsMode)
 }
