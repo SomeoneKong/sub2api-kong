@@ -509,7 +509,11 @@ type OpenAIGatewayService struct {
 	// 记录最近一次向该会话下发 x-codex-turn-state 的铸造账号，供出站守卫
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
 	openaiCodexTurnStateOrigins sync.Map
-	openaiCodexTurnStateWrites  atomic.Uint64
+	// openaiCodexTurnStateSweeping 单飞标记：清扫改在后台跑（不占交付 goroutine），同一时刻只许一轮。
+	openaiCodexTurnStateSweeping atomic.Bool
+	// openaiCodexTurnStateSweepForTest 仅测试注入：见 setTurnStateSweepForTest。
+	openaiCodexTurnStateSweepForTest atomic.Pointer[func()]
+	openaiCodexTurnStateWrites       atomic.Uint64
 
 	// [kong] codex 票据守卫。可选依赖：未启用时为 nil，所有接入点都是空操作。
 	// 用 setter 注入而不是加进构造函数参数表，是为了不动上游那个很长的签名。

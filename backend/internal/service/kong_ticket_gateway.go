@@ -103,6 +103,14 @@ func (a *KongUpstreamAttempt) RecordClientStateIfAbsentOnFeatures(state string) 
 	a.Features.RecordClientStateIfAbsent(state)
 }
 
+// RecordStrippedClientStateOnFeatures 是 nil-safe 的转发，理由同 FeatureSnapshot。
+func (a *KongUpstreamAttempt) RecordStrippedClientStateOnFeatures(state string) {
+	if a == nil {
+		return
+	}
+	a.Features.RecordStrippedClientState(state)
+}
+
 // KongTicketGateway 把编排服务接到转发链路上。
 type KongTicketGateway struct {
 	svc         *KongTicketService

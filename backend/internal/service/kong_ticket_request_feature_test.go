@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // 请求特征（逐请求的降智证据）。
@@ -886,5 +888,59 @@ func TestKongPersistCtxKeepsCallerDeadline(t *testing.T) {
 		if err := ctx.Err(); err != nil {
 			t.Errorf("客户端取消请求不该把落库一起掐掉：%v", err)
 		}
+	})
+}
+
+// 被剥掉的客户端原值必须活到出站那一项补齐为止。
+//
+// 跨账号剥离发生在票据准入之前，出站那一项却常常是结算时才由连接级补上的。若在剥离那一刻按"还没有
+// 出站"直接丢掉被剥值，等出站补上时 clientObserved 又会把补记挡住——这条证据就永久没了，管理页从此
+// 看不到"客户端手里那张是什么档"。
+func TestKongStrippedClientStateSurvivesLateOutbound(t *testing.T) {
+	clientOwn := strings.Repeat("a", 312)
+	handshakeSent := strings.Repeat("b", 292)
+
+	t.Run("先剥客户端那份，出站稍后才补上", func(t *testing.T) {
+		rec := &KongFeatureRecorder{}
+		rec.RecordStrippedClientState(clientOwn)
+		// 此刻还没有出站 state，不该摆一个会被读成"发生过替换"的孤值。
+		require.Nil(t, rec.Snapshot(), "只有客户端那份时不产出特征")
+
+		rec.RecordOutboundIfAbsent(handshakeSent)
+		f := rec.Snapshot()
+		require.NotNil(t, f)
+		require.Equal(t, kongStateFingerprint(handshakeSent), f.StateFP)
+		require.Equal(t, kongStateFingerprint(clientOwn), f.ClientStateFP, "被剥的客户端原值必须还在")
+		require.NotNil(t, f.ClientStateLen)
+		require.Equal(t, 312, *f.ClientStateLen)
+	})
+
+	t.Run("出站已在时立刻落定", func(t *testing.T) {
+		rec := &KongFeatureRecorder{}
+		rec.RecordOutboundIfAbsent(handshakeSent)
+		rec.RecordStrippedClientState(clientOwn)
+		f := rec.Snapshot()
+		require.NotNil(t, f)
+		require.Equal(t, kongStateFingerprint(clientOwn), f.ClientStateFP)
+	})
+
+	t.Run("剥掉的与出站相同则不记", func(t *testing.T) {
+		rec := &KongFeatureRecorder{}
+		rec.RecordStrippedClientState(handshakeSent)
+		rec.RecordOutboundIfAbsent(handshakeSent)
+		f := rec.Snapshot()
+		require.NotNil(t, f)
+		require.Empty(t, f.ClientStateFP, "与出站相同就是同一件事，记两遍会被读成发生过替换")
+	})
+
+	t.Run("已观测之后，连接级的旧头不得顶替它", func(t *testing.T) {
+		staleHeader := strings.Repeat("c", 292)
+		rec := &KongFeatureRecorder{}
+		rec.RecordStrippedClientState(clientOwn)
+		rec.RecordOutboundIfAbsent(handshakeSent)
+		rec.RecordClientStateIfAbsent(staleHeader)
+		f := rec.Snapshot()
+		require.NotNil(t, f)
+		require.Equal(t, kongStateFingerprint(clientOwn), f.ClientStateFP, "帧内被剥的那份才是本轮的客户端值")
 	})
 }

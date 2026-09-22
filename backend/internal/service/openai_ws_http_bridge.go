@@ -419,6 +419,10 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	imageInputSize string,
 	grokCacheIdentity string,
 	turn int,
+	// turnState 是**本连接本账号**的 turn-state：首轮取客户端回带里本账号可用的那份，后续轮取上一轮
+	// 从本账号 HTTP 响应里拿到的那个。只作用于这里造出来的出站请求，绝不写回 c.Request.Header——那份
+	// 请求头被同一请求里所有 failover attempt 共用，写回去等于把 A 的 blob 泄漏给接手的 B。
+	turnState string,
 	writeClientMessage func([]byte) error,
 ) (*OpenAIForwardResult, error) {
 	if s == nil {
@@ -504,6 +508,13 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		}
 		if account.Platform != PlatformGrok && isOpenAIResponsesLiteWebSocketPayload(payload) {
 			upstreamReq.Header.Set(responsesLiteHeader, "true")
+		}
+		// turn-state 一律按本账号的那份显式落定：出站请求是从客户端请求头拷出来的，客户端回带的值可能
+		// 由别的账号铸造，而这条路不经 HTTP 侧那道出站守卫。空值要主动删掉，不能留拷过来的残值。
+		if state := strings.TrimSpace(turnState); state != "" {
+			upstreamReq.Header.Set(openAIWSTurnStateHeader, state)
+		} else {
+			upstreamReq.Header.Del(openAIWSTurnStateHeader)
 		}
 		return upstreamReq, nil
 	}

@@ -80,6 +80,9 @@ type KongFeatureRecorder struct {
 	// 头带 A、帧内带 B 且原样上送 B 时，会补出 state=B / client_state=A——管理页读起来是一次并不存在
 	// 的替换。不进 KongRequestFeatures：它只是采集过程的记账，不该落库。
 	clientObserved bool
+	// strippedClient 是被跨账号剥离拿掉的那个客户端原值，暂存到取快照时按显示规则落定
+	// （见 RecordStrippedClientState）。不进 KongRequestFeatures：那里只放要落库的字段。
+	strippedClient string
 }
 
 // recordOutbound 记下这次实际发往上游的 state 与它的来源。
@@ -168,6 +171,50 @@ func (r *KongFeatureRecorder) RecordClientStateIfAbsent(state string) {
 	r.f.ClientStateLen = kongIntPtr(len(state))
 }
 
+// RecordStrippedClientState 记下"客户端确实带了这一份，但被我们剥掉了"（跨账号回放拦截）。
+//
+// 跨账号剥离发生在票据准入**之前**（不然异账号的 blob 会先被上送），于是准入再去采集"客户端自带那份"时
+// 已经什么都看不到了。缺了这一笔有两个后果：full 模式下"客户端手里是什么档"这条读数彻底消失；而 upgrade
+// 头里若还留着一个更早的旧值，连接级补记会把它当成"被替换掉的客户端那份"——管理页显示的来源就是错的。
+//
+// 所以这里**无条件把客户端那份标记为已观测**（我们确实看到了它）。要不要落到 client_state_* 仍按同一条
+// 显示规则（本轮有出站 state 才记），但**判定不能在这一刻做完就算数**：出站那一项常常是后补的
+// （连接级的握手 state 要等结算时才由 RecordOutboundIfAbsent 补上），此刻按"没有出站"直接丢掉被剥值，
+// 等出站补上时 clientObserved 又把补记挡住，这份证据就永久没了。所以先把它存着，取快照时再按规则落定。
+func (r *KongFeatureRecorder) RecordStrippedClientState(state string) {
+	if r == nil || state == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clientObserved = true
+	if r.strippedClient == "" {
+		r.strippedClient = state
+	}
+	r.materializeStrippedClientLocked()
+}
+
+// materializeStrippedClientLocked 在出站那一项已经就位时，把暂存的被剥值落到 client_state_*。
+//
+// 规则与 recordOutbound 一致：与出站相同就是同一件事，不记；已经记过就不覆盖。调用方必须持锁。
+func (r *KongFeatureRecorder) materializeStrippedClientLocked() {
+	if r.strippedClient == "" {
+		return
+	}
+	if r.f.ClientStateLen != nil || r.f.ClientStateFP != "" {
+		return
+	}
+	if r.f.StateLen == nil && r.f.StateFP == "" {
+		return
+	}
+	fp := kongStateFingerprint(r.strippedClient)
+	if r.f.StateFP == fp {
+		return
+	}
+	r.f.ClientStateFP = fp
+	r.f.ClientStateLen = kongIntPtr(len(r.strippedClient))
+}
+
 // RecordReissued 记下上游在响应里又下发的 state 及它入库后的 id（0 表示没入库）。
 //
 // 两条下行判定（HTTP 响应头 / WS 的 response.metadata 事件）都经这里，口径因此只有一份。
@@ -201,6 +248,8 @@ func (r *KongFeatureRecorder) Snapshot() *KongRequestFeatures {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// 出站那一项可能是刚刚才补上的（连接级），此刻才轮得到被剥值按规则落定。
+	r.materializeStrippedClientLocked()
 	if r.f.IsEmpty() {
 		return nil
 	}

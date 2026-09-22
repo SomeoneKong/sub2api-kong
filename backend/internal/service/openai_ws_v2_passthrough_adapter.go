@@ -895,8 +895,13 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 	turnState := ""
 	turnMetadata := ""
+	// clientTurnStateRaw 是客户端**原封不动**带来的那一份，只用于请求特征里"客户端手里是什么档"这条读数；
+	// 上送用的是按账号过滤之后的 turnState，两者不能混用（过滤后为空不代表客户端没带）。
+	clientTurnStateRaw := ""
 	if c != nil {
-		turnState = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
+		clientTurnStateRaw = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
+		// 只取本账号可以用的那一份（见 openAIWSClientTurnStateForAccount）。
+		turnState = s.openAIWSClientTurnStateForAccount(c, account)
 		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
 	}
 	headers, _, buildHdrErr := s.buildOpenAIWSHeaders(
@@ -1056,6 +1061,21 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if ticketErr := s.kongTicket.GuardWSFrame(account, payload); ticketErr != nil {
 				return nil, nil, wrapOpenAIWSKongTicketError(ticketErr)
 			}
+			// 跨账号剥离要在**帧分类之前**：分类本身读第一个 `type`，而客户端可以写两个 `type`
+			// （`response.cancel` + `response.create`）——按首键归类成控制帧就绕过了下面那条只在
+			// response.create 里跑的剥离，而按末键解码的上游看到的是一帧带着异账号凭据的生成请求。
+			// 它也必须与票据功能、账号保护模式无关（GuardWSFrame 只保护受票据保护的账号）。
+			strippedClientState := ""
+			if stripped, strippedState, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, payload); stripErr != nil {
+				return nil, nil, NewOpenAIWSClientCloseError(
+					coderws.StatusPolicyViolation,
+					"invalid websocket request payload",
+					stripErr,
+				)
+			} else {
+				payload = stripped
+				strippedClientState = strippedState
+			}
 			eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 			isResponseCreate := eventType == "response.create"
 			responseCreateAt := time.Time{}
@@ -1195,6 +1215,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				payload = next
 				kongTurnAttempt.Store(attempt)
 				usageMeta.storeKongFeatures(attempt)
+				// 剥离在准入之前，准入看不到客户端自带那份；补回来（见 RecordStrippedClientState）。
+				attempt.RecordStrippedClientStateOnFeatures(strippedClientState)
 			}
 			out, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, model, payload)
 			// 多轮 passthrough usage：仅在成功（non-block / non-err）
@@ -1249,6 +1271,18 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 	// 首轮的拒服可以换账号（理由见 wrapOpenAIWSFirstTurnKongTicketError）：此刻客户端一个字节都没收到、
 	// relay 还没启动、首帧也还没写上游。后续轮次的同一判定在逐帧过滤器里，那里只能按策略关闭连接。
+	// 首帧同样要剥帧内的异账号 blob（理由同逐帧过滤器那处）。
+	firstStrippedClientState := ""
+	if stripped, strippedState, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, firstClientMessage); stripErr != nil {
+		return NewOpenAIWSClientCloseError(
+			coderws.StatusPolicyViolation,
+			"invalid websocket request payload",
+			stripErr,
+		)
+	} else {
+		firstClientMessage = stripped
+		firstStrippedClientState = strippedState
+	}
 	// 收票放在准入之前，理由同逐帧过滤器那处。
 	if kongHandshakeState != "" && s.kongTicket.ShouldObserveHandshakeState(firstTurnModel) {
 		s.kongTicket.ObserveHandshakeState(ctx, account, firstTurnModel, kongHandshakeState)
@@ -1261,6 +1295,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		kongTurnAttempt.Store(attempt)
 		// 首帧不经逐帧过滤器，这里是它唯一的记录点。
 		usageMeta.storeKongFeatures(attempt)
+		attempt.RecordStrippedClientStateOnFeatures(firstStrippedClientState)
 	}
 	upstreamFirstMessageSent := false
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
@@ -1337,7 +1372,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				// [kong] 帧里没有 state 时补连接级的两项：出站认**我们在 upgrade 请求头里真正发出去
 				// 的**那个，客户端那份认客户端自己带来的那个（注入替换过才会落下差异）。
 				usageMeta.kongFeatures.Load().RecordOutboundIfAbsent(kongSentHandshakeState)
-				usageMeta.kongFeatures.Load().RecordClientStateIfAbsent(turnState)
+				usageMeta.kongFeatures.Load().RecordClientStateIfAbsent(clientTurnStateRaw)
 				turnResult := &OpenAIForwardResult{
 					RequestID: turn.RequestID,
 					Usage: OpenAIUsage{
@@ -1387,6 +1422,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 			},
 			AfterClientWrite: func(msgType coderws.MessageType, payload []byte, writeErr error) {
+				if writeErr == nil {
+					// 写成功才算客户端拿到了这个 blob：登记铸造账号供下次剥离判定。**不按帧类型过滤**
+					// ——本通路双向都允许二进制帧，一份 JSON 的 response.metadata 完全可以用 Binary 发出
+					// 来，按类型提前 return 等于留了个"换帧型就不登记"的缺口（与交付守卫同一处考量）。
+					s.noteOpenAIWSCodexTurnStateDelivered(c, account, payload)
+				}
 				if msgType == coderws.MessageText && writeErr == nil {
 					eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
 					markOpenAIWSClientVisibleFailure(c, eventType, payload)
@@ -1549,7 +1590,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	resultRequestModel, resultUpstreamModel := usageMeta.turnModels(relayResult.RequestModel)
 	// [kong] 同上：帧内没有 state 时补连接级那两项。
 	usageMeta.kongFeatures.Load().RecordOutboundIfAbsent(kongSentHandshakeState)
-	usageMeta.kongFeatures.Load().RecordClientStateIfAbsent(turnState)
+	usageMeta.kongFeatures.Load().RecordClientStateIfAbsent(clientTurnStateRaw)
 	result := &OpenAIForwardResult{
 		RequestID: relayResult.RequestID,
 		Usage: OpenAIUsage{

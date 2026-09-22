@@ -67,7 +67,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	turnState := ""
 	turnMetadata := ""
 	if c != nil && c.Request != nil {
-		turnState = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
+		// 只取本账号可以用的那一份（见 openAIWSClientTurnStateForAccount）。这条路每次 failover
+		// attempt 都会重入，判定用的始终是本次 attempt 的账号，而客户端那份请求头不被改动。
+		turnState = s.openAIWSClientTurnStateForAccount(c, account)
 		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
 	}
 	setOpenAIWSTurnMetadata(payload, turnMetadata)
@@ -132,7 +134,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		sessionHash = executionScope
 	}
 	if turnState == "" && stateStore != nil && sessionHash != "" {
-		if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, sessionHash); ok {
+		if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, account.ID, sessionHash); ok {
 			turnState = savedTurnState
 		}
 	}
@@ -330,11 +332,32 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	}
 	if handshakeTurnState != "" {
 		if stateStore != nil && sessionHash != "" {
-			stateStore.BindSessionTurnState(groupID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
+			stateStore.BindSessionTurnState(groupID, account.ID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
 		}
-		if c != nil {
-			c.Header(http.CanonicalHeaderKey(openAIWSTurnStateHeader), handshakeTurnState)
+	}
+	// commitHandshakeTurnState 在**真正提交下游响应之前**落定那个响应头，并按"确实交给客户端了"登记溯源。
+	//
+	// 不在拿到握手 state 时就写 `c.Writer`：这一层的 writer 是整个请求共用的，而这次 attempt 后面还有准入、
+	// 预热、上送、读上游等失败出口。提前写会造成两种错：被放弃的 attempt 把客户端其实没见过的值记成"它
+	// 持有"（下次它回带自己合法的旧 blob 就会被误剥）；以及那个头留在 writer 上，被接手的 attempt 的响应
+	// 原样带出去（本次为空时必须主动删掉残值——与 HTTP 侧 relayOpenAICodexTurnState 同一口径）。
+	commitHandshakeTurnState := func() {
+		if c == nil {
+			return
 		}
+		// 响应头一旦提交就冻结了：排队心跳会先写一个 ping 并 Flush（gateway_helper.go 的并发槽等待），
+		// 此后再改 Header map 只是改一个不会上线的副本。那时若照样登记溯源，就等于声称客户端持有一个
+		// 它根本没收到的 blob——溯源表被污染，后续判定会据此误剥。
+		if c.Writer.Written() {
+			return
+		}
+		canonical := http.CanonicalHeaderKey(openAIWSTurnStateHeader)
+		if handshakeTurnState == "" {
+			c.Writer.Header().Del(canonical)
+			return
+		}
+		c.Writer.Header().Set(canonical, handshakeTurnState)
+		s.noteOpenAICodexTurnStateProvenance(c, account, handshakeTurnState)
 	}
 
 	// [kong] codex 票据：这条 HTTP→WS 通路的准入。
@@ -342,6 +365,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	// 它是第三条独立通路——客户端 HTTP 进来、上游却是 WebSocket，既不过 doOpenAIUpstream 也不过
 	// 两条原生 WS 适配器。放在预热之前：预热帧与正式帧共用同一个 payload map，注入一次两者都带
 	// （codex 客户端也是每个 response.create 都带）。判定用 mappedModel——那是实际上送的模型。
+	// 帧内（这条路是 map）同样是上行载体：异账号 blob 要在准入与注入之前剥掉，且不得就地改内层 map
+	// ——它与客户端原始请求体共享（见 stripForeignOpenAIWSMapTurnState）。
+	strippedClientState := s.stripForeignOpenAIWSMapTurnState(c, account, payload)
 	kongTicketAttempt, kongTicketErr := s.kongTicket.PrepareWSMapPayload(ctx, account, mappedModel, payload)
 	if kongTicketErr != nil {
 		// **客户端是 HTTP**，所以拒服要走 HTTP 那套统一转换：包成 failover 错误让上层换号，耗尽时由
@@ -351,6 +377,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		// 此刻预热帧与正式生成帧都还没发出，换号是安全的。
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, kongTicketErr, false)
 	}
+	// 剥离在准入之前，准入看不到客户端自带那份；补回来（见 RecordStrippedClientState）。
+	kongTicketAttempt.RecordStrippedClientStateOnFeatures(strippedClientState)
 
 	if err := s.performOpenAIWSGeneratePrewarm(
 		ctx,
@@ -513,8 +541,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		frame = append(frame, "data: "...)
 		frame = append(frame, message...)
 		frame = append(frame, '\n', '\n')
+		if !wroteDownstream {
+			// 响应头必须在第一段字节之前落定。
+			commitHandshakeTurnState()
+		}
 		_, wErr := c.Writer.Write(frame)
 		if wErr == nil {
+			// 带内事件里上游也可能给 state，同样只在写出成功后登记。
+			s.noteOpenAIWSCodexTurnStateDelivered(c, account, message)
 			wroteDownstream = true
 			pendingFlushEvents++
 			flushStreamWriter(forceFlush)
@@ -786,7 +820,10 @@ readLoop:
 				flushBufferedStreamEvents("error_event")
 				emitStreamMessage(message, true)
 			}
-			if !reqStream {
+			if !reqStream && !clientDisconnected {
+				// 错误响应同样会把这个头交付给客户端，所以同样要落定并登记；客户端已经断连时这一份
+				// 送不出去，登记它就是在声称客户端持有一个没收到的 blob（成功分支同样带这个条件）。
+				commitHandshakeTurnState()
 				c.JSON(statusCode, gin.H{
 					"error": gin.H{
 						"type":    "upstream_error",
@@ -872,6 +909,7 @@ readLoop:
 			responseID = strings.TrimSpace(gjson.GetBytes(finalResponse, "id").String())
 		}
 
+		commitHandshakeTurnState()
 		c.Data(http.StatusOK, "application/json", finalResponse)
 	} else {
 		flushStreamWriter(true)
