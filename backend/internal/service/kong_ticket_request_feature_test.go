@@ -367,6 +367,35 @@ func TestKongRequestFeaturesReissuedReplacesAsGroup(t *testing.T) {
 //
 // 这条覆盖的是"只收票不判定"的入口：断连后没有业务输出会送出，交付判定无从谈起，也不该凭空产出
 // 一条拒服错误。
+// 原生 WS 上游发的载体事件带 codex. 前缀。只认不带前缀的拼写，WS 这条路一张票也收不到——
+// 票就在帧里，三处调用点却都静默 return，收票、交付判定、溯源登记同时失效且无任何信号。
+func TestKongObserveWSDownstreamAcceptsCodexPrefixedEvent(t *testing.T) {
+	ticket := strings.Repeat("a", 292)
+	g, account, repo := kongFeatureTestGateway(t, KongTicketModeFull, ticket)
+	payload := []byte(`{"type":"response.create","model":"gpt-6-astra"}`)
+	_, attempt, err := g.PrepareWSTurn(context.Background(), account, "gpt-6-astra", payload)
+	if err != nil || attempt == nil {
+		t.Fatalf("WS 准入失败：attempt=%v err=%v", attempt, err)
+	}
+
+	reissued := strings.Repeat("r", 292)
+	event := []byte(`{"type":"codex.response.metadata","headers":{` +
+		`"x-codex-safety-buffering-enabled":"true",` +
+		`"x-codex-turn-state":"` + reissued + `","x-models-etag":"W/\"abc\""}}`)
+	g.ObserveWSDownstream(context.Background(), account, attempt, event)
+
+	f := attempt.Features.Snapshot()
+	if f == nil || f.ReissuedFP != kongStateFingerprint(reissued) {
+		t.Fatalf("带前缀的载体事件没被收：%+v", f)
+	}
+	if f.ReissuedTicketID == nil {
+		t.Fatal("回发票应入库并带 id")
+	}
+	if got := repo.ticketByID(*f.ReissuedTicketID); got == nil || got.State != reissued {
+		t.Errorf("id 指向的不是那张回发票：%+v", got)
+	}
+}
+
 func TestKongObserveWSDownstreamCollectsWithoutJudging(t *testing.T) {
 	ticket := strings.Repeat("a", 292)
 	g, account, repo := kongFeatureTestGateway(t, KongTicketModeFull, ticket)

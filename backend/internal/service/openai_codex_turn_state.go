@@ -333,9 +333,10 @@ func (s *OpenAIGatewayService) stripForeignOpenAIWSMapTurnState(c *gin.Context, 
 
 // noteOpenAIWSCodexTurnStateDelivered 记录"上游给的这个 state 已经到了客户端手里"。
 //
-// 原生 WS 上客户端是从**带内 `response.metadata` 事件**里拿到 state 的（我们的 upgrade 响应早就发完
-// 了，加不了头），它下次连进来会把这个值放在 upgrade 请求头上回带。不在这里记溯源，那道剥离守卫对
-// **WS 铸造的** state 就是个空操作——溯源表里查无此项，它只会直接放行。
+// 原生 WS 上这个 state 只能经**带内 metadata 事件**到达客户端（我们的 upgrade 响应早就发完了，
+// 加不了头）。客户端会不会解析并在下次 upgrade 请求头上回带，取决于它的实现——所核查的 codex 版本
+// 只认不带前缀的事件名，因此不回带；但溯源要按"已经交到客户端手里"记，不能赌客户端不用它。
+// 不在这里记溯源，那道剥离守卫对**WS 铸造的** state 就是个空操作——溯源表里查无此项，直接放行。
 //
 // 与 HTTP 侧口径一致：**只在确实要写给客户端时记**，没送出去的（被拦截、客户端已断连）不记，否则
 // 溯源表会污染成"客户端手里有一个它其实从没见过的值"，导致后续误剥离。
@@ -343,7 +344,7 @@ func (s *OpenAIGatewayService) noteOpenAIWSCodexTurnStateDelivered(c *gin.Contex
 	if s == nil || c == nil || account == nil || len(payload) == 0 {
 		return
 	}
-	if eventType, _, _ := parseOpenAIWSEventEnvelope(payload); eventType != "response.metadata" {
+	if eventType, _, _ := parseOpenAIWSEventEnvelope(payload); !kongWSTurnStateMetadataEvent(eventType) {
 		return
 	}
 	state := kongWSTurnStateFromEvent(payload)

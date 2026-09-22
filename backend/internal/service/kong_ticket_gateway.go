@@ -465,7 +465,7 @@ func (g *KongTicketGateway) GuardWSDownstream(ctx context.Context, account *Acco
 		return nil
 	}
 	eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
-	if eventType != "response.metadata" {
+	if !kongWSTurnStateMetadataEvent(eventType) {
 		return nil
 	}
 	state := kongWSTurnStateFromEvent(payload)
@@ -523,7 +523,7 @@ func (g *KongTicketGateway) ObserveWSDownstream(ctx context.Context, account *Ac
 	if !g.Enabled() || account == nil || len(payload) == 0 {
 		return
 	}
-	if eventType, _, _ := parseOpenAIWSEventEnvelope(payload); eventType != "response.metadata" {
+	if eventType, _, _ := parseOpenAIWSEventEnvelope(payload); !kongWSTurnStateMetadataEvent(eventType) {
 		return
 	}
 	state := kongWSTurnStateFromEvent(payload)
@@ -586,6 +586,24 @@ func (g *KongTicketGateway) ObserveHandshakeState(ctx context.Context, account *
 		return
 	}
 	g.svc.ObserveState(ctx, account.ID, model, state)
+}
+
+// kongWSTurnStateMetadataEvent 判断一帧是不是带内 turn-state 的载体事件。
+//
+// **两种拼写都要认。** 原生 WS 上游发的是 `codex.response.metadata`（实测线上帧得到；codex-rs 的
+// `codex-api/src/endpoint/responses_websocket.rs` 是**客户端接收侧**，它按这个名字取 models-etag，
+// `sse/responses.rs` 的公共事件表也列了它），SSE 上则是不带前缀的 `response.metadata`。只认后者，WS 这条路一帧也匹配不上——票明明就在帧里，
+// 只是类型名对不上，而三处调用点全部静默 return，于是收票、交付判定、溯源登记在 WS 上同时失效。
+//
+// 不用「剥掉 codex. 前缀」的写法：上游同一条连接上还发 `codex.rate_limits`、
+// `responsesapi.websocket_timing` 这类带外事件，按前缀泛化等于把未知事件也当成载体。
+func kongWSTurnStateMetadataEvent(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "response.metadata", "codex.response.metadata":
+		return true
+	default:
+		return false
+	}
 }
 
 // kongWSTurnStateFromEvent 从 `response.metadata` 事件里取票。

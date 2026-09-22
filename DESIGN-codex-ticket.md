@@ -207,7 +207,7 @@
 | 上游传输 | 本轮证据 | 结论 |
 |---|---|---|
 | HTTP（含 SSE 流式、SSE 转 JSON） | `x-codex-turn-state` 在响应头，头先于 body 到达 | **可以拦**：判定点天然早于任何业务内容离开 |
-| WebSocket 上游 | 票在**上送帧**的 `client_metadata`，信号在**带内 `response.metadata` 事件**（turn start 就到） | **可以拦**：判定点同样早于任何内容分片 |
+| WebSocket 上游 | 票在**上送帧**的 `client_metadata`，信号在**带内 `codex.response.metadata` 事件**（turn start 就到） | **可以拦**：判定点同样早于任何内容分片 |
 
 **握手头那一层单独拿不出本轮证据**，这是 WS 上唯一需要小心的地方：连接池复用时本轮根本不发生握手，
 新票压根没送上去，而保存下来的旧握手响应头恰好"没有新 state"，**看起来像注入成功**。加大正文缓冲补
@@ -224,11 +224,46 @@
 | 方向 | HTTP | WS |
 |---|---|---|
 | 客户端 → 上游 | `x-codex-turn-state` 请求头 | payload 的 `client_metadata["x-codex-turn-state"]`，每个 `response.create` 帧都带 |
-| 上游 → 客户端 | 响应头 | 握手响应头 **+ 带内 `response.metadata` 事件**的 `headers` |
+| 上游 → 客户端 | 响应头 | 握手响应头 **+ 带内 `codex.response.metadata` 事件**的顶层 `headers` |
 
-所以「本轮证据」在 WS 上是存在的，而且 `response.metadata` 是上游在 **turn start** 下发路由令牌的
+所以「本轮证据」在 WS 上是存在的，而且该事件是上游在 **turn start** 下发路由令牌的
 事件，先于任何内容分片——判定时机比 HTTP 的响应头还宽裕。连接池复用不构成障碍：证据不在握手里，
 在本轮的下行事件里。
+
+⚠️ **事件名在 WS 上带 `codex.` 前缀，两种拼写都要认。** 原生 WS 上游发的是
+`codex.response.metadata`——这一条的依据是**实测线上帧**；codex 那两个文件
+（`codex-rs/codex-api/src/endpoint/responses_websocket.rs` 与 `sse/responses.rs`）是**客户端接收侧**，
+前者按这个名字取 models-etag、后者的公共事件表也列了它，它们佐证名字但不是上游的发送实现。
+SSE 上才是不带前缀的 `response.metadata`。
+只认后者会让 WS 上的收票、交付判定与溯源登记**同时静默失效**——票就在帧里，只是类型名对不上。
+不要用「剥掉 `codex.` 前缀」泛化：同一条连接上还有 `codex.rate_limits`、
+`responsesapi.websocket_timing` 这类带外事件。
+
+**「下发即未接受」这条推断在 WS 上已实测成立**（同一条连接连跑两轮）：第一轮不带票，
+`codex.response.metadata` 的 `headers` 里有 `x-codex-turn-state`（292）；第二轮把该票回带进
+`client_metadata`，同一个事件照样到达、但**不再带** `x-codex-turn-state`（只剩
+`x-codex-safety-buffering-*` 与 `x-models-etag`）。所以判据必须是「这一帧**带不带 state**」而不是
+「这一帧有没有来」——后者会把受保护账号整轮误拦。
+
+**所核查的 codex 版本在带内读不到这份票**（`5c07856e25`，2026-09-22）：它的 `turn_state()` 只匹配
+不带前缀的 `response.metadata`，WS 上它自己的票来自**握手响应头**（`OnceLock`，连接级只取一次），
+而我们给客户端的 upgrade 响应在任何一轮之前就发完了、加不上这个头。所以带内那一份是**我们**在 WS 上
+唯一能拿到的逐轮证据。
+
+⚠️ **不要据此反推特征列的含义**，两者是不同的事：
+
+- `state_fp` 记的是**本轮实际上送给上游的那个 state**，取值有先后：`PrepareWSTurn` 先记**帧内**的值
+  （off/observe 记客户端自带那份，full 记注入后的那份），帧内没有时才由 `RecordOutboundIfAbsent`
+  补上**这条连接握手时真正发出去的**值。所以它非空至少有三种来路：客户端在帧里带了票、我们注入了票、
+  或者握手请求里带了票——**最后一种不要求 full 模式**，网关会把上游握手响应里的 state 存进会话粘滞、
+  并塞进后续连接的请求头（ingress 的握手分支与 `GetSessionTurnState` 恢复）。客户端从没拿到票时，
+  off 模式的 `state_fp` 照样可能非空。
+- `client_state_fp` 只在**客户端那份与我们实际上送的那份不同**时才记，为空不能推出"客户端没票"。
+- `reissued_*` 才是下行证据，它缺失直接对应"本轮上游没下发 state"（或那一帧没被认出来）。
+
+线上观测到的 WS 特征长期全空（33 个门控轮 0 条）与上面几条都相容，但**不要拿单条结论去解释它**：
+要坐实得同时核对那些轮次的帧内是否带 state、握手请求里有没有缓存恢复的值、以及带内事件是否被认出。
+已知的一条是带内事件当时正被事件名判定丢掉，因此 `reissued_*` 必然为空。
 
 两条原生路径各有两个接入点：注入在逐帧解析/过滤器里（都在模型解析并改写**之后**，判定用的是实际
 上送的那个模型，所以会话中途换成门控模型同样受保护），交付判定在下行写点（ctx_pool 的
@@ -959,7 +994,7 @@ state**（没有任何 state 上送时单独摆一个 `client_state_*`，读起�
 的通路漏失重新变成静默，而那正是它这次抓到的东西。
 
 **收票与记特征不挂在"客户端还连得上"这个条件下。** ctx_pool 那条路的下行处理整块在 `clientDisconnected`
-之后被跳过，而上游照样在发 `response.metadata`、用量行照样结算；所以那一侧另有一个**只收票不判定**的
+之后被跳过，而上游照样在发该 metadata 事件、用量行照样结算；所以那一侧另有一个**只收票不判定**的
 入口（`ObserveWSDownstream`）。交付判定仍然只在写客户端那条路上做：断连之后没有业务输出会送出去，
 再产出一条拒服错误只是凭空给调用方加错误路径。
 

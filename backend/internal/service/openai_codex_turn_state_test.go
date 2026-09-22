@@ -592,6 +592,22 @@ func TestOpenAIWSCodexTurnStateEchoGuard(t *testing.T) {
 		require.Equal(t, "blob-A", shared["x-codex-turn-state"], "客户端原始请求体共享的那份内层 map 不得被改")
 	})
 
+	t.Run("带 codex. 前缀的载体事件同样记溯源", func(t *testing.T) {
+		// 原生 WS 上游发的就是这个拼写。漏认它，WS 铸造的 state 永远进不了溯源表，
+		// 那道跨账号剥离对 WS 就是个空操作——判定「查无来源」一律放行。
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-prefixed")
+		frame := []byte(`{"type":"codex.response.metadata","headers":{"x-codex-turn-state":"blob-prefixed"}}`)
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, frame)
+
+		next := upgradeWith(t, "ws-sess-prefixed", "blob-prefixed")
+		require.Empty(t, svc.openAIWSClientTurnStateForAccount(next, &Account{ID: 43}),
+			"别的账号铸造的 state 不许用")
+		same := upgradeWith(t, "ws-sess-prefixed", "blob-prefixed")
+		require.Equal(t, "blob-prefixed", svc.openAIWSClientTurnStateForAccount(same, &Account{ID: 42}),
+			"本账号自己铸造的那份照常可用")
+	})
+
 	t.Run("非 metadata 事件与不带 state 的事件都不记", func(t *testing.T) {
 		svc := &OpenAIGatewayService{}
 		c, _ := newTurnStateTestContext(t, 7, "ws-sess-3")

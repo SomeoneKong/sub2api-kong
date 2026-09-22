@@ -308,6 +308,26 @@ func TestKongGuardWSDownstream(t *testing.T) {
 			attempt:   &KongUpstreamAttempt{Model: "gpt-6-astra"},
 			wantBlock: false,
 		},
+		{
+			// 原生 WS 上游发的是带 codex. 前缀的拼写，headers 里还混着别的 x-codex-* 项。
+			// 帧形状取自线上实测。
+			name: "codex.response.metadata 带 state = 必须拦",
+			payload: `{"type":"codex.response.metadata","headers":{` +
+				`"x-codex-safety-buffering-enabled":"true",` +
+				`"x-codex-safety-buffering-faster-model":"gpt-fast",` +
+				`"x-codex-turn-state":"aaa","x-models-etag":"W/\"abc\""}}`,
+			attempt:   &KongUpstreamAttempt{Model: "gpt-6-astra", Grant: &KongTicketGrant{Allowed: true, TicketID: 7}},
+			wantBlock: true,
+		},
+		{
+			// 票被接受的那一轮：metadata 帧照样来，只是不带 turn-state。不能因为「这帧来了」就拦，
+			// 否则受保护账号在 WS 上会被整轮误拦。帧形状取自线上实测的第二轮。
+			name: "codex.response.metadata 不带 state = 票被接受，放行",
+			payload: `{"type":"codex.response.metadata","headers":{` +
+				`"x-codex-safety-buffering-enabled":"true","x-models-etag":"W/\"abc\""}}`,
+			attempt:   &KongUpstreamAttempt{Model: "gpt-6-astra", Grant: &KongTicketGrant{Allowed: true, TicketID: 7}},
+			wantBlock: false,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -318,6 +338,26 @@ func TestKongGuardWSDownstream(t *testing.T) {
 				t.Fatalf("拦截 = %v（err=%v），want %v", got, err, c.wantBlock)
 			}
 		})
+	}
+}
+
+// 载体事件的拼写有两种，只认一种就会让整条通路静默失效：上游在原生 WS 上发的是
+// codex.response.metadata，SSE 上是不带前缀的 response.metadata。
+// 同一条连接上还有别的带外事件，不能按 codex. 前缀泛化。
+func TestKongWSTurnStateMetadataEvent(t *testing.T) {
+	for _, ok := range []string{"response.metadata", "codex.response.metadata", "  codex.response.metadata  "} {
+		if !kongWSTurnStateMetadataEvent(ok) {
+			t.Errorf("%q 应判为载体事件", ok)
+		}
+	}
+	for _, no := range []string{
+		"", "codex.rate_limits", "responsesapi.websocket_timing",
+		"response.completed", "response.output_text.delta",
+		"metadata", "codex.response.metadata.extra",
+	} {
+		if kongWSTurnStateMetadataEvent(no) {
+			t.Errorf("%q 不该判为载体事件", no)
+		}
 	}
 }
 
