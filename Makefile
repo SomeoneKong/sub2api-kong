@@ -26,7 +26,8 @@ FRONTEND_CRITICAL_VITEST := \
 	src/features/codex-ticket/__tests__/TicketEventTable.props.spec.ts \
 	src/features/codex-ticket/__tests__/requestFeatures.spec.ts \
 	src/features/codex-ticket/__tests__/CodexTicketView.drafts.spec.ts \
-	src/features/codex-ticket/__tests__/CodexTicketDetailView.route.spec.ts
+	src/features/codex-ticket/__tests__/CodexTicketDetailView.route.spec.ts \
+	src/features/openai-usage-window/__tests__/fiveHourWindow.spec.ts
 
 # 一键编译前后端
 build: build-backend build-frontend
