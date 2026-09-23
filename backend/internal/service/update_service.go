@@ -30,7 +30,7 @@ var (
 const (
 	updateCacheKey = "update_check_cache"
 	updateCacheTTL = 1200 // 20 minutes
-	githubRepo     = "Wei-Shaw/sub2api"
+	githubRepo     = "SomeoneKong/sub2api-kong"
 
 	// Security: allowed download domains for updates
 	allowedDownloadHost = "github.com"
@@ -637,12 +637,16 @@ func (s *UpdateService) saveToCache(ctx context.Context, info *UpdateInfo) {
 	_ = s.cache.SetUpdateInfo(ctx, string(data), time.Duration(updateCacheTTL)*time.Second)
 }
 
-// compareVersions compares two semantic versions
+// compareVersions compares two semantic versions.
+//
+// 版本形如 <major>.<minor>.<patch>[-kong.<n>]：前三段是上游基线，第四段是同一基线上的
+// fork 迭代序号。四段都参与比较——只比前三段会让 0.2.5-kong.1 与 0.2.5-kong.7 等价，
+// 版本检查将永远认为"无新版"。
 func compareVersions(current, latest string) int {
 	currentParts := parseVersion(current)
 	latestParts := parseVersion(latest)
 
-	for i := 0; i < 3; i++ {
+	for i := range currentParts {
 		if currentParts[i] < latestParts[i] {
 			return -1
 		}
@@ -653,13 +657,24 @@ func compareVersions(current, latest string) int {
 	return 0
 }
 
-func parseVersion(v string) [3]int {
+// parseVersion 解析为 [major, minor, patch, fork] 四段。
+//
+// 无后缀时 fork 为 0，于是同一基线上 "0.2.5-kong.1" > "0.2.5"。解析不出数字的后缀
+// （如 -rc1）同样按 0 处理，只按前三段比较。
+func parseVersion(v string) [4]int {
 	v = strings.TrimPrefix(v, "v")
+	fork := 0
 	if idx := strings.IndexByte(v, '-'); idx != -1 {
+		suffix := v[idx+1:]
 		v = v[:idx]
+		if j := strings.LastIndexByte(suffix, '.'); j != -1 {
+			if n, err := strconv.Atoi(suffix[j+1:]); err == nil {
+				fork = n
+			}
+		}
 	}
 	parts := strings.Split(v, ".")
-	result := [3]int{0, 0, 0}
+	result := [4]int{0, 0, 0, fork}
 	for i := 0; i < len(parts) && i < 3; i++ {
 		if parsed, err := strconv.Atoi(parts[i]); err == nil {
 			result[i] = parsed
