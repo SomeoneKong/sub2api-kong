@@ -646,6 +646,10 @@ const allColumns = computed(() => [
   { key: 'endpoint', label: t('usage.endpoint'), sortable: false },
   { key: 'group', label: t('admin.usage.group'), sortable: false },
   { key: 'stream', label: t('usage.type'), sortable: false },
+  // [kong] fork 专有列：逐请求的降智特征（发往上游的 state、客户端自带那份、注入的票、上游回发的 state）。
+  // 标签用中文字面量而不是 t()：它只服务本 fork 的排查，加 i18n 键要动上游两份 locale 文件，
+  // 那是每周都在变的 rebase 面，代价与收益不成比例。
+  { key: 'request_features', label: '请求特征', sortable: false },
   { key: 'billing_mode', label: t('admin.usage.billingMode'), sortable: false },
   { key: 'tokens', label: t('usage.tokens'), sortable: false },
   { key: 'cost', label: t('usage.cost'), sortable: false },
