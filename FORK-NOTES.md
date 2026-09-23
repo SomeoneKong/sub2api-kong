@@ -8,8 +8,9 @@
 
 ## 定制的边界
 
-只碰两类东西：**codex ticket 相关的功能**，以及**fork 自身必须适配的部分**（版本检查、
-发布标识）。上游其余部分一律不动——定制面越窄，越能持续跟上上游的 bug 修复。
+只碰三类东西：**codex ticket 相关的功能**、**OpenAI 账号消耗节奏**（旧版选号的重排，设计见
+`DESIGN-openai-account-pace.md`），以及**fork 自身必须适配的部分**（版本检查、发布标识）。
+上游其余部分一律不动——定制面越窄，越能持续跟上上游的 bug 修复。
 
 有三处是**结构性的、不随上游版本变化的约束**，值得写在这里而不是只留在 commit 里：
 
@@ -38,7 +39,7 @@
 | **不改 Go module path** | 仍是 `github.com/Wei-Shaw/sub2api`。改它要动几百处 import、制造巨大 rebase 冲突面；本 fork 只构建镜像、不作为库被引用 |
 | **不改 `backend/cmd/server/VERSION`** | 版本优先级是 `--build-arg VERSION` > git tag > 该文件，走 build-arg 即可 |
 | CI / Security Scan 只在 `main` 与 PR 上触发 | 上游的 `on: push` 无分支过滤。本 fork 会持续 push `base/*` tag 归档上游基线，不限制就每个 tag 都跑一遍全量 CI——跑的还是纯上游代码 |
-| **不要跑 `wire generate`** | codex 票据的装配是手工写在 `cmd/server/wire_gen.go` 里的（直接给 `AdminHandlers` 赋字段、调 `SetKongTicketGateway`），wire 生成不出这几行。重新生成会把它们抹掉，而编译不会报错——只会让功能静默失效 |
+| **不要跑 `wire generate`** | codex 票据与消耗节奏的装配是手工写在 `cmd/server/wire_gen.go` 里的（直接给 `AdminHandlers` 赋字段、调 `SetKongTicketGateway` / `SetKongOpenAIAccountPace`，外加节奏组件的 `Start` 与 cleanup 里的 `StopKongOpenAIAccountPace`），wire 生成不出这几行。重新生成会把它们抹掉，而编译不会报错——只会让功能静默失效 |
 | **HTTP 的票据闸门挂在 `doOpenAIUpstream`，不挂在各业务分支** | 那是全部 OpenAI **HTTP** 上游发送的汇聚点（二十来个调用点；原生 WS 的帧不经过它，见下一行）。逐个分支去插必漏——Responses 透传、chat-completions 转 Responses、messages 转 Responses、WS-HTTP bridge、alpha-search、images 桥接各自构造请求与处理响应，而漏没漏不会报错，只会安静地交付降智输出。交付判定放在拿到响应头之后：正文还没到调用方手里，丢弃即「零业务正文交付」，流式/非流式/SSE 转 JSON 一并覆盖 |
 | **原生 WS 自己接入同一套判定** | 帧不流经 `doOpenAIUpstream`，所以 ctx_pool 与 passthrough 两条路各自在「客户端→上游」的帧出口做准入（`GuardWSFrame` 挡歧义帧 + `PrepareWSTurn` 注入）、在「上游→客户端」的帧写点做交付判定（`GuardWSDownstream`）。**两个易漏点**：passthrough 的首帧不走逐帧过滤器（它在 relay 启动前单独写上游），必须单独准入；下行判定不能按帧类型提前 return，`response.metadata` 用 Binary 帧一样发得出来 |
 | WS 的票走 payload 的 `client_metadata`，不是握手头 | codex 客户端在 WS 上把 `x-codex-turn-state` 放进每个 `response.create` 帧的 `client_metadata`（`codex-rs/core/src/client.rs`），上游则用带内 `response.metadata` 事件回送（`codex-api/src/sse/responses.rs`）。两边都是逐轮的，所以连接复用不妨碍本轮判定。**不要把受保护账号改投 HTTP bridge**：bridge 适配层会删 `previous_response_id`、丢 `generate:false`、只收 `response.create`，不是原生 WS 的等价替代 |
@@ -50,6 +51,8 @@
 | **turn-state 溯源表不设容量上限** | 表里记的是「这个 blob 是我们替哪个账号发出去的」，判定口径是查无来源即不剥——无从判定来源就剥，等于无谓丢掉客户端的对话上下文。所以淘汰未过期条目会把「已知别家铸造」降成「查无来源」，failover 换号后那个 blob 又被原样送到新账号，正是这道守卫要挡的事。要设硬上限，就得在交付前先预留登记容量、满额即拒服；在那之前容量只由 TTL 与后台清扫约束 |
 | 门控判定只能用 JSON 解码，且要拒绝重复 `model` 键 | 转义写法（`a` 之类）的原始字节里找不到模型名，解码后却正是它——字节子串匹配等于留一个一行转义就能绕开的后门。重复键更麻烦：gjson 取第一个而 `encoding/json` 取最后一个，上游按哪个解释我们不知道，所以判为「不可判定」。判不出时受保护账号拒服、其余照常 |
 | 票据拒服要在 `handleOpenAIUpstreamTransportError` **最前面**早退 | 否则会被当成传输故障：记一条假的 `request_error`、可能把健康账号临时停掉调度、还包装成 502 去换号——等于把「拒服」悄悄变成「换个号照发」。早退必须在任何 ops 写入之前，放在后面只避免了换号、仍然污染了故障记录 |
+| **消耗节奏只挂在旧版选号的第 2 层，只改顺序不改候选** | 钩子全在 `openai_gateway_scheduling.go` 的 `selectAccountWithLoadAwareness` 里，都是单行、带 `[kong]` 注释：进入第 2 层处 `kongPaceBegin` + `defer finish`、`shuffleWithinSortGroups` 之后 `reorder`、抢槽循环前 `finalOrder`、两处抢到后 `acquired`、负载读取失败分支开头 `loadFailed`。rebase 时要复核的就是这几处；上游改动这个函数时，要确认 `reorder` 仍在同优先级内的随机打散之后、倍率排序与 compact 分层之前——放到后面会把上游的硬约束冲掉。第 1 层（粘性）与第 3 层（兜底等待）刻意不接：粘性优先于短期均衡，兜底等待本就不挑号。过滤条件一概不碰，所以最坏情况也只是退回上游的顺序 |
+| 消耗节奏的参数放数据目录下的 `openai-account-pace.yaml`，不进 `config.yaml`、也不像票据那样走环境变量 | 要在线调：环境变量每改一次都要重建容器、掐断进行中的流式响应，而组件每分钟检查一次文件，改完即生效；参数又是按套餐分组的嵌套结构，环境变量表达不了。不进 `config.yaml` 是因为上游的 `config.go` 是高频改动面，加字段就多一处 rebase 冲突。文件不存在即功能关闭，改坏时沿用上一份有效配置并在日志与 Redis 的 meta 里报错 |
 | 接转发链路用「可选依赖 + setter」 | `OpenAIGatewayService` 的构造函数参数表很长且是上游高频改动面。加字段 + `SetKongTicketGateway` 能把改动收在一处，未注入时所有接入点退化为空操作 |
 | 前端定制放 `frontend/src/features/codex-ticket/`，上游文件只做单行追加 | 页面自包含（自己的 `api.ts` / `types.ts`），碰上游的只有四处各一行：`router/index.ts` 一个路由对象、`AppSidebar.vue` 的 `baseItems` 一项、`i18n/locales/{en,zh}/common.ts` 各一个 `nav.kongTicket`。rebase 时要复核的就是这四处 |
 | 后端响应结构要显式写 `json` tag | 本功能的 handler 直接序列化 service 层结构体。上游那些结构多数也没 tag，但我们的响应里混着 `gin.H` 的 snake_case 字段——不写 tag 会让同一个响应里两种命名风格并存，前端类型也跟着别扭 |
