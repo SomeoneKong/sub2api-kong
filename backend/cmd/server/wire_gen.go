@@ -18,6 +18,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/server"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/Wei-Shaw/sub2api/internal/setup"
 	"github.com/redis/go-redis/v9"
 	"log"
 	"net/http"
@@ -302,6 +303,11 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 		log.Printf("kong fingerprint: 指纹库加载失败，指纹测试不可用: %v", kongFingerprintErr)
 	}
 	adminHandlers.KongFingerprint = admin.NewKongFingerprintHandler(kongFingerprintTester)
+	// [kong] 账号消耗节奏：同样手工装配。协程总是启动——配置文件（数据目录下的
+	// openai-account-pace.yaml）可以之后再放，放进去一分钟内生效；文件不存在时每拍只检查一次文件。
+	kongPace := service.NewKongOpenAIAccountPace(repository.NewKongPaceRepository(db), repository.NewKongPaceStore(redisClient), concurrencyService, service.KongPaceConfigPath(setup.GetDataDir()))
+	openAIGatewayService.SetKongOpenAIAccountPace(kongPace)
+	kongPace.Start()
 	usageRecordWorkerPool := service.NewUsageRecordWorkerPool(configConfig)
 	userMsgQueueCache := repository.NewUserMsgQueueCache(redisClient)
 	userMessageQueueService := service.ProvideUserMessageQueueService(userMsgQueueCache, rpmCache, configConfig)
@@ -661,6 +667,12 @@ func provideCleanup(
 			{"KongTicketObserver", func() error {
 				if openAIGateway != nil {
 					openAIGateway.StopKongTicketObserver()
+				}
+				return nil
+			}},
+			{"KongOpenAIAccountPace", func() error {
+				if openAIGateway != nil {
+					openAIGateway.StopKongOpenAIAccountPace()
 				}
 				return nil
 			}},
