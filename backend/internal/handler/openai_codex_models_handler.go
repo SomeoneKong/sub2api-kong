@@ -34,6 +34,8 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 		return
 	}
 
+	// [kong] 目录写出前还要折算上下文窗口，If-None-Match 只能对最终正文判定：
+	// 下面的构建函数一律传空串，由 KongFinalizeCodexModelsManifest 统一判 304。
 	ifNoneMatch := c.GetHeader("If-None-Match")
 	// 固定账号分支：开启后只用选定账号拉取 manifest，不经过调度器；
 	// 全部不可用/全部失败时按 FallbackToScheduler 决定回退调度器或返回错误。
@@ -60,13 +62,14 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 		} else {
 			// 让 ops 错误日志携带实际拉取成功的首个固定账号。
 			setOpsSelectedAccount(c, pinnedAccount.ID, pinnedAccount.Platform)
-			if err := h.gatewayService.MergeGroupConfiguredCodexModels(c.Request.Context(), apiKey.Group, pinnedManifest, ifNoneMatch); err != nil {
+			if err := h.gatewayService.MergeGroupConfiguredCodexModels(c.Request.Context(), apiKey.Group, pinnedManifest, ""); err != nil {
 				h.errorResponse(c, http.StatusInternalServerError, "api_error", "Failed to build Codex models manifest")
 				return
 			}
 			if c.Request.Context().Err() != nil {
 				return
 			}
+			service.KongFinalizeCodexModelsManifest(pinnedManifest, ifNoneMatch)
 			writeOpenAIModelsResponse(c, pinnedManifest)
 			return
 		}
@@ -76,7 +79,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 		configuredManifest, configured, err := h.gatewayService.BuildGroupConfiguredCodexModelsManifest(
 			c.Request.Context(),
 			apiKey.Group,
-			ifNoneMatch,
+			"",
 		)
 		if err != nil {
 			if c.Request.Context().Err() != nil {
@@ -86,6 +89,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 			return
 		}
 		if configured {
+			service.KongFinalizeCodexModelsManifest(configuredManifest, ifNoneMatch)
 			writeOpenAIModelsResponse(c, configuredManifest)
 			return
 		}
@@ -139,7 +143,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 			h.errorResponse(c, http.StatusInternalServerError, "api_error", "Failed to apply model mappings")
 			return
 		}
-		if err := h.gatewayService.MergeGroupConfiguredCodexModels(c.Request.Context(), apiKey.Group, manifest, ifNoneMatch); err != nil {
+		if err := h.gatewayService.MergeGroupConfiguredCodexModels(c.Request.Context(), apiKey.Group, manifest, ""); err != nil {
 			h.errorResponse(c, http.StatusInternalServerError, "api_error", "Failed to build Codex models manifest")
 			return
 		}
@@ -147,6 +151,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 			return
 		}
 
+		service.KongFinalizeCodexModelsManifest(manifest, ifNoneMatch)
 		writeOpenAIModelsResponse(c, manifest)
 		return
 	}
