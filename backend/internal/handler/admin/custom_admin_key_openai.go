@@ -79,6 +79,9 @@ func (h *OpenAIOAuthHandler) scopedOpenAIQuota(c *gin.Context, refresh bool) {
 		response.Error(c, 503, "账户额度服务不可用")
 		return
 	}
+	if refresh {
+		defer service.KongQuotaAccountLock(c.Request.Context(), id)() // [kong] 查询与写缓存同一账号串行，同 RefreshQuota
+	}
 	u, err := h.quotaService.QueryUsage(c.Request.Context(), id)
 	if err != nil {
 		scopedOpenAIError(c, err)
