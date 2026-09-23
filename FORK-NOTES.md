@@ -13,6 +13,10 @@
 - **codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）
 - **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）
 - **OpenAI 账号消耗节奏**（旧版选号的重排，设计见 `DESIGN-openai-account-pace.md`）
+- **Codex 模型目录的上下文窗口折算**（见下文挂点一节）
+- **发往官方 ChatGPT 后端的请求体 zstd 压缩**（省出站流量，见下文挂点一节）
+- **前端展示调整**（账号页：OpenAI Pro 20x / Pro 5x 只有 7d 主窗口，不显示 5h；管理员用量页：用户列可在列设置里隐
+  藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会显示）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
@@ -134,6 +138,38 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
   存在即功能关闭，改坏时沿用上一份有效配置并在日志与 Redis 的 meta 里报错。
 - **装配**（`wire_gen.go`）：建节奏组件，`SetKongOpenAIAccountPace` 注入网关服务，接好计划组件之后 `Start`；
   cleanup 里 `StopKongOpenAIAccountPace`。
+
+### Codex 模型目录的上下文窗口折算
+
+- **挂在 `CodexModels` 的每个写出口**。上游目录的 `max_context_window` 在 codex 里是「配置覆盖允许的上限」，网关按
+  它 × 比例抬高 `context_window`（只往上调），客户端就不必各自配 `model_context_window` 或钉本地目录。handler
+  的固定账号、分组配置、调度三条分支各自写响应，每处写出前都调 `KongFinalizeCodexModelsManifest`；传给上游构建
+  函数的 If-None-Match 一律为空串，304 由它按折算后的 ETag 判定——否则持有折算前 ETag 的客户端永远拿不到折算结
+  果。rebase 时上游若新增写出分支，要一并接上。
+- **开关**：环境变量 `KONG_CODEX_CONTEXT_WINDOW_RATIO`，不设置为 1（取 max），0 关闭，写错则关闭并记错误日志。
+
+### 发往官方 ChatGPT 后端的请求体 zstd 压缩
+
+- **挂在 `doOpenAIUpstream` 的发送处**。与票的观测同一个汇聚点，HTTP 调用点一并覆盖；原生 WS 不经过这里，它的帧由
+  permessage-deflate 压缩。条件只看最终出站请求：发往 `chatgpt.com`（含子域）的 JSON POST、正文不小于 1 KiB、
+  没有 `Content-Encoding`、账号不走插件（插件自带传输层）。入站的 `Content-Encoding` 在读入时已解码并删除，也
+  不在转发头白名单里，所以客户端自己压缩上来的请求不影响判断。票的观测在压缩之前记下明文请求体的读取入口：收票
+  要读明文里的 `model`。
+- **插件判定只做一次**：压缩了的请求（连同明文重发）直接交 `httpUpstream.Do`，不经 `sendOpenAIUpstream`，否则插件
+  绑定在两次判定之间切换时，压缩正文会落进插件——rebase 时上游若在 `sendOpenAIUpstream` 里加了逻辑，要看压缩路
+  径是否也需要。
+- **被拒时的回退**：上游像是不接受压缩（415，或 400 / 422 且错误正文是专指正文解码失败的写法）时用明文重发一次；明
+  文通过了，才把该端点改发明文 24 小时，明文同样被拒说明与压缩无关、端点照旧压缩。普通业务错误不重发，错误正文
+  原样交给调用方。每 10 分钟一行 `kong zstd: 周期计数` 日志给出压缩前后字节数。
+- **开关**：环境变量 `KONG_OPENAI_REQUEST_ZSTD`，不设置为开，false 关闭，写错则关闭并记错误日志。
+
+### 前端展示调整
+
+- 代码在 `features/openai-usage-window/`、`features/usage-latency/`，碰上游的点分两类。**追加**：
+  `AccountUsageCell.vue` 与 `UsageTable.vue` 各一行 import，`UsageTable.vue` 延迟列网格里的「速度」一行（接在
+  上游的「输出 TPS」之后：上游是输出 token ÷ 总耗时，含排队与首字等待；这里除以去掉首字的生成时长，口径不同，
+  两行并存），`i18n/locales/{en,zh}/dashboard.ts` 的 `usage` 段各两个键。**替换**：`AccountUsageCell.vue` OpenAI
+  OAuth 分支 5h 进度条的 `v-if` 条件、管理员 `views/admin/UsageView.vue` 的 `ALWAYS_VISIBLE` 去掉 `user`。
 
 ## 本地验证的已知差异
 
