@@ -39,6 +39,12 @@ type openAIWSConnBinding struct {
 
 type openAIWSTurnStateBinding struct {
 	turnState string
+	// accountID 是**铸造这个 state 的账号**。
+	//
+	// turn-state 是 (账号, 会话) 绑定的凭据，不是会话级的公共物件：键里只有会话时，failover 换号之后
+	// 新账号会把上一个账号铸造的那个原样发到自己的上游连接上。读的时候按账号核对，不一致就当没有
+	// ——新账号从上游重新要一个即可，代价只是这一轮没有粘滞。
+	accountID int64
 	expiresAt time.Time
 }
 
@@ -76,8 +82,8 @@ type OpenAIWSStateStore interface {
 	GetResponseConn(responseID string) (string, bool)
 	DeleteResponseConn(responseID string)
 
-	BindSessionTurnState(groupID int64, sessionHash, turnState string, ttl time.Duration)
-	GetSessionTurnState(groupID int64, sessionHash string) (string, bool)
+	BindSessionTurnState(groupID, accountID int64, sessionHash, turnState string, ttl time.Duration)
+	GetSessionTurnState(groupID, accountID int64, sessionHash string) (string, bool)
 	DeleteSessionTurnState(groupID int64, sessionHash string)
 
 	BindSessionConn(groupID int64, sessionHash, connID string, ttl time.Duration)
@@ -331,7 +337,7 @@ func (s *defaultOpenAIWSStateStore) DeleteResponseConn(responseID string) {
 	s.responseToConnMu.Unlock()
 }
 
-func (s *defaultOpenAIWSStateStore) BindSessionTurnState(groupID int64, sessionHash, turnState string, ttl time.Duration) {
+func (s *defaultOpenAIWSStateStore) BindSessionTurnState(groupID, accountID int64, sessionHash, turnState string, ttl time.Duration) {
 	key := openAIWSSessionTurnStateKey(groupID, sessionHash)
 	state := strings.TrimSpace(turnState)
 	if key == "" || state == "" {
@@ -344,12 +350,13 @@ func (s *defaultOpenAIWSStateStore) BindSessionTurnState(groupID int64, sessionH
 	ensureBindingCapacity(s.sessionToTurnState, key, openAIWSStateStoreMaxEntriesPerMap)
 	s.sessionToTurnState[key] = openAIWSTurnStateBinding{
 		turnState: state,
+		accountID: accountID,
 		expiresAt: time.Now().Add(ttl),
 	}
 	s.sessionToTurnStateMu.Unlock()
 }
 
-func (s *defaultOpenAIWSStateStore) GetSessionTurnState(groupID int64, sessionHash string) (string, bool) {
+func (s *defaultOpenAIWSStateStore) GetSessionTurnState(groupID, accountID int64, sessionHash string) (string, bool) {
 	key := openAIWSSessionTurnStateKey(groupID, sessionHash)
 	if key == "" {
 		return "", false
@@ -361,6 +368,10 @@ func (s *defaultOpenAIWSStateStore) GetSessionTurnState(groupID int64, sessionHa
 	binding, ok := s.sessionToTurnState[key]
 	s.sessionToTurnStateMu.RUnlock()
 	if !ok || now.After(binding.expiresAt) || strings.TrimSpace(binding.turnState) == "" {
+		return "", false
+	}
+	// 换号即视为未命中：这个 state 是别的账号铸造的，发到本账号的上游连接上就是一次跨账号回放。
+	if binding.accountID != accountID {
 		return "", false
 	}
 	return binding.turnState, true
