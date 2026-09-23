@@ -291,6 +291,21 @@
           <span v-else class="text-sm text-gray-400 dark:text-gray-500">-</span>
         </template>
 
+        <!-- [kong] 请求特征：fork 专有的一列，按「键: 值」逐行显示（有哪些键见 requestFeatures）。
+             缺值时整行不出现、整列显示占位符——把"没采到"显示成 0 会被读成"上游收到了个空串"。 -->
+        <template #cell-request_features="{ row }">
+          <div v-if="requestFeatures(row).length" class="space-y-0.5">
+            <p
+              v-for="f in requestFeatures(row)"
+              :key="f.key"
+              class="whitespace-nowrap font-mono text-xs text-gray-600 dark:text-gray-400"
+            >
+              {{ f.key }}: {{ f.value }}
+            </p>
+          </div>
+          <span v-else class="text-sm text-gray-400 dark:text-gray-500">-</span>
+        </template>
+
         <template #cell-user_agent="{ row }">
           <span v-if="row.user_agent" class="text-sm text-gray-600 dark:text-gray-400 block max-w-[320px] truncate" :title="row.user_agent">{{ formatUserAgent(row.user_agent) }}</span>
           <span v-else class="text-sm text-gray-400 dark:text-gray-500">-</span>
@@ -540,6 +555,8 @@ import { formatCacheTokens, formatMultiplier } from '@/utils/formatters'
 import { formatTokenPricePerMillion } from '@/utils/usagePricing'
 import { getUsageServiceTierLabel } from '@/utils/usageServiceTier'
 import { resolveUsageRequestType } from '@/utils/usageRequestType'
+// [kong] 请求特征列的取数与文案，见该模块的注释。
+import { requestFeatures } from '@/features/codex-ticket/requestFeatures'
 import {
   LATENCY_BAR_CLASSES,
   LATENCY_BAR_FROM_CLASSES,
