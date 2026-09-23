@@ -1,0 +1,51 @@
+name: Kong Race Detector
+
+# 只手动触发。
+#
+# 为什么单独一个文件而不是往 backend-ci.yml 里加一个 job：本 fork 会长期 rebase 到新的上游基线，
+# 上游文件每改一处都是一处冲突面。新文件永不冲突，与提交切分用的是同一条原则（见 FORK-NOTES）。
+#
+# 为什么不并入常规 CI：race 构建慢且吃内存，而本 fork 需要它的地方是固定的几处并发代码
+# （WS 透传路径上跨 goroutine 的票据上下文）。需要时手动跑一次拿结论，比每个 PR 都付代价划算。
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: '要跑的包（go test 的路径模式），默认只跑 service 包'
+        required: false
+        type: string
+        default: ./internal/service/
+      run:
+        description: '只跑匹配的用例（go test -run 的正则），留空跑全部'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+      - name: Race detector
+        working-directory: backend
+        env:
+          PACKAGES: ${{ github.event.inputs.packages }}
+          RUN_FILTER: ${{ github.event.inputs.run }}
+        run: |
+          set -o pipefail
+          # -race 需要 CGO；Linux runner 自带工具链，本机 Windows 上跑不了，这正是本 workflow 的理由。
+          ARGS="-race -tags=unit -count=1"
+          if [ -n "$RUN_FILTER" ]; then
+            ARGS="$ARGS -run $RUN_FILTER"
+          fi
+          echo "go test $ARGS $PACKAGES"
+          go test $ARGS $PACKAGES
