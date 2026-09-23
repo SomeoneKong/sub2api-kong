@@ -106,6 +106,38 @@ func classifyUpstreamTransportError(err error) upstreamTransportErrorClass {
 //
 // passthrough tags the Ops error event for the OpenAI passthrough forward path.
 func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Context, c *gin.Context, account *Account, err error, passthrough bool) error {
+	// [kong] codex 票据的拒服与交付拦截不是传输故障：账号本身是好的，是我们主动不发或不交付。
+	// 必须在任何 ops 传输错误写入**之前**判掉，否则即使不停调度、不换号，也已经污染了上游故障
+	// 记录——那些记录会被当成账号健康度的证据。
+	//
+	// **例外是票据拒服**：它们全是账号级条件（这个账号的出口静默不够、配置不对、任务没拿到票……），
+	// 换一个账号完全可能立刻有票。包成 failover 错误让上层换号，但：
+	//
+	//   - RequestScopedTransient：**不得据此临时封禁账号**。账号本身是好的，只是这一刻没票可注入
+	//     ——封掉它等于把一个几十秒后就补上票的账号推出调度。
+	//   - RetryableOnSameAccount 只在**几秒内可能自行好转**时为真（见 kongDenyWorthSameAccountWait）。
+	//     对 window_closed 这类"要等到某个时刻"的原因先等本号纯属浪费重试次数，还会延后真正能服务的
+	//     那次换号。
+	//
+	// ⚠️ 不能只放行 preparing：那样 window_closed 会一律直接拒服、**从不尝试换号**，而同分组另一账号
+	// 可能已有合格票——那是无谓拒服，与放行降智同级。
+	//
+	// 仍然不写 ops 传输错误，理由同上：一个字节都没发出去。
+	if canFailover, retrySame := KongTicketFailover(ctx, err); canFailover {
+		var denied *KongErrTicketDenied
+		if errors.As(err, &denied) && denied != nil {
+			// 恢复时刻并进请求级累计：failover 耗尽（所有账号都没票）时，耗尽呈现要靠它告诉客户端
+			// **最早**什么时候值得再来，而不是一句"上游请求失败"。取最早而不是最后一个账号的，
+			// 见 KongTicketDenyWait。
+			MarkKongTicketDenied(c, denied.RetryAfter)
+			// 包装错误同时保留原始拒服类型，调度上报据此豁免（见 newKongTicketDenyFailover）。
+			return newKongTicketDenyFailover(denied, retrySame)
+		}
+	}
+	if KongIsDeliveryBlocked(err) {
+		return err
+	}
+
 	safeErr := sanitizeUpstreamErrorMessage(err.Error())
 	setOpsUpstreamError(c, 0, safeErr, "")
 	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{

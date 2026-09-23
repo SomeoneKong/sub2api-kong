@@ -288,7 +288,21 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	auditLogHandler := admin.NewAuditLogHandler(auditLogService, totpService)
 	upstreamBillingProbeService := service.ProvideUpstreamBillingProbeService(accountRepository, accountTestService, settingService, leaderLockCache, db)
 	openCodeGoUsageService := service.ProvideOpenCodeGoUsageService(accountRepository, httpUpstream, settingService, leaderLockCache, db)
+	// [kong] Codex 票据：装配手工写在这里，不经 wire。
+	// 直接给 AdminHandlers 赋字段而不是扩 ProvideAdminHandlers 的参数表，是为了把改动收在
+	// 这一个文件里；代价是 wire generate 生成不出这几行，所以本仓库不跑 wire generate。
+	// 门控模型集合留空时 Enabled=false，Service 与 Gateway 为 nil（转发链路的接入点全部退化为
+	// 空操作），但 Admin 仍装配——管理面只读状态，让页面能显示「未启用」而不是服务故障。
+	kongTicketRepository := repository.NewKongTicketRepository(db)
+	kongTicketUpstream := service.NewKongTicketUpstream(httpUpstream, openAITokenProvider, proxyRepository, tlsFingerprintProfileService)
+	kongTicketComponents, kongTicketErr := service.NewKongTicketComponents(kongTicketRepository, kongTicketUpstream, accountRepository, proxyRepository, configConfig.Gateway.KongCodexTicket)
+	if kongTicketErr != nil {
+		// fail-closed：启用了却装配不起来，等于放行降智请求，那比启动失败糟得多。
+		return nil, kongTicketErr
+	}
 	adminHandlers := handler.ProvideAdminHandlers(dashboardHandler, adminUserHandler, groupHandler, accountHandler, adminAnnouncementHandler, dataManagementHandler, backupHandler, oAuthHandler, openAIOAuthHandler, geminiOAuthHandler, antigravityOAuthHandler, grokOAuthHandler, cnProviderHandler, proxyHandler, adminRedeemHandler, promoHandler, settingHandler, opsHandler, systemHandler, adminSubscriptionHandler, adminUsageHandler, userAttributeHandler, errorPassthroughHandler, tlsFingerprintProfileHandler, pluginHandler, adminAPIKeyHandler, scheduledTestHandler, channelHandler, channelMonitorHandler, channelMonitorRequestTemplateHandler, contentModerationHandler, promptAdminHandler, paymentHandler, affiliateHandler, complianceHandler, auditLogHandler, upstreamBillingProbeService, ollamaCloudUsageService, openCodeGoUsageService)
+	adminHandlers.KongTicket = admin.NewKongTicketHandler(kongTicketComponents.Admin)
+	openAIGatewayService.SetKongTicketGateway(kongTicketComponents.Gateway)
 	usageRecordWorkerPool := service.NewUsageRecordWorkerPool(configConfig)
 	userMsgQueueCache := repository.NewUserMsgQueueCache(redisClient)
 	userMessageQueueService := service.ProvideUserMessageQueueService(userMsgQueueCache, rpmCache, configConfig)
