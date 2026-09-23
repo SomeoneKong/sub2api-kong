@@ -1867,6 +1867,9 @@ func (s *OpenAIGatewayService) fetchCachedOpenAIModels(ctx context.Context, requ
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if kongCodexCatalogBypassCache(ctx) { // [kong] 目录存档的拉取任务不经缓存（DESIGN-codex-catalog-consensus.md）
+		return fetch(ctx, "")
+	}
 	cacheKey := buildOpenAIModelsCacheKey(request)
 	manifest, state := s.openAIModelsCache.get(cacheKey, time.Now())
 	if state == openAIModelsCacheFresh {
