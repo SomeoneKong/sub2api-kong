@@ -1047,6 +1047,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 			eventType, eventResponseID, _ := parseOpenAIWSEventEnvelope(upstreamMessage)
 			responseModelObserver.ObserveOpenAI(upstreamMessage, eventType)
+			// 逐轮的额度快照：原生 WS 没有逐轮响应头，上游把它放在这个带外事件里
+			// （见 noteOpenAIWSCodexRateLimits）。
+			s.noteOpenAIWSCodexRateLimits(ctx, account, eventType, upstreamMessage)
 			if responseID == "" && eventResponseID != "" {
 				responseID = eventResponseID
 			}
@@ -1273,8 +1276,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					OpenAIWSMode:                  true,
 					UpstreamTerminalEvent:         terminalEvent,
 					ResponseHeaders:               lease.HandshakeHeaders(),
-					Duration:                      time.Since(turnStart),
-					FirstTokenMs:                  firstTokenMs,
+					// 这是连接级的握手头，不是本轮响应头（见 CodexQuotaHeaders）。
+					ResponseHeadersFromWSHandshake: true,
+					Duration:                       time.Since(turnStart),
+					FirstTokenMs:                   firstTokenMs,
 				}
 				if replayInput := replayCollector.Items(); len(replayInput) > 0 {
 					result.wsReplayInput = replayInput
