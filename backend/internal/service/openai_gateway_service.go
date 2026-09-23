@@ -506,7 +506,11 @@ type OpenAIGatewayService struct {
 	// 记录最近一次向该会话下发 x-codex-turn-state 的铸造账号，供出站守卫
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
 	openaiCodexTurnStateOrigins sync.Map
-	openaiCodexTurnStateWrites  atomic.Uint64
+	// openaiCodexTurnStateSweeping 单飞标记：清扫改在后台跑（不占交付 goroutine），同一时刻只许一轮。
+	openaiCodexTurnStateSweeping atomic.Bool
+	// openaiCodexTurnStateSweepForTest 仅测试注入：见 setTurnStateSweepForTest。
+	openaiCodexTurnStateSweepForTest atomic.Pointer[func()]
+	openaiCodexTurnStateWrites       atomic.Uint64
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService
