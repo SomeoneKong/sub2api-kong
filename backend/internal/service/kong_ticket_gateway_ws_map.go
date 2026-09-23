@@ -1,6 +1,9 @@
 package service
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 // HTTP→WS 这条路径（forwardOpenAIWSV2）的接入。
 //
@@ -17,8 +20,13 @@ import "context"
 // 直接原地改 payload：调用方随后把同一个 map 交给 WriteJSON（预热帧也用它）。
 // 返回的 attempt 交给 GuardWSDownstream 做交付判定。
 func (g *KongTicketGateway) PrepareWSMapPayload(ctx context.Context, account *Account, model string, payload map[string]any) (*KongUpstreamAttempt, error) {
-	if account == nil || !g.IsGatedModel(model) {
+	if account == nil || !g.Enabled() || strings.TrimSpace(model) == "" {
 		return nil, nil
+	}
+	if !g.IsGatedModel(model) {
+		// 非门控模型只观测，口径同 PrepareUpstream。
+		clientState := kongOutboundStateFromWSMap(payload)
+		return kongNewAttempt(model, nil, clientState, clientState), nil
 	}
 	if payload == nil {
 		return nil, &KongErrTicketDenied{Reason: "payload_missing"}

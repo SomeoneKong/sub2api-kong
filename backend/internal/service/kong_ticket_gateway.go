@@ -78,7 +78,7 @@ type KongUpstreamAttempt struct {
 	ResponseID string
 }
 
-// FeatureSnapshot 取这次发送记下的请求特征。**attempt 为 nil 是常态**（非门控模型、功能未启用），
+// FeatureSnapshot 取这次发送记下的请求特征。**attempt 可能为 nil**（功能未启用、判不出模型、Live 通路），
 // 所以取值必须容得下它——调用点散在各协议的用量行组装处，那里漏一个 nil 判断就是一次 panic。
 func (a *KongUpstreamAttempt) FeatureSnapshot() *KongRequestFeatures {
 	if a == nil {
@@ -180,7 +180,7 @@ func (g *KongTicketGateway) PrepareUpstream(ctx context.Context, req *http.Reque
 		return nil, &KongErrTicketDenied{Reason: "model_undeterminable: " + result.Reason}
 	}
 	model := result.Model
-	if model == "" || !g.gatedModels[model] {
+	if model == "" {
 		return nil, nil
 	}
 	// 客户端自带的那个 state 要在注入**之前**取：注入会覆盖这个头，之后就再也读不到它了。
@@ -188,6 +188,15 @@ func (g *KongTicketGateway) PrepareUpstream(ctx context.Context, req *http.Reque
 	clientState := kongOutboundStateFromHeader(req.Header)
 	attempt := func(grant *KongTicketGrant) *KongUpstreamAttempt {
 		return kongNewAttempt(model, grant, clientState, kongOutboundStateFromHeader(req.Header))
+	}
+	// **非门控模型只观测**：不注入、不拒服、不做交付判定，只记这次收发的 state 并收票入库。
+	// 新模型要不要门控，得先看清它的票怎么流转，而这些数据只有在它不受门控时才采得到。
+	// Live 通路是 sideband 原始转发，没有可观测的响应头，照旧不建 attempt。
+	if !g.gatedModels[model] {
+		if kongIsLiveCallsPath(req.URL) {
+			return nil, nil
+		}
+		return attempt(nil), nil
 	}
 	// Live 这条通路**承载不了票据**：创建之后是 sideband 原始双向转发，既没有逐轮注入点，也没有
 	// 「上游是否接受了这张票」的证据。按默认拒绝极性拒服，而不是放行一次不受保障的门控会话。
@@ -400,7 +409,7 @@ func kongWSVerifyInjectedState(raw []byte, want string) string {
 
 // PrepareWSTurn 在一帧 `response.create` 上送之前做准入，并把票写进 `client_metadata`。
 //
-// 返回改写后的 payload。未受门控或账号不在保护范围内时原样返回、attempt 为 nil。
+// 返回改写后的 payload。未受门控或账号不在保护范围内时原样返回，attempt 不带票、只用于观测。
 // 拿不到合格票时返回 *KongErrTicketDenied，调用方必须据此终止这一轮。
 func (g *KongTicketGateway) PrepareWSTurn(ctx context.Context, account *Account, model string, payload []byte) ([]byte, *KongUpstreamAttempt, error) {
 	if account == nil || !g.Enabled() {
@@ -422,7 +431,12 @@ func (g *KongTicketGateway) PrepareWSTurn(ctx context.Context, account *Account,
 		effective = res.Model
 	}
 	if !g.IsGatedModel(effective) {
-		return payload, nil, nil
+		// 非门控模型只观测，口径同 PrepareUpstream。
+		if strings.TrimSpace(effective) == "" {
+			return payload, nil, nil
+		}
+		clientState := kongOutboundStateFromWSFrame(payload)
+		return payload, kongNewAttempt(effective, nil, clientState, clientState), nil
 	}
 	model = effective
 	// 原生 WS：**不交接**。这条路上的拒服落点是按策略关闭连接，没有 failover 可走（见

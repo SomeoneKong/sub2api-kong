@@ -20,19 +20,22 @@ type kongStubRepo struct {
 	stg0Err   error
 	mu        sync.Mutex
 
-	current      map[string][]*KongTicket
-	candidates   map[string][]*KongTicket
-	nextID       int64
-	inserted     []*KongTicket
-	events       []*KongTicketEvent
-	probes       []*KongFingerprintProbe
-	revoked      []int64
-	skipped      []int64
-	skippedBulk  []string
-	skipBoundary time.Time
-	byState      map[string]int64
-	cleared      int
-	statusSets   []kongStubStatusSet
+	current    map[string][]*KongTicket
+	candidates map[string][]*KongTicket
+	nextID     int64
+	inserted   []*KongTicket
+	events     []*KongTicketEvent
+	// eventSweeps 数 DeleteEventsBefore 被调用的次数；deleteEventsErr 让它失败。
+	eventSweeps     int
+	deleteEventsErr error
+	probes          []*KongFingerprintProbe
+	revoked         []int64
+	skipped         []int64
+	skippedBulk     []string
+	skipBoundary    time.Time
+	byState         map[string]int64
+	cleared         int
+	statusSets      []kongStubStatusSet
 
 	lastEgressUsed *time.Time
 	lastCooldown   *time.Time
@@ -562,6 +565,26 @@ func (r *kongStubRepo) InsertEvent(_ context.Context, e *KongTicketEvent) error 
 	}
 	r.events = append(r.events, e)
 	return nil
+}
+
+func (r *kongStubRepo) DeleteEventsBefore(_ context.Context, cutoff time.Time, batchSize int) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.eventSweeps++
+	if r.deleteEventsErr != nil {
+		return 0, r.deleteEventsErr
+	}
+	kept := r.events[:0]
+	var n int64
+	for _, e := range r.events {
+		if n < int64(batchSize) && e.CreatedAt.Before(cutoff) {
+			n++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	r.events = kept
+	return n, nil
 }
 
 // TicketConclusions 按生产口径实现：只认提交了归因的最终事件（`fingerprint_model` 非空），每张票取

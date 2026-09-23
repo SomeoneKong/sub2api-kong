@@ -720,22 +720,26 @@ func TestKongBatchFetchEventsCarryUpstreamDuration(t *testing.T) {
 	}
 }
 
-// **三种模式都收票入库，只有 observe 会自动探测。**
+// **三种模式都收票入库，只有 observe 下的门控模型会自动探测。**
 //
 // off 的语义是"不参与保护"——不注入、不主动取票、不自动烧额度探测。它**不**是"看见票就扔掉"：
 // 业务响应带回的票是免费的（不消耗任何出口静默），留着它，模式切到 full 时缓存里立刻有票可用，
 // 而在 off 期间也能靠人工验票问出"这张票是什么档位"，那正是"该不该开 full"的判据。
+//
+// 非门控模型的票照收不探：它不在校准资料里时归因不成立，探测只会白烧额度。
 func TestKongObserveStateStoresInEveryModeAndProbesOnlyInObserve(t *testing.T) {
-	const model = kongBatchAstra
 	for _, tc := range []struct {
 		mode      KongTicketMode
+		model     string
 		wantProbe bool
 	}{
-		{KongTicketModeOff, false},
-		{KongTicketModeObserve, true},
-		{KongTicketModeFull, false},
+		{KongTicketModeOff, kongBatchAstra, false},
+		{KongTicketModeObserve, kongBatchAstra, true},
+		{KongTicketModeFull, kongBatchAstra, false},
+		{KongTicketModeObserve, "gpt-6-sol", false},
 	} {
-		t.Run(string(tc.mode), func(t *testing.T) {
+		model := tc.model
+		t.Run(string(tc.mode)+"/"+model, func(t *testing.T) {
 			repo := newKongStubRepo()
 			accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
 			account := kongTestAccount(1, tc.mode, KongTicketEgressNone)
@@ -744,7 +748,7 @@ func TestKongObserveStateStoresInEveryModeAndProbesOnlyInObserve(t *testing.T) {
 			accounts.set(account)
 			up := &kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}, answers: kongVerifyAnswers()}
 			svc := kongTestService(t, repo, up, accounts)
-			svc.accept = KongTicketAccept{model: []string{model}}
+			svc.accept = KongTicketAccept{kongBatchAstra: []string{kongBatchAstra}}
 
 			state := strings.Repeat("b", 292)
 			svc.ObserveState(context.Background(), 1, model, state)

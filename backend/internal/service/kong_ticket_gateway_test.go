@@ -262,8 +262,9 @@ func TestKongPrepareWSTurnInjectsClientMetadata(t *testing.T) {
 
 	// payload 省略 model 时回落到调用方的值——Realtime 允许后续帧不重述模型。
 	noModel := []byte(`{"type":"response.create"}`)
-	if _, attempt3, err := g.PrepareWSTurn(context.Background(), account, "gpt-5.6-sol", noModel); err != nil || attempt3 != nil {
-		t.Errorf("字段缺失且调用方模型非门控时应原样放行：attempt=%v err=%v", attempt3, err)
+	if out, attempt3, err := g.PrepareWSTurn(context.Background(), account, "gpt-5.6-sol", noModel); err != nil ||
+		attempt3 == nil || attempt3.Grant != nil || attempt3.Model != "gpt-5.6-sol" || string(out) != string(noModel) {
+		t.Errorf("字段缺失且调用方模型非门控时应原样放行、只建观测用的 attempt：attempt=%v err=%v", attempt3, err)
 	}
 	if _, attempt4, err := g.PrepareWSTurn(context.Background(), account, "gpt-6-astra", noModel); err != nil || attempt4 == nil || attempt4.Grant == nil {
 		t.Errorf("字段缺失时应按调用方的门控模型判定：attempt=%v err=%v", attempt4, err)

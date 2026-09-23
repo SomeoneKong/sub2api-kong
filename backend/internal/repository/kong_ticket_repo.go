@@ -546,6 +546,25 @@ func (r *kongTicketRepository) InsertEvent(ctx context.Context, e *service.KongT
 	return insertTicketEventTx(ctx, r.db, e)
 }
 
+// DeleteEventsBefore 按批删除超出保留期的事件。id 随写入单调递增，按 id 取最早的一批即按时间取。
+func (r *kongTicketRepository) DeleteEventsBefore(ctx context.Context, cutoff time.Time, batchSize int) (int64, error) {
+	if batchSize <= 0 {
+		batchSize = 5000
+	}
+	res, err := r.db.ExecContext(ctx,
+		`DELETE FROM kong_ticket_events WHERE id IN (
+			SELECT id FROM kong_ticket_events WHERE created_at < $1 ORDER BY id LIMIT $2
+		)`, cutoff.UTC(), batchSize)
+	if err != nil {
+		return 0, fmt.Errorf("delete old events: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete old events rows: %w", err)
+	}
+	return affected, nil
+}
+
 // kongExecer 抽掉「直连还是事务内」的差别，让事件插入在两种场合共用一份。
 type kongExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)

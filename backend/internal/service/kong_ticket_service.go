@@ -60,6 +60,11 @@ type KongTicketService struct {
 	// lastCooldownMem 是 F（失败判定时刻）的内存事实，键是 (accountID, ticketEgress)。
 	// 与 A 一样必须有兜底：冷却事件写失败时库里读不到 F，下一个请求会立刻重试。
 	lastCooldownMem map[string]time.Time
+
+	// eventRetention 是事件的保留期，0 表示不清理（见 kong_ticket_event_retention.go）。
+	eventRetention time.Duration
+	// lastEventSweep 是最近一次认领事件清理的时刻，由 mu 保护。
+	lastEventSweep time.Time
 }
 
 // kongTicketTask 是一次在途的取票验证任务。
@@ -2068,6 +2073,7 @@ func (s *KongTicketService) logEventWith(ctx context.Context, event *KongTicketE
 			"event_type", event.EventType, "outcome", event.Outcome,
 			"ticket_egress", event.TicketEgress, "error", err)
 	}
+	s.maybeSweepEvents(ctx, time.Now())
 }
 
 // noteEgressUse 记下「本进程刚在这个票据出口上发过请求」。
@@ -2174,14 +2180,29 @@ func (s *KongTicketService) ObserveState(ctx context.Context, accountID int64, m
 	return ticketID
 }
 
+// isGatedModel 报告该模型是否在门控集合里。
+func (s *KongTicketService) isGatedModel(model string) bool {
+	for _, m := range s.gatedModels {
+		if m == model {
+			return true
+		}
+	}
+	return false
+}
+
 // maybeObserveProbe 在 observe 模式下用刚收到的票跑一次诊断探测。
 //
-// 三道闸：模式必须是 observe（off 不探测，full 自有取票流程）、账号必须可调度、距上次探测必须
-// 满 ObserveProbeInterval。探测烧真实额度（三份挑战、每份几百 token），没有间隔下限会把每个
+// 四道闸：模型必须受门控、模式必须是 observe（off 不探测，full 自有取票流程）、账号必须可调度、
+// 距上次探测必须满 ObserveProbeInterval。探测烧真实额度（三份挑战、每份几百 token），没有间隔下限会把每个
 // 业务响应都变成一次探测。
 func (s *KongTicketService) maybeObserveProbe(ctx context.Context, accountID int64, model string, ticketID int64, state string, expiresAt time.Time) {
 	// 诊断探测是可选能力：缺了账号装载或校准资料就不做，收票本身照常。
 	if s.accounts == nil || s.upstream == nil || s.bank == nil {
+		return
+	}
+	// 非门控模型的票只收不探：它们多半不在校准资料里，闭集归因会把票硬判成最像的已知模型，
+	// 结论不成立，额度白烧。
+	if !s.isGatedModel(model) {
 		return
 	}
 	account, err := s.accounts.GetByID(ctx, accountID)

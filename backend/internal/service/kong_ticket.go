@@ -441,6 +441,9 @@ type KongTicketRepository interface {
 	DeleteExpiredTickets(ctx context.Context, cutoff time.Time, batchSize int) (int64, error)
 
 	InsertEvent(ctx context.Context, e *KongTicketEvent) error
+	// DeleteEventsBefore 删掉最早的一批 created_at 早于 cutoff 的事件，返回删掉的行数。调用方循环到
+	// 返回值小于 batchSize 为止。
+	DeleteEventsBefore(ctx context.Context, cutoff time.Time, batchSize int) (int64, error)
 	ListEvents(ctx context.Context, filter *KongTicketEventFilter) ([]*KongTicketEvent, int, error)
 	// TicketConclusions 取这些票各自**最后一次已提交归因**的结论来自哪一层（0 = stg0，1 = stg1）。
 	//

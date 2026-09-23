@@ -119,3 +119,34 @@ func TestKongTicketAcceptExtraEnvParsing(t *testing.T) {
 		})
 	}
 }
+
+func TestKongTicketEventRetentionDaysEnvParsing(t *testing.T) {
+	cases := []struct {
+		name string
+		set  bool
+		raw  string
+		want int
+	}{
+		{name: "未设置取内置默认", set: false, want: DefaultKongTicketEventRetentionDays},
+		{name: "显式设定", set: true, raw: "30", want: 30},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			viper.Reset()
+			t.Cleanup(viper.Reset)
+			t.Setenv("CONFIG_FILE", "")
+			t.Setenv("DATA_DIR", "")
+			t.Setenv("JWT_SECRET", "")
+			if tc.set {
+				t.Setenv(KongTicketEventRetentionDaysEnv, tc.raw)
+			}
+			cfg, err := LoadForBootstrap()
+			if err != nil {
+				t.Fatalf("配置加载失败: %v", err)
+			}
+			if got := cfg.Gateway.KongCodexTicket.EventRetentionDays; got != tc.want {
+				t.Fatalf("event_retention_days = %d，应为 %d", got, tc.want)
+			}
+		})
+	}
+}

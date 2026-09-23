@@ -468,7 +468,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			normalized = next
 			kongTurnAttempt = attempt
-			// attempt 为 nil 是常态：非门控模型走到这里就不产出 attempt，也就没有特征。
+			// 功能未启用或判不出模型时 attempt 为 nil，此时没有特征。
 			if attempt != nil {
 				turnKongFeatures = attempt.Features
 			}

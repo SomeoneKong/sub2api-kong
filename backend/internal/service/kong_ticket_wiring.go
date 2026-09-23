@@ -202,6 +202,10 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 	if err := params.Validate(kongTicketTTL); err != nil {
 		return nil, fmt.Errorf("codex 票据的时间参数不合法: %w", err)
 	}
+	eventRetention, err := kongEventRetention(ticketCfg.EventRetentionDays, params)
+	if err != nil {
+		return nil, err
+	}
 
 	confidence := 0.9
 	if raw := strings.TrimSpace(os.Getenv(KongTicketConfidenceEnv)); raw != "" {
@@ -227,6 +231,7 @@ func NewKongTicketComponents(repo KongTicketRepository, upstream KongTicketUpstr
 	access := NewKongAccountAccess(accountRepo, proxyRepo)
 	ticketService := NewKongTicketService(repo, upstream, accountRepo, bank, params,
 		gated, ticketCfg.BatchFetchAllModels, ticketCfg.FetchFusedFingerprint, accept, stg0, confidence)
+	ticketService.SetEventRetention(eventRetention)
 	adminService := NewKongTicketAdminService(repo, access, params, gated, accept, stg0, confidence)
 	// 手工触发要走编排服务的正常决策路径，所以 Admin 需要它。
 	adminService.SetTicketService(ticketService)
@@ -248,6 +253,35 @@ func kongSplitModels(raw string) []string {
 		}
 	}
 	return out
+}
+
+// kongMaxEventRetentionDays 是保留天数能换算成 time.Duration 的上限，再大乘法就会回绕成负数或一个
+// 很短的时长——前者让清理永远跳过，后者会删掉几分钟前的事件。
+const kongMaxEventRetentionDays = int(math.MaxInt64 / int64(24*time.Hour))
+
+// kongEventRetention 把事件保留天数换算成时长，并确认它盖得住调度回看事件表的每个窗口。
+//
+// 调度从事件表读三个时刻：出口最后一次活动、最近一次失败、上次诊断探测，分别按最小静默、验证失败
+// 冷却、探测间隔判定；在用票的验证结论还要在票的寿命内查得到。保留期短于其中任何一个，清理就会删掉
+// 仍在窗口里的事件，调度读不到便按"从未发生"处理——提前取票、提前重试、提前付费探测。
+func kongEventRetention(days int, params KongTicketParams) (time.Duration, error) {
+	if days <= 0 || days > kongMaxEventRetentionDays {
+		return 0, fmt.Errorf("%s 必须在 1 到 %d 之间，得到 %d",
+			config.KongTicketEventRetentionDaysEnv, kongMaxEventRetentionDays, days)
+	}
+	retention := time.Duration(days) * 24 * time.Hour
+	need := kongTicketTTL
+	for _, window := range []time.Duration{params.TicketFetchMinIdle, params.VerifyFailCooldown, params.ObserveProbeInterval} {
+		if window > need {
+			need = window
+		}
+	}
+	if retention < need {
+		return 0, fmt.Errorf("%s=%d 天短于调度要回看的最长窗口 %s（票寿命、%s、%s、%s 中的最大者）",
+			config.KongTicketEventRetentionDaysEnv, days, need,
+			KongTicketMinIdleEnv, KongTicketCooldownEnv, KongTicketObserveEnv)
+	}
+	return retention, nil
 }
 
 // kongEnvDuration 读一个以秒为单位的时间参数。

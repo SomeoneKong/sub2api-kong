@@ -2262,6 +2262,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.kong_codex_ticket.stg0_accept", DefaultKongTicketStg0Accept)
 	viper.SetDefault("gateway.kong_codex_ticket.batch_fetch_all_models", DefaultKongTicketBatchFetchAllModels)
 	viper.SetDefault("gateway.kong_codex_ticket.fetch_fused_fingerprint", DefaultKongTicketFetchFusedFingerprint)
+	viper.SetDefault("gateway.kong_codex_ticket.event_retention_days", DefaultKongTicketEventRetentionDays)
 
 	// Ops (vNext)
 	viper.SetDefault("ops.enabled", true)

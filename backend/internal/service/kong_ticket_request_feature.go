@@ -362,7 +362,8 @@ func KongFeaturesFromRequest(req *http.Request) *KongRequestFeatures {
 // 人去翻库才发现。门控模型有没有 state 这件事是确定的（要么我们注入、要么客户端自带、要么上游
 // 回发），所以"门控请求 + 零特征"几乎一定意味着那条通路没接采集，值得一条 Warn。
 //
-// 只在门控模型上喊：非门控请求本来就不该有特征，对它们喊会把日志淹掉、这条守卫也就废了。
+// 只在门控模型上喊：非门控模型只观测，客户端与上游都没给 state 时特征本来就是空的，对它们喊会把
+// 日志淹掉、这条守卫也就废了。
 func (g *KongTicketGateway) WarnMissingRequestFeatures(model, inboundEndpoint string, wsMode bool, features *KongRequestFeatures) {
 	if g == nil || !g.Enabled() || !features.IsEmpty() {
 		return

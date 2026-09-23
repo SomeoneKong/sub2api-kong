@@ -107,23 +107,50 @@ func TestKongRequestFeaturesRecordOutboundState(t *testing.T) {
 		}
 	})
 
-	t.Run("非门控模型不记特征", func(t *testing.T) {
-		g, account, _ := kongFeatureTestGateway(t, KongTicketModeFull, ticket)
-		req := kongTestGatedRequest(t, `{"model":"gpt-5.6-luna"}`)
+	// 非门控模型即使账号开着 full 也只观测：不注入、不拦截，照记收发两侧的 state 并收票。
+	t.Run("非门控模型只观测", func(t *testing.T) {
+		g, account, repo := kongFeatureTestGateway(t, KongTicketModeFull, ticket)
+		req := kongTestGatedRequest(t, `{"model":"gpt-6-sol"}`)
+		clientOwn := strings.Repeat("z", 780)
+		req.Header.Set(openAICodexTurnStateHeader, clientOwn)
 		attempt, err := g.PrepareUpstream(context.Background(), req, account)
 		if err != nil {
 			t.Fatalf("非门控不该报错: %v", err)
 		}
-		if attempt != nil {
-			t.Errorf("非门控模型不该产生 attempt：%+v", attempt)
+		if attempt == nil || attempt.Grant != nil || attempt.Model != "gpt-6-sol" {
+			t.Fatalf("非门控模型应当产生不带票的 attempt：%+v", attempt)
+		}
+		if got := req.Header.Get(openAICodexTurnStateHeader); got != clientOwn {
+			t.Error("非门控模型的请求头被改写了")
+		}
+		f := attempt.Features.Snapshot()
+		if f == nil || f.StateLen == nil || *f.StateLen != 780 || f.StateFP != kongStateFingerprint(clientOwn) {
+			t.Fatalf("客户端回传的 state 没记下：%+v", f)
+		}
+		if f.ClientStateLen != nil || f.TicketID != nil {
+			t.Errorf("没有注入，不该有客户端单列或票 id：%+v", f)
+		}
+
+		reissued := strings.Repeat("r", 780)
+		resp := &http.Response{Header: http.Header{}}
+		resp.Header.Set(openAICodexTurnStateHeader, reissued)
+		if err := g.AfterUpstream(context.Background(), account, attempt, resp); err != nil {
+			t.Fatalf("非门控模型上游回发 state 不该拦截: %v", err)
+		}
+		f = attempt.Features.Snapshot()
+		if f.ReissuedLen == nil || *f.ReissuedLen != 780 || f.ReissuedTicketID == nil {
+			t.Errorf("上游回发的 state 应当记下并入库：%+v", f)
+		}
+		if n := kongCountTickets(repo, 1, "gpt-6-sol"); n != 1 {
+			t.Errorf("非门控模型收到的票应当按它自己的模型名入库，实际 %d 张", n)
 		}
 	})
 }
 
 // 上游回发的 state 要连同它入库后的 id 一起记下。
 //
-// 入库了就给 id（凭它能查到这张票后来验成了什么）；按规则没入库（312 在长度黑名单里）就只有指纹
-// 与长度——那时库里根本没有这张票，给个 id 就是假的。
+// 入库了就给 id（凭它能查到这张票后来验成了什么）；入库失败就只有指纹与长度——那时库里根本
+// 没有这张票，给个 id 就是假的。
 func TestKongRequestFeaturesRecordReissuedState(t *testing.T) {
 	ticket := strings.Repeat("a", 292)
 
@@ -974,5 +1001,58 @@ func TestKongStrippedClientStateSurvivesLateOutbound(t *testing.T) {
 		f := rec.Snapshot()
 		require.NotNil(t, f)
 		require.Equal(t, kongStateFingerprint(clientOwn), f.ClientStateFP, "帧内被剥的那份才是本轮的客户端值")
+	})
+}
+
+// WS 的两条入口对非门控模型同样只观测：帧原样放行、不注入，回发的 state 照记不拦。
+func TestKongNonGatedModelObservedOverWS(t *testing.T) {
+	ticket := strings.Repeat("a", 292)
+	clientOwn := strings.Repeat("z", 780)
+	reissued := strings.Repeat("r", 780)
+	metadata := []byte(`{"type":"codex.response.metadata","headers":{"x-codex-turn-state":"` + reissued + `"}}`)
+
+	t.Run("原生 WS 帧", func(t *testing.T) {
+		g, account, repo := kongFeatureTestGateway(t, KongTicketModeFull, ticket)
+		payload := []byte(`{"type":"response.create","model":"gpt-6-sol","client_metadata":{"x-codex-turn-state":"` + clientOwn + `"}}`)
+		out, attempt, err := g.PrepareWSTurn(context.Background(), account, "gpt-6-sol", payload)
+		if err != nil {
+			t.Fatalf("非门控不该报错: %v", err)
+		}
+		if attempt == nil || attempt.Grant != nil || string(out) != string(payload) {
+			t.Fatalf("非门控模型应当原样放行并建不带票的 attempt：%+v", attempt)
+		}
+		if f := attempt.Features.Snapshot(); f == nil || f.StateFP != kongStateFingerprint(clientOwn) {
+			t.Fatalf("帧里客户端回传的 state 没记下：%+v", f)
+		}
+		if err := g.GuardWSDownstream(context.Background(), account, attempt, metadata); err != nil {
+			t.Fatalf("非门控模型上游回发 state 不该拦截: %v", err)
+		}
+		if f := attempt.Features.Snapshot(); f.ReissuedFP != kongStateFingerprint(reissued) || f.ReissuedTicketID == nil {
+			t.Errorf("回发的 state 应当记下并入库：%+v", f)
+		}
+		if n := kongCountTickets(repo, 1, "gpt-6-sol"); n != 1 {
+			t.Errorf("非门控模型收到的票应当入库，实际 %d 张", n)
+		}
+	})
+
+	t.Run("HTTP→WS 的 map 载荷", func(t *testing.T) {
+		g, account, _ := kongFeatureTestGateway(t, KongTicketModeFull, ticket)
+		payload := map[string]any{
+			"model":           "gpt-6-sol",
+			"client_metadata": map[string]any{kongWSTurnStateMetadataKey: clientOwn},
+		}
+		attempt, err := g.PrepareWSMapPayload(context.Background(), account, "gpt-6-sol", payload)
+		if err != nil {
+			t.Fatalf("非门控不该报错: %v", err)
+		}
+		if attempt == nil || attempt.Grant != nil {
+			t.Fatalf("非门控模型应当建不带票的 attempt：%+v", attempt)
+		}
+		if got := payload["client_metadata"].(map[string]any)[kongWSTurnStateMetadataKey]; got != clientOwn {
+			t.Error("非门控模型的载荷被改写了")
+		}
+		if f := attempt.Features.Snapshot(); f == nil || f.StateFP != kongStateFingerprint(clientOwn) {
+			t.Fatalf("载荷里客户端回传的 state 没记下：%+v", f)
+		}
 	})
 }

@@ -257,7 +257,7 @@ type OpenAIForwardResult struct {
 	// It avoids guessing when one downstream protocol can use multiple upstream endpoints.
 	UpstreamEndpoint string
 	// KongRequestFeatures 是本次上送的请求特征（fork 专有，见 kong_ticket_request_feature.go）。
-	// nil 表示这条通路没记到任何特征——非门控模型，或该通路尚未接采集。
+	// nil 表示这条通路没记到任何特征——客户端与上游都没给 state，或该通路尚未接采集。
 	KongRequestFeatures *KongRequestFeatures
 	// KongResponseHeadersFromWSHandshake 标记 ResponseHeaders 装的是**连接级的 WS 握手响应头**，
 	// 不是本轮的响应头（fork 专有）。原生 WS 逐轮没有响应头，三条通路把握手头放进来供限流信号与

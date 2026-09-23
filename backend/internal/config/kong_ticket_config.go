@@ -80,6 +80,13 @@ const KongTicketBatchFetchEnv = "GATEWAY_KONG_CODEX_TICKET_BATCH_FETCH_ALL_MODEL
 // 验证额度）。它是整个机制的地基，换上游、换出口之后要重新确认。
 const DefaultKongTicketBatchFetchAllModels = true
 
+// KongTicketEventRetentionDaysEnv 是 EventRetentionDays 对应的环境变量名。
+const KongTicketEventRetentionDaysEnv = "GATEWAY_KONG_CODEX_TICKET_EVENT_RETENTION_DAYS"
+
+// DefaultKongTicketEventRetentionDays 是事件保留天数的内置默认，与 usage_logs 的默认保留期一致：
+// 请求特征里的票 id 要能在事件表里对上，两边留得一样久才不会出现半截历史。
+const DefaultKongTicketEventRetentionDays = 90
+
 // KongTicketFusedFingerprintEnv 是 FetchFusedFingerprint 对应的环境变量名。
 const KongTicketFusedFingerprintEnv = "GATEWAY_KONG_CODEX_TICKET_FETCH_FUSED_FINGERPRINT"
 
@@ -197,4 +204,8 @@ type KongCodexTicketConfig struct {
 	// 关掉它就退回"一次只取触发模型那一张"，此时同时门控两个模型必然有空窗（约 11.8% 的时间
 	// 拒服，推导见上述不等式）。
 	BatchFetchAllModels bool `mapstructure:"batch_fetch_all_models"`
+
+	// EventRetentionDays 是票据事件表的保留天数（见 DefaultKongTicketEventRetentionDays）。它必须盖住
+	// 调度回看事件表的最长窗口，装配时校验（service.kongEventRetention）。
+	EventRetentionDays int `mapstructure:"event_retention_days"`
 }
