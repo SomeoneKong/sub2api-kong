@@ -2,7 +2,10 @@
 
 package service
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // 只在 -tags=unit 下编译：给其他包的测试用来隔离进程级状态，生产二进制里没有这些函数。
 
@@ -53,4 +56,34 @@ func KongSetOpenAIBodyFastpathItemsOffForTest(names ...string) func() {
 	}
 	kongFastpathSettingsCurrent = func() kongFastpathSettings { return settings }
 	return func() { kongFastpathSettingsCurrent = previous }
+}
+
+// KongInstallCodexCatalogForTest 给网关服务装上目录存档组件：候选账号取自 candidates，拉取交给 fetch，
+// 不读写数据库，复核原样放行。返回停止函数。
+func KongInstallCodexCatalogForTest(
+	s *OpenAIGatewayService,
+	candidates func() []Account,
+	fetch func(account *Account, clientVersion string) (*OpenAIModelsResponse, error),
+) func() {
+	c := newKongCodexCatalog(true, nil, kongCodexCatalogTestGateway{candidates: candidates, fetch: fetch}, time.Now)
+	s.SetKongCodexCatalog(c)
+	return c.Stop
+}
+
+type kongCodexCatalogTestGateway struct {
+	candidates func() []Account
+	fetch      func(account *Account, clientVersion string) (*OpenAIModelsResponse, error)
+}
+
+func (g kongCodexCatalogTestGateway) kongCodexCatalogCandidates(context.Context, int64) ([]Account, error) {
+	return g.candidates(), nil
+}
+
+func (g kongCodexCatalogTestGateway) kongCodexCatalogRecheck(_ context.Context, account *Account, _ int64) (*Account, string) {
+	copied := *account
+	return &copied, account.GetCredential("plan_type")
+}
+
+func (g kongCodexCatalogTestGateway) kongCodexCatalogFetch(_ context.Context, account *Account, clientVersion string) (*OpenAIModelsResponse, error) {
+	return g.fetch(account, clientVersion)
 }
