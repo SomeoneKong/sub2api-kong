@@ -1,6 +1,7 @@
 module github.com/Wei-Shaw/sub2api
 
-go 1.27.3
+// [kong] go1.27.4 修复 GO-2026-6859（net/http 的 MaxBytesReader 头部竞争可致 HTTP/1 服务崩溃）
+go 1.27.4
 
 require (
 	entgo.io/ent v0.14.5
