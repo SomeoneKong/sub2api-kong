@@ -41,6 +41,7 @@ func RunOpenAIQuotaResetPostProcess(
 	recoverer openAIQuotaResetWorkflowRecoverer,
 	loadAccount func(context.Context, int64) (*Account, error),
 ) OpenAIQuotaResetPostProcessResult {
+	quota = KongSerializeResetQuota(quota) // [kong] 用卡后的查询与写缓存同一账号串行
 	result := OpenAIQuotaResetPostProcessResult{}
 	if recoverer == nil {
 		result.WarningCode = OpenAIQuotaResetWarningAccountRecoveryFailed

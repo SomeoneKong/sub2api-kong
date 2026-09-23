@@ -763,7 +763,7 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 	if (force || shouldRefreshOpenAICodexSnapshot(account, usage, now)) && s.shouldProbeOpenAICodexSnapshot(account.ID, now, force) {
 		if adminaccess.RestrictedFromContext(ctx) != nil {
 			// 受限额度读取只调用额度 API，不生成 /responses 合成请求或消费重置次数。
-			if s.openAIQuotaService != nil {
+			if s.openAIQuotaService != nil && !s.kongRestrictedOpenAIUsageProbe(ctx, account, usage, now) { // [kong] 账号锁内查询、经窗口转换同步落库
 				if quotaUsage, err := s.openAIQuotaService.QueryUsage(WithScopedAdminAccountOperation(ctx, "accounts.usage.read"), account.ID); err == nil {
 					updates := buildOpenAIAutoResetUsageUpdates(quotaUsage, now)
 					if account.IsShadow() {

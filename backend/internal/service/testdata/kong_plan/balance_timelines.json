@@ -1,0 +1,151 @@
+{
+  "comment": "余额时间线用例（DESIGN-account-selection.md 第 4.2 节第 5 步）。网关软线补记（Go）与边车余额账本（Python）都跑这一份。每个用例从空状态开始：没有余额基点、没有入层。事件按顺序处理：obs 是一次余额观测（balance 为 null 表示查询成功但没有数值），enter / leave 是某个窗口序号的入层与离层，tick 只推进时刻，restart 把状态序列化后再读回。每个带时刻的事件处理完后，按该时刻检查结算：已离层，且离层之后有数值的观测已记进基点，或离层满 24h。expect 写了的项才比：credits_rises 是余额补记的消耗（记在观测的源查询时刻，按时刻排序），unknown_until 是未知标记的有效期截止（没有为 null），open 是未结算的窗口序号（升序），balance 是余额基点，at_line 是此刻是否视同到线（有未结算的入层，或未知标记在有效期内）。",
+  "cases": [
+    {
+      "name": "正常刷新：每次下降按换算率记消耗，离层后的观测到达即结算",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "enter", "seq": 1, "at": "2026-10-02T00:10:00Z", "expect": {"open": [1], "at_line": true}},
+        {"type": "obs", "at": "2026-10-02T01:00:00Z", "balance": 980},
+        {"type": "obs", "at": "2026-10-02T02:00:00Z", "balance": 960},
+        {"type": "leave", "seq": 1, "at": "2026-10-02T02:05:00Z", "expect": {"open": [1]}},
+        {"type": "obs", "at": "2026-10-02T03:00:00Z", "balance": 950,
+         "expect": {"credits_rises": [{"at": "2026-10-02T01:00:00Z", "points": 10}, {"at": "2026-10-02T02:00:00Z", "points": 10},
+                                      {"at": "2026-10-02T03:00:00Z", "points": 5}],
+                    "unknown_until": null, "open": [], "balance": {"at": "2026-10-02T03:00:00Z", "value": 950}, "at_line": false}}
+      ]
+    },
+    {
+      "name": "刷新中断后恢复：中断期间的下降在恢复时一次补上",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "enter", "seq": 1, "at": "2026-10-02T00:10:00Z"},
+        {"type": "obs", "at": "2026-10-02T05:00:00Z", "balance": 900,
+         "expect": {"credits_rises": [{"at": "2026-10-02T05:00:00Z", "points": 50}], "open": [1], "at_line": true}}
+      ]
+    },
+    {
+      "name": "回到第一层后才到达的观测：补上离层前的消耗，之后才结算",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "enter", "seq": 1, "at": "2026-10-02T00:30:00Z"},
+        {"type": "leave", "seq": 1, "at": "2026-10-02T01:00:00Z"},
+        {"type": "tick", "at": "2026-10-02T02:00:00Z", "expect": {"open": [1], "at_line": true, "credits_rises": []}},
+        {"type": "obs", "at": "2026-10-02T03:00:00Z", "balance": 940,
+         "expect": {"credits_rises": [{"at": "2026-10-02T03:00:00Z", "points": 30}], "open": [], "at_line": false}}
+      ]
+    },
+    {
+      "name": "换算率未知：每次下降记一个未知，后续观测不撤销，有效期从最后一次起算",
+      "per_point": null,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "enter", "seq": 1, "at": "2026-10-02T00:10:00Z"},
+        {"type": "obs", "at": "2026-10-02T01:00:00Z", "balance": 980, "expect": {"unknown_until": "2026-10-03T01:00:00Z"}},
+        {"type": "obs", "at": "2026-10-02T02:00:00Z", "balance": 970, "expect": {"unknown_until": "2026-10-03T02:00:00Z"}},
+        {"type": "leave", "seq": 1, "at": "2026-10-02T02:30:00Z"},
+        {"type": "obs", "at": "2026-10-02T03:00:00Z", "balance": 970,
+         "expect": {"credits_rises": [], "unknown_until": "2026-10-03T02:00:00Z", "open": [], "at_line": true}},
+        {"type": "tick", "at": "2026-10-03T02:00:00Z", "expect": {"at_line": false}}
+      ]
+    },
+    {
+      "name": "余额上升（人工购买）：不记消耗，以新余额为基点",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "obs", "at": "2026-10-02T01:00:00Z", "balance": 1500, "expect": {"credits_rises": [], "balance": {"at": "2026-10-02T01:00:00Z", "value": 1500}}},
+        {"type": "obs", "at": "2026-10-02T02:00:00Z", "balance": 1490,
+         "expect": {"credits_rises": [{"at": "2026-10-02T02:00:00Z", "points": 5}]}}
+      ]
+    },
+    {
+      "name": "有数值 → 无数值 → 有数值：数值恢复后与最近一次有数值的基点比较",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "obs", "at": "2026-10-02T01:00:00Z", "balance": null, "expect": {"balance": {"at": "2026-10-02T00:00:00Z", "value": 1000}}},
+        {"type": "obs", "at": "2026-10-02T02:00:00Z", "balance": 990,
+         "expect": {"credits_rises": [{"at": "2026-10-02T02:00:00Z", "points": 5}], "balance": {"at": "2026-10-02T02:00:00Z", "value": 990}}}
+      ]
+    },
+    {
+      "name": "离层后连续无数值：不提前结算，也不延长 24h 上限",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "enter", "seq": 1, "at": "2026-10-02T00:10:00Z"},
+        {"type": "leave", "seq": 1, "at": "2026-10-02T01:00:00Z"},
+        {"type": "obs", "at": "2026-10-02T02:00:00Z", "balance": null},
+        {"type": "obs", "at": "2026-10-02T06:00:00Z", "balance": null},
+        {"type": "tick", "at": "2026-10-03T00:59:00Z", "expect": {"open": [1], "at_line": true}},
+        {"type": "tick", "at": "2026-10-03T01:00:00Z", "expect": {"open": [], "at_line": false, "credits_rises": []}}
+      ]
+    },
+    {
+      "name": "入层时还没有数值基点：首个有数值的观测只建立基点，并记一个未知",
+      "per_point": 2,
+      "events": [
+        {"type": "enter", "seq": 1, "at": "2026-10-02T00:00:00Z"},
+        {"type": "obs", "at": "2026-10-02T01:00:00Z", "balance": null, "expect": {"balance": null, "unknown_until": null}},
+        {"type": "obs", "at": "2026-10-02T02:00:00Z", "balance": 1000,
+         "expect": {"credits_rises": [], "unknown_until": "2026-10-03T02:00:00Z", "balance": {"at": "2026-10-02T02:00:00Z", "value": 1000}, "open": [1]}}
+      ]
+    },
+    {
+      "name": "没有入层时的首个观测：只建立基点，不记未知",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000, "expect": {"unknown_until": null, "at_line": false}}
+      ]
+    },
+    {
+      "name": "无数值期间重启：基点与入层都读回，之后照常补记",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "enter", "seq": 1, "at": "2026-10-02T00:10:00Z"},
+        {"type": "obs", "at": "2026-10-02T01:00:00Z", "balance": null},
+        {"type": "restart"},
+        {"type": "obs", "at": "2026-10-02T02:00:00Z", "balance": 980,
+         "expect": {"credits_rises": [{"at": "2026-10-02T02:00:00Z", "points": 10}], "open": [1]}}
+      ]
+    },
+    {
+      "name": "源查询时刻相同的重复样本：不算新数据",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "obs", "at": "2026-10-02T01:00:00Z", "balance": 990},
+        {"type": "obs", "at": "2026-10-02T01:00:00Z", "balance": 990,
+         "expect": {"credits_rises": [{"at": "2026-10-02T01:00:00Z", "points": 5}]}}
+      ]
+    },
+    {
+      "name": "较旧的观测迟到：忽略",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "obs", "at": "2026-10-02T02:00:00Z", "balance": 980},
+        {"type": "obs", "at": "2026-10-02T01:00:00Z", "balance": 990,
+         "expect": {"credits_rises": [{"at": "2026-10-02T02:00:00Z", "points": 10}], "balance": {"at": "2026-10-02T02:00:00Z", "value": 980}}}
+      ]
+    },
+    {
+      "name": "24h 内连续推进窗口：不论未结算的入层在哪个窗口，都视同到线，各自结算",
+      "per_point": 2,
+      "events": [
+        {"type": "obs", "at": "2026-10-02T00:00:00Z", "balance": 1000},
+        {"type": "enter", "seq": 1, "at": "2026-10-02T00:10:00Z"},
+        {"type": "leave", "seq": 1, "at": "2026-10-02T01:00:00Z"},
+        {"type": "enter", "seq": 2, "at": "2026-10-02T02:00:00Z"},
+        {"type": "leave", "seq": 2, "at": "2026-10-02T03:00:00Z", "expect": {"open": [1, 2], "at_line": true}},
+        {"type": "obs", "at": "2026-10-02T04:00:00Z", "balance": 900,
+         "expect": {"credits_rises": [{"at": "2026-10-02T04:00:00Z", "points": 50}], "open": [], "at_line": false}}
+      ]
+    }
+  ]
+}
