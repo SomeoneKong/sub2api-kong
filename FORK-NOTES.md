@@ -17,6 +17,8 @@
 - **Codex 模型目录的版本存档与多数对外**（目录全文按版本存档，对外版本由分组内最高一档账号的观测计票决定，
   设计见 `DESIGN-codex-catalog-consensus.md`）
 - **发往官方 ChatGPT 后端的请求体 zstd 压缩**（省出站流量，见下文挂点一节）
+- **前端展示调整**（账号页：OpenAI Pro 20x / Pro 5x 只有 7d 主窗口，不显示 5h；管理员用量页：用户列可在列设置里隐
+  藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会显示）
 - **OpenAI 账号会话数上限**（软上限，设计见 `DESIGN-openai-session-limit.md`）
 - **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）
 - **OpenAI 请求体快速路径**（跳过必然不改写的处理、复用顶层查找，设计见 `DESIGN-openai-request-body-fastpath.md`）
@@ -217,6 +219,14 @@ rebase 时丢掉，这一小节随之删除。
   `kongSendOpenAIUpstreamCompressed` 返回时释放持有者，此后 `GetBody` 报错，明文重发用压缩前的 `GetBody`。rebase 时
   若 `HTTPUpstream` 或调用方开始在 `Do` 返回之后重读 `GetBody`（像 Grok 的回退那样），这条前提就不成立了。
 - **开关**：环境变量 `KONG_OPENAI_REQUEST_ZSTD`，不设置为开，false 关闭，写错则关闭并记错误日志。
+
+### 前端展示调整
+
+- 代码在 `features/openai-usage-window/`、`features/usage-latency/`，碰上游的点分两类。**追加**：
+  `AccountUsageCell.vue` 与 `UsageTable.vue` 各一行 import，`UsageTable.vue` 延迟列网格里的「速度」一行（接在
+  上游的「输出 TPS」之后：上游是输出 token ÷ 总耗时，含排队与首字等待；这里除以去掉首字的生成时长，口径不同，
+  两行并存），`i18n/locales/{en,zh}/dashboard.ts` 的 `usage` 段各两个键。**替换**：`AccountUsageCell.vue` OpenAI
+  OAuth 分支 5h 进度条的 `v-if` 条件、管理员 `views/admin/UsageView.vue` 的 `ALWAYS_VISIBLE` 去掉 `user`。
 
 ### OpenAI 账号会话数上限
 
