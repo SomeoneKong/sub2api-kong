@@ -12,7 +12,14 @@
 
 - **codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）
 - **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）
+- **OpenAI 账号消耗节奏**（旧版选号的重排，设计见 `DESIGN-openai-account-pace.md`）
+- **OpenAI 账号会话数上限**（软上限，设计见 `DESIGN-openai-session-limit.md`）
 - **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）
+- **账号计划执行端用到的管理端点**（按到期时间指定重置卡的用卡端点，设计见
+  `DESIGN-openai-plan-reset-by-expiry.md`）
+- **请求存活续期**（并发槽与会话登记在请求进行中续期，设计见 `DESIGN-request-liveness.md`）
+- **账号选择与 credits**（计划输入生效时的定层、两轮排序、credits 层与容量视图，设计见
+  `DESIGN-openai-plan-dispatch.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有四个可提给上游的修复，排在定制清单最前面（见下文挂点一节的前两小节），上游合并后在 rebase 时丢掉。
@@ -137,6 +144,44 @@ rebase 时丢掉，这一小节随之删除。
   `AccountActionMenu.vue`「测试连接」下方的菜单项组件与它的 import，`AccountsView.vue` 的弹窗宿主与它的
   import——弹窗不能挂在菜单里，菜单关闭时菜单组件随之卸载。
 
+### OpenAI 账号消耗节奏
+
+- **只挂在旧版选号的第 2 层，只改顺序不改候选**。钩子全在 `openai_gateway_scheduling.go` 的
+  `selectAccountWithLoadAwareness` 里：进入第 2 层处 `kongPaceBegin` + `defer finish`、
+  `shuffleWithinSortGroups` 之后 `reorder`（传入随后倍率排序用的 `rateOrder`）、抢槽循环前 `finalOrder`、两处
+  抢到后 `acquired`、负载读取失败分支开头 `loadFailed`。rebase 时要复核的就是这几处；上游改动这个函数时，要确
+  认 `reorder` 仍在同优先级内的随机打散之后、倍率排序与 compact 分层之前——放到后面会把上游的硬约束冲掉。第 1
+  层（粘性）与第 3 层（兜底等待）刻意不接：粘性优先于短期均衡，兜底等待本就不挑号。过滤条件一概不碰，所以最坏
+  情况也只是退回上游的顺序。
+- **参数放数据目录下的 `openai-account-pace.yaml`，不进 `config.yaml`、也不走环境变量**。要在线调：环境变量每改一
+  次都要重建容器、掐断进行中的流式响应，而组件每分钟检查一次文件，改完即生效；参数又是按套餐分组的嵌套结构，环
+  境变量表达不了。不进 `config.yaml` 是因为上游的 `config.go` 是高频改动面，加字段就多一处 rebase 冲突。文件不
+  存在即功能关闭，改坏时沿用上一份有效配置并在日志与 Redis 的 meta 里报错。
+- **装配**（`wire_gen.go`）：建节奏组件，`SetKongOpenAIAccountPace` 注入网关服务，接好计划组件之后 `Start`；
+  cleanup 里 `StopKongOpenAIAccountPace`。
+
+### OpenAI 账号会话数上限
+
+- **挂在旧版选号的三层与 WS 每轮入口，只登记与分段，不删除登记**。`selectAccountWithLoadAwareness` 里：第 1 层抢到
+  槽与排队两处返回前 `kongSessionTouch`；候选判空之后 `kongSessionGateBegin`（传入节奏决策）；`available` 构造
+  后 `preferRoomLoads`；负载读取失败分支 `preferRoomAccounts`；两处抢到槽后 `confirm`（在 `kongPace.acquired`
+  与绑定粘性会话之前，不通过要释放槽）；第 3 层排序后 `roomFirst`、返回排队计划前 `confirm`。
+  `openai_account_scheduler.go` 里续接与 guardian 命中处 `kongSessionTouch`，guardian 回退进入旧版选号前
+  `KongWithSessionCountHash`。
+- **各 OpenAI 入口都要把会话哈希放进请求上下文**：`openai_gateway_handler.go` 的 Responses、Messages、WS 与
+  `openai_chat_completions.go` 在算出会话哈希后用 `KongWithSessionCountHash` 放进去，WS 的 ingress 每轮解析
+  （ctx_pool 与 HTTP bridge 共用）与 passthrough 的首帧、每轮处 `kongSessionRenew` 从上下文取。上游新增 OpenAI
+  入口时要一并接上。
+- **显示侧**：`dto/mappers.go` 一行导出上限，`admin/account_handler.go` 列表与详情各一行查活跃数。
+- **rebase 时复核**这些位置；上游改动三层结构时要保证第 3 层两段的并集仍是原候选——软上限不能新增拒绝。
+- **装配**（`wire_gen.go`）：`SetKongSessionLimitCache` 注入上游的 `SessionLimitCache`，计数复用它。
+- **不要加"请求失败就注销"**：同一会话会同时有多个请求在途，一个失败时别的可能还在原账号上执行，登记只刷新或按空闲
+  超时过期。
+- **前端**（`features/openai-session-limit/`）同样分两类。**追加**：`EditAccountModal.vue` 的两行 import、并发数网格里
+  的输入框、`syncFormFromAccount` 里取值、提交前的 `applyOpenAISessionLimit`，
+  `i18n/locales/{en,zh}/admin/accounts.ts` 的 `kongSessionLimit` 段。**替换**：`AccountCapacityCell.vue` 会话徽标
+  的显示条件与满额提示。
+
 ### codex 响应的 `x-reasoning-included`
 
 - **分两步写：handler 先写，Responses 各成功出口再按上游重写**。响应头可能在选定上游之前就提交——流式排队等槽的心
@@ -151,6 +196,74 @@ rebase 时丢掉，这一小节随之删除。
   删掉那一份，不能随暂存头提交——keepalive 之后暂存头全部作废。codex 只在成功响应上读这个头，错误响应带着无妨，
   不必为错误分支另做清除。
 - **开关**：环境变量 `KONG_CODEX_REASONING_INCLUDED`，不设置为开，false 关闭，写错则关闭并记错误日志。
+
+### 按到期时间指定重置卡的用卡端点
+
+- **只加文件，不改上游接口**。`kong-reset-quota` 的 handler 通过接口断言取服务层的 `KongResetCreditByExpiry`，不往
+  上游的 `openAIQuotaService` 接口里加方法（那会连带改上游测试桩）。到期时间在服务层现查卡明细换成卡 ID，卡 ID
+  仍不出服务层；`redeem_request_id` 由调用方稳定生成、原样交上游做幂等。碰上游的只有 `routes/admin.go` 一行。
+
+### 请求存活续期
+
+- **挂在 `ConcurrencyService` 的三个获取入口，会话跟着账号槽走**。`concurrency_service.go` 里账号槽（含不限并发的
+  分支）、用户槽、API Key 占用返回的释放函数各包一层 `kongTrack`，结构体加一个可选字段；进程内一个续期器
+  （`kong_request_liveness.go`）每 30 秒刷新在途占用，并发槽只刷新仍存在的成员
+  （`repository/kong_concurrency_liveness.go`），会话只刷新已有的登记（上游 `RefreshSession`），释放时先注销、
+  结束刷新交给续期器异步执行。账号槽的会话计数身份取自请求上下文，所以 handler 里新增的抢槽路径（重试、换号、
+  借用）不必另接；但新增的 OpenAI 入口要在算出会话哈希后放进上下文（见会话数上限一节）。
+- **rebase 时复核**：上游若新增不经这三个入口的占槽方式，要一并接上；若改了这三个入口的释放函数形状，`kongTrack`
+  的包装位置要跟着调。
+- **装配**（`wire_gen.go`）：建续期器，`SetKongRequestLiveness` 分别注入并发服务与网关服务，然后 `Start`；cleanup
+  里 `StopKongRequestLiveness`。
+- **不要让续期加入会话**：选号先抢槽、再确认名额，被拒的尝试不能被计入。
+
+### 账号选择与 credits
+
+设计见 `DESIGN-openai-plan-dispatch.md`。全部是单行 `[kong]` 挂钩，挂在旧版选号、生效上限、两条暂停路径、绑定
+的复用与写入、WS 逐轮复核和额度写入处。新逻辑在 `kong_plan_*.go`、`kong_pool_capacity.go` 与 repository /
+handler / routes 下的同名文件，另有几处在节奏与会话组件里（设计第 12 节）。
+
+- **选号**（`openai_gateway_scheduling.go` 的 `selectAccountWithLoadAwareness`）：第 2 层入口 `kongPlanBegin`，过
+  滤满并发账号之前 `keepLoads`（决策记录用）、会话分段处 `preferRoomLoads`、最终顺序处 `sequenceLoads`，主循
+  环、负载读取失败、第 3 层三个尝试循环在每个位置开头 `next`、抢到槽后（第 3 层在返回等待计划之前）`confirm`，
+  非批量分支入口的 `!kongPlanInEffect()` 条件（计划生效时绕开非批量分支、改走完整循环）与负载读取
+  `kongPlanLoadBatch`（这时按负载读取失败处理），负载读取失败分支 `preferRoomAccounts`、第 3 层 `roomFirst`。
+- **生效上限**：全部抢槽与等待计划的并发上限换成 `KongEffectiveConcurrency`（选号、续接、guardian），负载率的分母
+  `kongEffectiveLoadFactor`，handler 的 WS 后续轮次与同账号重试用 `KongWSTurnConcurrency`。
+- **暂停路径**：A 路径 `shouldAutoPauseOpenAIAccountByQuota` 两处 `kongPlanSkip7d`、B 路径
+  `account_scheduling_threshold_eval.go` 一处 `kongPlanDrop7dCandidates`（credits 层去掉 7d 候选，判不出时只写
+  短标记）。
+- **绑定**：复用前粘性第 1 层、非批量粘性与 guardian 调 `kongPlanReuseSticky`，续接调 `kongPlanReuseResponse` 并用
+  `kongPlanKeepResponseBindings` 包住绑定存储；会话绑定写入前 `kongPlanMarkSession`（在
+  `openai_sticky_compat.go` 的共用绑定函数里，所有会话绑定都经它）、token 计数用的非批量选号在写绑定处加
+  `!kongPlanInEffect()`（计划生效时只复用、不新绑）、利润门之后 `kongPlanReplaceBinding`，响应绑定的六个写入点
+  前 `kongPlanMarkResponse`。
+- **WS 与额度写入**：`openai_gateway_handler.go` 的 WS 建连 `KongPlanWSBegin`、每轮 `KongPlanWSTurnAllowed`；
+  `openai_quota_service.go` 写额度快照前 `kongPlanLedger.Observe` 与 `kongQuotaUsageWrites`，
+  `openai_quota_auto_reset.go` 两处同一个窗口转换；`handler.go` 一个字段、`router.go` 一行注册
+  `/api/v1/pool`。
+- **热账号限速与余额刷新**（设计第 13 节）：`handler/admin/openai_oauth_handler.go` 的 `RefreshQuota` 开头一行 `KongQuotaAccountLock`、
+  `openai_quota_reset_workflow.go` 的 `RunOpenAIQuotaResetPostProcess` 开头一行 `KongSerializeResetQuota`（同一账号的额度查询
+  与写缓存串行）；`handler/gateway_helper.go` 等槽函数的每次重试、`openai_gateway_handler.go` 的 HTTP 与 WS 建连快速抢槽读
+  `KongWaitConcurrency`；`openai_gateway_handler.go` 在排队满被拒、等待结束处 `kongHotNoteRequestWait`（同一请求只记一次），
+  WS 建连与后续轮次抢不到槽处 `KongHotNoteWait`、同账号重试抢不到槽处 `kongHotNoteWSRetryBusy`（限速挤压计数，结果换算与
+  这两个函数在 `handler/kong_hot_wait.go`）。
+- **装配**（`wire_gen.go`）：存储与决策记录各自 `Start`，直接给 `AdminHandlers` 赋 `KongPlan` 字段，记账接到节奏组
+  件与额度服务（`SetKongPlanLedger`），`SetKongPlanRuntime` 装上运行时，一行 `NewKongPlanBalanceRefresher(...).Start()`
+  启动余额刷新协程。节奏组件的 `Start` 先同步跑一拍、读回热度名单，要在开始接请求之前调用（现有位置即是）。
+- **实时占用**（`DESIGN-quota-gateway-reads.md`）：`GET /kong-plan/accounts` 每项带 `live`（并发、排队、活跃会话），给额度服务
+  读；代码在 `kong_plan_live.go`，只改 fork 文件。负载走 `ConcurrencyService.GetAccountsLoadBatch`、会话走会话上限组件的
+  `GetActiveSessionCountBatch`，上游改这两个函数的口径（计入哪些槽位、批量读取失败时返回什么）时要同步复核。
+- **优先承接新会话**（工作区 `DESIGN-routing-priority.md`）：快照条目的 `first_until`、两轮排序的前置段与确认时改判、`/kong-plan/accounts` 的
+  `routing`，只改 fork 文件（`kong_plan_contract.go`、`kong_plan_order.go`、`kong_plan_tier.go`，排序与 Rust 推演内核共用夹具）。`routing`
+  的负载率分母与选号同为 `kongLoadFactorWith`，上游改负载率的口径时要同步复核。
+- **rebase 时复核**：定层的"已到 7d 阈值"（`kongPlanReached7d`）与阈值（`windowThresholdPercent`）复刻了 A、B 两条
+  暂停路径的判定，上游改这两处时要同步；上游新增的会话绑定写入要经那个共用函数、不经两轮排序、也不是续接命中的
+  选号，不得在计划生效时写新绑定、新增的响应绑定写入点要先写续接标记、新增的选号循环要消费 `next` /
+  `confirm`、新增的并发上限读取点要用生效上限；漏接不报错，只会让计划输入在那条路径上失效。热账号限速另有三项：上游
+  新增的等槽重试点、抢槽点要经 `KongWaitConcurrency`（否则排队中的请求按入队时的旧上限获准，限速在那条路径上放宽），新增的
+  排队结束点要记限速挤压（HTTP 用 `kongHotNoteRequestWait`）；上游新增的"查额度并写缓存"路径要加账号锁（否则较早的查询可能
+  晚于较新的落库，观测倒退）。
 
 ## 本地验证的已知差异
 
