@@ -8,9 +8,14 @@
 
 ## 定制的边界
 
-只碰四类东西：**codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）、
+只碰七类东西：**codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）、
 **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）、**OpenAI 账号消耗节奏**（旧版选号的重排，设计见
-`DESIGN-openai-account-pace.md`），以及**fork 自身必须适配的部分**（版本检查、发布标识）。
+`DESIGN-openai-account-pace.md`）、**Codex 模型目录的上下文窗口折算**、**发往官方 ChatGPT 后端的
+请求体 zstd 压缩**（省出站流量；这两项见下文维护约定）、
+**前端展示调整**（账号页：OpenAI Pro 20x / Pro 5x 只有 7d 主窗口，不显示 5h；管理员用量页：用户列
+可在列设置里隐藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会
+显示），以及
+**fork 自身必须适配的部分**（版本检查、发布标识）。
 上游其余部分一律不动——定制面越窄，越能持续跟上上游的 bug 修复。
 
 有三处是**结构性的、不随上游版本变化的约束**，值得写在这里而不是只留在 commit 里：
@@ -50,8 +55,10 @@
 | **turn-state 溯源表不设容量上限** | 表里记的是「这个 blob 是我们替哪个账号发出去的」，判定口径是查无来源即不剥——无从判定来源就剥，等于无谓丢掉客户端的对话上下文。所以淘汰未过期条目会把「已知别家铸造」降成「查无来源」，failover 换号后那个 blob 又被原样送到新账号，正是这道守卫要挡的事。要设硬上限，就得在交付前先预留登记容量、满额即拒服；在那之前容量只由 TTL 与后台清扫约束 |
 | **消耗节奏只挂在旧版选号的第 2 层，只改顺序不改候选** | 钩子全在 `openai_gateway_scheduling.go` 的 `selectAccountWithLoadAwareness` 里，都是单行、带 `[kong]` 注释：进入第 2 层处 `kongPaceBegin` + `defer finish`、`shuffleWithinSortGroups` 之后 `reorder`（传入随后倍率排序用的 `rateOrder`）、抢槽循环前 `finalOrder`、两处抢到后 `acquired`、负载读取失败分支开头 `loadFailed`。rebase 时要复核的就是这几处；上游改动这个函数时，要确认 `reorder` 仍在同优先级内的随机打散之后、倍率排序与 compact 分层之前——放到后面会把上游的硬约束冲掉。第 1 层（粘性）与第 3 层（兜底等待）刻意不接：粘性优先于短期均衡，兜底等待本就不挑号。过滤条件一概不碰，所以最坏情况也只是退回上游的顺序 |
 | 消耗节奏的参数放数据目录下的 `openai-account-pace.yaml`，不进 `config.yaml`、也不走环境变量 | 要在线调：环境变量每改一次都要重建容器、掐断进行中的流式响应，而组件每分钟检查一次文件，改完即生效；参数又是按套餐分组的嵌套结构，环境变量表达不了。不进 `config.yaml` 是因为上游的 `config.go` 是高频改动面，加字段就多一处 rebase 冲突。文件不存在即功能关闭，改坏时沿用上一份有效配置并在日志与 Redis 的 meta 里报错 |
+| **Codex 模型目录的上下文窗口折算挂在 `CodexModels` 的每个写出口** | 上游目录的 `max_context_window` 在 codex 里是「配置覆盖允许的上限」，网关按它 × 比例抬高 `context_window`（只往上调），客户端就不必各自配 `model_context_window` 或钉本地目录。handler 的固定账号、分组配置、调度三条分支各自写响应，每处写出前都调 `KongFinalizeCodexModelsManifest`；传给上游构建函数的 If-None-Match 一律为空串，304 由它按折算后的 ETag 判定——否则持有折算前 ETag 的客户端永远拿不到折算结果。rebase 时上游若新增写出分支，要一并接上。比例走环境变量 `KONG_CODEX_CONTEXT_WINDOW_RATIO`：不设置为 1（取 max），0 关闭，写错则关闭并记错误日志 |
+| **出站请求体的 zstd 压缩挂在 `doOpenAIUpstream` 的发送处** | 与票的观测同一个汇聚点，HTTP 调用点一并覆盖；原生 WS 不经过这里，它的帧由 permessage-deflate 压缩。条件只看最终出站请求：发往 `chatgpt.com`（含子域）的 JSON POST、正文不小于 1 KiB、没有 `Content-Encoding`、账号不走插件（插件自带传输层）。入站的 `Content-Encoding` 在读入时已解码并删除，也不在转发头白名单里，所以客户端自己压缩上来的请求不影响判断。票的观测在压缩之前记下明文请求体的读取入口：收票要读明文里的 `model`。插件判定只做一次：压缩了的请求（连同明文重发）直接交 `httpUpstream.Do`，不经 `sendOpenAIUpstream`，否则插件绑定在两次判定之间切换时，压缩正文会落进插件——rebase 时上游若在 `sendOpenAIUpstream` 里加了逻辑，要看压缩路径是否也需要。上游像是不接受压缩（415，或 400 / 422 且错误正文是专指正文解码失败的写法）时用明文重发一次；明文通过了，才把该端点改发明文 24 小时，明文同样被拒说明与压缩无关、端点照旧压缩。普通业务错误不重发，错误正文原样交给调用方。每 10 分钟一行 `kong zstd: 周期计数` 日志给出压缩前后字节数。开关走环境变量 `KONG_OPENAI_REQUEST_ZSTD`：不设置为开，false 关闭，写错则关闭并记错误日志 |
 | 接转发链路用「可选依赖 + setter」 | `OpenAIGatewayService` 的构造函数参数表很长且是上游高频改动面。加字段 + `SetKongTicketObserver` 能把改动收在一处，未注入时所有接入点退化为空操作 |
-| 前端定制放 `frontend/src/features/<主题>/`，上游文件只做追加 | 用量明细的请求特征列（`features/request-features/`）碰上游的点全是**追加**：`UsageTable.vue` 一行 import 与一个 `#cell-request_features` 插槽、`types/index.ts` 里 `AdminUsageLog` 的 `kong_request_features` 字段、管理员 `views/admin/UsageView.vue` 的列定义一项（标签用中文字面量，不加 i18n 键）。账号指纹测试（`features/openai-fingerprint-test/`，文案在 feature 内）碰上游的只有两处各两行：`AccountActionMenu.vue`「测试连接」下方的菜单项组件与它的 import，`AccountsView.vue` 的弹窗宿主与它的 import——弹窗不能挂在菜单里，菜单关闭时菜单组件随之卸载。rebase 时要复核的就是这几处 |
+| 前端定制放 `frontend/src/features/<主题>/`，上游文件只做单行追加或单处替换 | 用量明细的请求特征列（`features/request-features/`）碰上游的点全是**追加**：`UsageTable.vue` 一行 import 与一个 `#cell-request_features` 插槽、`types/index.ts` 里 `AdminUsageLog` 的 `kong_request_features` 字段、管理员 `views/admin/UsageView.vue` 的列定义一项（标签用中文字面量，不加 i18n 键）。账号指纹测试（`features/openai-fingerprint-test/`，文案在 feature 内）碰上游的只有两处各两行：`AccountActionMenu.vue`「测试连接」下方的菜单项组件与它的 import，`AccountsView.vue` 的弹窗宿主与它的 import——弹窗不能挂在菜单里，菜单关闭时菜单组件随之卸载。前端展示调整（`features/openai-usage-window/`、`features/usage-latency/`）碰上游的点分两类：**追加**——`AccountUsageCell.vue` 与 `UsageTable.vue` 各一行 import，`UsageTable.vue` 延迟列网格里的「速度」一行，`i18n/locales/{en,zh}/dashboard.ts` 的 `usage` 段各两个键；**替换**——`AccountUsageCell.vue` OpenAI OAuth 分支 5h 进度条的 `v-if` 条件、管理员 `views/admin/UsageView.vue` 的 `ALWAYS_VISIBLE` 去掉 `user`。替换点在上游改到同一行时必然冲突，rebase 时先看这两处。定制的前端单测都要追加到根 `Makefile` 的 `FRONTEND_CRITICAL_VITEST`，CI 只跑这份清单 |
 | 后端响应结构要显式写 `json` tag | 本功能的 handler 直接序列化 service 层结构体。上游那些结构多数也没 tag，但我们的响应里混着 `gin.H` 的 snake_case 字段——不写 tag 会让同一个响应里两种命名风格并存，前端类型也跟着别扭 |
 | `upstream` remote 禁止 push | `git remote set-url --push upstream DISABLED` |
 | `base/*` tag 必须 push 到 origin | push 后该 commit object 即归本仓库。上游会 force push、删 tag、撤 release，不这么做就得靠运气 |
