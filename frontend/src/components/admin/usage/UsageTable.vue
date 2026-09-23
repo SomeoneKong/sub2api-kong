@@ -250,6 +250,8 @@
               <span class="font-medium tabular-nums" :class="LATENCY_TEXT_CLASSES[durationSeverity(row.duration_ms ?? 0)]">{{ formatDuration(row.duration_ms) }}</span>
               <span class="text-gray-400 dark:text-gray-500" :title="t('usage.outputTpsHint')">{{ t('usage.outputTps') }}</span>
               <span data-testid="output-tps" class="font-medium tabular-nums text-gray-700 dark:text-gray-300">{{ formatUsageOutputRate(row) }}</span>
+              <span class="text-gray-400 dark:text-gray-500" :title="t('usage.latencyOutputSpeedHint')">{{ t('usage.latencyOutputSpeed') }}</span>
+              <span data-testid="usage-output-speed" class="tabular-nums" :class="formatOutputSpeed(row) ? 'font-medium text-gray-700 dark:text-gray-300' : 'text-gray-400 dark:text-gray-500'">{{ formatOutputSpeed(row) ?? '-' }}</span>
             </div>
           </div>
         </template>
@@ -604,6 +606,7 @@ import EmptyState from '@/components/common/EmptyState.vue'
 import IpGeoCell from '@/components/common/IpGeoCell.vue'
 import Icon from '@/components/icons/Icon.vue'
 import { fetchBatch, getEntry } from '@/utils/ipGeoLookup'
+import { formatOutputSpeed } from '@/features/usage-latency/outputSpeed'
 import type { AdminUsageLog } from '@/types'
 import type { Column } from '@/components/common/types'
 
