@@ -524,6 +524,8 @@ type OpenAIGatewayService struct {
 	// [kong] codex 票据守卫。可选依赖：未启用时为 nil，所有接入点都是空操作。
 	// 用 setter 注入而不是加进构造函数参数表，是为了不动上游那个很长的签名。
 	kongTicket *KongTicketGateway
+	// [kong] 账号消耗节奏（可选依赖，setter 在 kong_openai_account_pace_select.go）。nil 即不启用。
+	kongPace *KongOpenAIAccountPace
 }
 
 // SetKongTicketGateway 注入 codex 票据守卫（可选依赖）。
