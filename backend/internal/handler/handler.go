@@ -44,6 +44,7 @@ type AdminHandlers struct {
 	Compliance             *admin.ComplianceHandler
 	AuditLog               *admin.AuditLogHandler
 	KongFingerprint        *admin.KongFingerprintHandler // [kong] 账号指纹测试
+	KongPlan               *admin.KongPlanHandler        // [kong] 账号选择与 credits
 }
 
 // Handlers contains all HTTP handlers

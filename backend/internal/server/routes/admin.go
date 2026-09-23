@@ -87,6 +87,8 @@ func RegisterAdminRoutes(
 
 		// 账号指纹测试（本 fork 定制）
 		registerKongFingerprintRoutes(admin, h)
+		// 账号计划执行端用到的端点（本 fork 定制）
+		registerKongPlanRoutes(admin, h)
 
 		// 系统管理
 		registerSystemRoutes(admin, h)
