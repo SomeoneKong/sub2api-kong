@@ -837,7 +837,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	turnState := ""
 	turnMetadata := ""
 	if c != nil {
-		turnState = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
+		// 只取本账号可以用的那一份（见 openAIWSClientTurnStateForAccount）。
+		turnState = s.openAIWSClientTurnStateForAccount(c, account)
 		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
 	}
 	headers, _, buildHdrErr := s.buildOpenAIWSHeaders(
@@ -979,6 +980,18 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		filter: func(msgType coderws.MessageType, payload []byte) (out []byte, blocked *OpenAIFastBlockedError, filterErr error) {
 			if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
 				return payload, nil, nil
+			}
+			// 跨账号剥离要在**帧分类之前**：分类本身读第一个 `type`，而客户端可以写两个 `type`
+			// （`response.cancel` + `response.create`）——按首键归类成控制帧就绕过了只在
+			// response.create 里跑的剥离，而按末键解码的上游看到的是一帧带着异账号凭据的生成请求。
+			if stripped, _, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, payload); stripErr != nil {
+				return nil, nil, NewOpenAIWSClientCloseError(
+					coderws.StatusPolicyViolation,
+					"invalid websocket request payload",
+					stripErr,
+				)
+			} else {
+				payload = stripped
 			}
 			eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 			isResponseCreate := eventType == "response.create"
@@ -1134,6 +1147,16 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			cancel()
 		},
 	}
+	// 首帧不经过上面的逐帧过滤器（它在下面直接写上游），同样要剥帧内的异账号 blob。
+	if stripped, _, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, firstClientMessage); stripErr != nil {
+		return NewOpenAIWSClientCloseError(
+			coderws.StatusPolicyViolation,
+			"invalid websocket request payload",
+			stripErr,
+		)
+	} else {
+		firstClientMessage = stripped
+	}
 	upstreamFirstMessageSent := false
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
 	firstWriteErr := relayUpstreamFrameConn.WriteFrame(firstWriteCtx, coderws.MessageText, firstClientMessage)
@@ -1251,6 +1274,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 			},
 			AfterClientWrite: func(msgType coderws.MessageType, payload []byte, writeErr error) {
+				if writeErr == nil {
+					// 写成功才算客户端拿到了这个 blob：登记铸造账号供下次剥离判定。**不按帧类型过滤**
+					// ——本通路双向都允许二进制帧，一份 JSON 的 response.metadata 完全可以用 Binary 发出
+					// 来，按类型提前 return 等于留了个"换帧型就不登记"的缺口（与交付守卫同一处考量）。
+					s.noteOpenAIWSCodexTurnStateDelivered(c, account, payload)
+				}
 				if msgType == coderws.MessageText && writeErr == nil {
 					eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
 					markOpenAIWSClientVisibleFailure(c, eventType, payload)
