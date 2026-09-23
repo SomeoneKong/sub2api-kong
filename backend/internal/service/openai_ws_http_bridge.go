@@ -555,15 +555,31 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	turnStart := time.Now()
 	rejectedFieldRetryState := newOpenAIResponsesRejectedFieldRetryState(body)
 	var resp *http.Response
+	// [kong] 本次上送记下的请求特征。出站请求在循环内逐次重建，所以每次发送后都取一次快照，最终留下的
+	// 是实际服务的那一次。
+	var kongFeatures *KongRequestFeatures
 	for {
 		upstreamReq, buildErr := buildUpstreamRequest(body)
 		if buildErr != nil {
 			return nil, buildErr
 		}
 		resp, err = s.doOpenAIUpstream(upstreamReq, proxyURL, account)
+		kongFeatures = KongFeaturesFromRequest(upstreamReq)
 		if err != nil {
+			// [kong] 交付拦截不是上游故障，也不换号：上游已经对本账号这次注入作出了回应。首轮同样按策略
+			// 关闭——通用传输错误处理会把它原样返回，落到上层就成了 1011「上游故障」。
+			if KongIsDeliveryBlocked(err) {
+				return nil, wrapOpenAIWSKongTicketError(err)
+			}
 			if turn == 1 {
 				return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
+			}
+			// [kong] 票据拒服不是上游故障。`parseClientPayload` 那一次准入成功，不代表这一次
+			// 还成立——两者之间票可能过期或被并发撤销。走通用路径会同时坏三件事：给客户端发一帧
+			// `502 upstream_error`、把原始错误字符串化（类型丢了，调度上报的豁免与策略关闭都失效）、
+			// 于是一次本地拒服被记成账号故障。后续轮次不换号（会话状态活在这条上游连接里），按策略关闭。
+			if KongIsTicketDenied(err) {
+				return nil, wrapOpenAIWSKongTicketError(err)
 			}
 			safeErr := sanitizeUpstreamErrorMessage(err.Error())
 			clientError := buildOpenAIWSHTTPBridgeErrorEvent(http.StatusBadGateway, "Upstream request failed")
@@ -683,6 +699,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			ResponseHeaders:               cloneHeader(resp.Header),
 			Duration:                      time.Since(turnStart),
 			FirstTokenMs:                  firstTokenMs,
+			KongRequestFeatures:           kongFeatures,
 		}
 		if replayInput := replayCollector.Items(); len(replayInput) > 0 {
 			result.wsReplayInput = replayInput

@@ -85,6 +85,9 @@ func RegisterAdminRoutes(
 		// 运维监控（Ops）
 		registerOpsRoutes(admin, h)
 
+		// Codex 票据（本 fork 定制）
+		registerKongTicketRoutes(admin, h)
+
 		// 系统管理
 		registerSystemRoutes(admin, h)
 

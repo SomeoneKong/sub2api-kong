@@ -138,6 +138,9 @@ type openAIWSPassthroughUsageMeta struct {
 	requestedReasoningEffort atomic.Pointer[string]
 	requestModel             atomic.Pointer[string]
 	upstreamModel            atomic.Pointer[string]
+	// [kong] 本轮准入记下的请求特征记录器（见 kong_ticket_request_feature.go）。
+	// 与上面几项同样是**逐轮**的：一次会话每轮各有自己的票，记连接级的值会把上一轮算到这一轮头上。
+	kongFeatures atomic.Pointer[KongFeatureRecorder]
 
 	// 仅在 client->upstream filter goroutine 中读写；Load 侧通过上方原子指针同步。
 	sessionRequestModel string
@@ -196,6 +199,21 @@ func (m *openAIWSPassthroughUsageMeta) updateFromResponseCreate(policyOutput []b
 	m.serviceTier.Store(extractOpenAIServiceTierFromBody(policyOutput))
 	m.reasoningEffort.Store(extractOpenAIReasoningEffortFromBody(policyOutput, mappedModel, requestModelForFrame))
 	m.storeTurnModels(requestModelForFrame, policyOutput)
+}
+
+// storeKongFeatures 记下这一轮准入产出的特征记录器。
+//
+// 每轮都要存，**未注入的轮次存 nil**：沿用上一轮的记录器会让这一轮的用量行顶着上一轮的票 id 与
+// 指纹显示，那是彻头彻尾的错误陈述。
+func (m *openAIWSPassthroughUsageMeta) storeKongFeatures(attempt *KongUpstreamAttempt) {
+	if m == nil {
+		return
+	}
+	if attempt == nil {
+		m.kongFeatures.Store(nil)
+		return
+	}
+	m.kongFeatures.Store(attempt.Features)
 }
 
 func (m *openAIWSPassthroughUsageMeta) storeTurnModels(requestModel string, upstreamPayload []byte) {
@@ -257,6 +275,16 @@ func openAIWSPassthroughRequestModelFromSessionFrame(payload []byte) string {
 }
 
 const openaiWSV2PassthroughModeFields = "ws_mode=passthrough ws_router=v2"
+
+// openAIWSPassthroughDrainTimeout 是客户端走后继续读上游、捞延迟 usage/终帧的窗口（同 relay 默认值）。
+//
+// openAIWSPassthroughDrainPersistShare 是这个窗口里允许票据落库占用的份额。落库是同步的、占的就是上游
+// reader，剩下那一半要留给读取并处理终帧——窗口一到 relay 就取消上游并等 reader 返回，占满就等于拿
+// usage 结算去换一次免费样本。
+const (
+	openAIWSPassthroughDrainTimeout      = 1200 * time.Millisecond
+	openAIWSPassthroughDrainPersistShare = openAIWSPassthroughDrainTimeout / 2
+)
 
 var errOpenAIWSPassthroughFirstOutputTimeout = errors.New("openai websocket passthrough first output timeout")
 var errOpenAIWSPassthroughActiveTurnTimeout = errors.New("openai websocket passthrough active turn read timeout")
@@ -701,6 +729,17 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	} else {
 		firstClientMessage = next
 	}
+	// [kong] codex 票据：首帧的准入（第一段，歧义判定）。
+	//
+	// 必须在**任何字段解析、模型映射与规范化之前**：那些步骤会重建 JSON（合并重复键、改写字段），
+	// 之后再判看到的已经是一份「干净」的 payload，而模型早就按重复键里的第一个值算完了——
+	// `{"model":"gpt-5.1","model":"gpt-6-astra"}` 于是被判成非门控放行，整轮无票交付。
+	// 注入与最终模型核对在写上游之前另有一段。
+	if ticketErr := s.kongTicket.GuardWSFrame(account, firstClientMessage); ticketErr != nil {
+		// 首帧：走统一包装。歧义是请求级原因，不会换号（NextAccountStop），但要拿到同一套身份、
+		// 分类与看板归因——只包"能换号的那部分"等于给其余拒服开一条旁路。
+		return wrapOpenAIWSFirstTurnKongTicketError(c, ticketErr)
+	}
 	requestModel := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "model").String())
 	requestPreviousResponseID := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "previous_response_id").String())
 	promptCacheKey := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "prompt_cache_key").String())
@@ -741,6 +780,26 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			firstClientMessage = s.ReplaceModelInBody(firstClientMessage, mappedModel)
 		}
 	}
+	// [kong] codex 票据：本轮的票据上下文。
+	//
+	// 必须是 atomic：写它的是 `runClientToUpstream` 里的逐帧过滤器，读它的是
+	// `runUpstreamToClient` 里的 BeforeWriteClient——两个 goroutine。同在一个函数作用域只保证
+	// 引用得到，不提供任何同步；用普通指针就是数据竞争，读到的可能不是完整的本轮快照。
+	var kongTurnAttempt atomic.Pointer[KongUpstreamAttempt]
+	// kongClientGone 表示客户端已经走了、relay 正在排空上游。写它的是 relay 主流程的
+	// BeforeRelayCancel，读它的是下行 goroutine 的 BeforeWriteClient——两个 goroutine，故用 atomic。
+	var kongClientGone atomic.Bool
+	// kongDrainPersistDeadline 是排空期间票据落库的**绝对截止时刻**（UnixNano，0 表示还没进排空）。
+	//
+	// 单次上限（kongObserveDetachedTimeout）挡不住累计：一次排空里可能来好几帧 metadata，metadata 也
+	// 可能是排空开始之后才到的，每帧各拿一次完整上限就能把整段拖过排空窗口——而窗口一到 relay 就取消
+	// 并关闭上游、再等这条 reader 返回，排在后面的终帧连同 usage 一起没了。所以由排空发起方给一个
+	// 共享的截止时刻，落库那边取它与单次上限里更早的那个（见 kongPersistCtx）。
+	var kongDrainPersistDeadline atomic.Int64
+	// kongReleasedTurnIDs 记下已经释放过的响应 id，用来挡住迟到或重复的旧轮终端事件——它们不该再
+	// 影响当前轮。只在下行 goroutine 里读写（BeforeWriteClient 是它唯一的访问点），不需要同步。
+	kongReleasedTurnIDs := make(map[string]bool, 4)
+
 	capturedSessionModel := openAIWSPassthroughPolicyModelForFrame(account, firstClientMessage)
 	if capturedSessionModel != "" && capturedSessionModel != strings.TrimSpace(gjson.GetBytes(firstClientMessage, "model").String()) {
 		firstClientMessage = s.ReplaceModelInBody(firstClientMessage, capturedSessionModel)
@@ -836,7 +895,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 	turnState := ""
 	turnMetadata := ""
+	// clientTurnStateRaw 是客户端**原封不动**带来的那一份，只用于请求特征里"客户端手里是什么档"这条读数；
+	// 上送用的是按账号过滤之后的 turnState，两者不能混用（过滤后为空不代表客户端没带）。
+	clientTurnStateRaw := ""
 	if c != nil {
+		clientTurnStateRaw = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
 		// 只取本账号可以用的那一份（见 openAIWSClientTurnStateForAccount）。
 		turnState = s.openAIWSClientTurnStateForAccount(c, account)
 		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
@@ -917,6 +980,18 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		statusCode,
 		openAIWSHeaderValueForLog(handshakeHeaders, "x-request-id"),
 	)
+	// [kong] 这条路每次都自己拨号（不走连接池），所以两个连接级事实都是本连接的：
+	// kongHandshakeState 是上游在握手**响应**里给的票，待收；kongSentHandshakeState 是我们在 upgrade
+	// **请求**头里真正发出去的那个，帧内没有 state 时它才是"本轮实际发往上游的"。
+	//
+	// 收票先存着是因为要按发往上游的门控模型判，而那个模型要等本帧解析出来（口径与 PrepareWSTurn
+	// 一致）。收完清空，避免同一条连接反复产出 duplicate_state；**非门控轮不清空**——同一条连接后面
+	// 完全可能换成门控模型，清掉就等于把那一轮的票提前扔了。
+	//
+	// 线程安全：首帧那一段在 relay 启动之前跑，之后只有 runClientToUpstream 那条 goroutine 里的
+	// filter 会碰它（同 filter 内其余状态的约定，见下方 filter 处的注释）。
+	kongHandshakeState := strings.TrimSpace(handshakeHeaders.Get(openAIWSTurnStateHeader))
+	kongSentHandshakeState := strings.TrimSpace(headers.Get(openAIWSTurnStateHeader))
 
 	upstreamFrameConn, ok := upstreamConn.(openaiwsv2.FrameConn)
 	if !ok {
@@ -981,10 +1056,17 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
 				return payload, nil, nil
 			}
+			// [kong] codex 票据：歧义帧必须在帧分类之前挡住——分类本身就读 `type`，
+			// 被读成别的事件类型就绕过了下面整条准入。
+			if ticketErr := s.kongTicket.GuardWSFrame(account, payload); ticketErr != nil {
+				return nil, nil, wrapOpenAIWSKongTicketError(ticketErr)
+			}
 			// 跨账号剥离要在**帧分类之前**：分类本身读第一个 `type`，而客户端可以写两个 `type`
-			// （`response.cancel` + `response.create`）——按首键归类成控制帧就绕过了只在
+			// （`response.cancel` + `response.create`）——按首键归类成控制帧就绕过了下面那条只在
 			// response.create 里跑的剥离，而按末键解码的上游看到的是一帧带着异账号凭据的生成请求。
-			if stripped, _, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, payload); stripErr != nil {
+			// 它也必须与票据功能、账号保护模式无关（GuardWSFrame 只保护受票据保护的账号）。
+			strippedClientState := ""
+			if stripped, strippedState, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, payload); stripErr != nil {
 				return nil, nil, NewOpenAIWSClientCloseError(
 					coderws.StatusPolicyViolation,
 					"invalid websocket request payload",
@@ -992,6 +1074,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				)
 			} else {
 				payload = stripped
+				strippedClientState = strippedState
 			}
 			eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 			isResponseCreate := eventType == "response.create"
@@ -1108,6 +1191,34 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if isResponseCreate && model != "" && model != strings.TrimSpace(gjson.GetBytes(payload, "model").String()) {
 				payload = s.ReplaceModelInBody(payload, model)
 			}
+			// [kong] codex 票据：把票写进本帧的 client_metadata。
+			//
+			// 放在模型解析与改写之后：判定必须用**实际上送的那个模型**。WS 上票是 payload 字段而
+			// 不是头，且逐轮上送（口径见 kong_ticket_gateway.go 的 WS 段），所以每个
+			// response.create 帧都要单独准入——会话中途换成门控模型同样受保护。
+			if isResponseCreate {
+				// 收票放在准入**之前**：准入可能因无合格票而拒服，挂在它成功之后等于把已经到手的
+				// 免费样本一起丢掉。模型用本帧解析出的那个，与紧随其后的准入同一口径。
+				if kongHandshakeState != "" && s.kongTicket.ShouldObserveHandshakeState(model) {
+					s.kongTicket.ObserveHandshakeState(ctx, account, model, kongHandshakeState)
+					kongHandshakeState = ""
+				}
+				next, attempt, ticketErr := s.kongTicket.PrepareWSTurn(ctx, account, model, payload)
+				if ticketErr != nil {
+					return nil, nil, wrapOpenAIWSKongTicketError(ticketErr)
+				}
+				// 上一轮受保护且还没落定时不允许交接：那一轮迟到的 metadata 会被拿去跟新轮的
+				// 上下文比对，用 nil 覆盖就等于放过它。
+				if handoffErr := s.kongTicket.GuardWSTurnHandoff(kongTurnAttempt.Load(), attempt); handoffErr != nil {
+					return nil, nil, wrapOpenAIWSKongTicketError(handoffErr)
+				}
+				payload = next
+				kongWSInheritRetired(kongTurnAttempt.Load(), attempt)
+				kongTurnAttempt.Store(attempt)
+				usageMeta.storeKongFeatures(attempt)
+				// 剥离在准入之前，准入看不到客户端自带那份；补回来（见 RecordStrippedClientState）。
+				attempt.RecordStrippedClientStateOnFeatures(strippedClientState)
+			}
 			out, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, model, payload)
 			// 多轮 passthrough usage：仅在成功（non-block / non-err）
 			// 的 response.create 帧上更新 usageMeta，使用
@@ -1147,8 +1258,23 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			cancel()
 		},
 	}
-	// 首帧不经过上面的逐帧过滤器（它在下面直接写上游），同样要剥帧内的异账号 blob。
-	if stripped, _, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, firstClientMessage); stripErr != nil {
+	// [kong] codex 票据：首帧的准入（第二段，注入）。
+	//
+	// 首帧不经过上面的逐帧过滤器——它在这里直接写上游（过滤器包的是客户端连接的 ReadFrame，
+	// 而首帧早已被读出来单独处理，过滤器里的 turnNo 也因此从 2 起算）。少了这一段，
+	// **每条 passthrough 连接的第一轮都无票交付**，而第一轮往往就是全部。
+	//
+	// 只做准入，不套用整个过滤器：那会把 BeforeRequest / BeforeTurn / 占槽与计费初始化重跑一遍。
+	// 歧义判定在本函数更靠前的位置已经做过（见那里的注释），这里判的是最终出站 payload。
+	firstTurnModel := capturedSessionModel
+	if firstTurnModel == "" {
+		firstTurnModel = initialRequestModel
+	}
+	// 首轮的拒服可以换账号（理由见 wrapOpenAIWSFirstTurnKongTicketError）：此刻客户端一个字节都没收到、
+	// relay 还没启动、首帧也还没写上游。后续轮次的同一判定在逐帧过滤器里，那里只能按策略关闭连接。
+	// 首帧同样要剥帧内的异账号 blob（理由同逐帧过滤器那处）。
+	firstStrippedClientState := ""
+	if stripped, strippedState, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, firstClientMessage); stripErr != nil {
 		return NewOpenAIWSClientCloseError(
 			coderws.StatusPolicyViolation,
 			"invalid websocket request payload",
@@ -1156,6 +1282,21 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		)
 	} else {
 		firstClientMessage = stripped
+		firstStrippedClientState = strippedState
+	}
+	// 收票放在准入之前，理由同逐帧过滤器那处。
+	if kongHandshakeState != "" && s.kongTicket.ShouldObserveHandshakeState(firstTurnModel) {
+		s.kongTicket.ObserveHandshakeState(ctx, account, firstTurnModel, kongHandshakeState)
+		kongHandshakeState = ""
+	}
+	if next, attempt, ticketErr := s.kongTicket.PrepareWSTurn(ctx, account, firstTurnModel, firstClientMessage); ticketErr != nil {
+		return wrapOpenAIWSFirstTurnKongTicketError(c, ticketErr)
+	} else {
+		firstClientMessage = next
+		kongTurnAttempt.Store(attempt)
+		// 首帧不经逐帧过滤器，这里是它唯一的记录点。
+		usageMeta.storeKongFeatures(attempt)
+		attempt.RecordStrippedClientStateOnFeatures(firstStrippedClientState)
 	}
 	upstreamFirstMessageSent := false
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
@@ -1196,8 +1337,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		UpstreamConn:       relayUpstreamFrameConn,
 		FirstClientMessage: firstClientMessage,
 		Options: openaiwsv2.RelayOptions{
-			WriteTimeout:       s.openAIWSWriteTimeout(),
-			FirstTurnStartedAt: firstTurnStartedAt,
+			WriteTimeout: s.openAIWSWriteTimeout(),
+			// 与 relay 的默认值同值，显式写出来是因为票据落库的预算要从它切一份：两个常量各自埋着
+			// 就会悄悄错配。
+			UpstreamDrainTimeout: openAIWSPassthroughDrainTimeout,
+			FirstTurnStartedAt:   firstTurnStartedAt,
 			TakeNextTurnStartedAt: func() time.Time {
 				startedAt := acceptedTurnStartedAt.Swap(nil)
 				if startedAt == nil {
@@ -1226,6 +1370,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					hooks.TurnStarted(turnNo, turn.StartedAt)
 				}
 				turnRequestModel, turnUpstreamModel := usageMeta.turnModels(turn.RequestModel)
+				// [kong] 帧里没有 state 时补连接级的两项：出站认**我们在 upgrade 请求头里真正发出去
+				// 的**那个，客户端那份认客户端自己带来的那个（注入替换过才会落下差异）。
+				usageMeta.kongFeatures.Load().RecordOutboundIfAbsent(kongSentHandshakeState)
+				usageMeta.kongFeatures.Load().RecordClientStateIfAbsent(clientTurnStateRaw)
 				turnResult := &OpenAIForwardResult{
 					RequestID: turn.RequestID,
 					Usage: OpenAIUsage{
@@ -1245,6 +1393,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 					Stream:                        true,
 					OpenAIWSMode:                  true,
+					KongRequestFeatures:           usageMeta.kongFeatures.Load().Snapshot(),
 					UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(turn.TerminalEventType),
 					ResponseHeaders:               cloneHeader(handshakeHeaders),
 					// 这是连接级的握手头，不是本轮响应头（见 CodexQuotaHeaders）。
@@ -1291,6 +1440,13 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 			},
 			BeforeRelayCancel: func(exit openaiwsv2.RelayExit) {
+				// [kong] relay 判定"客户端正常读完/走了"就进入排空模式（丢弃下行写），但它是在调过
+				// BeforeWriteClient 之后才丢帧的。所以这里先立旗：排空期间下行只收票、不判交付。
+				// 条件与 relay 自己进入排空的条件一致（read_client 且 graceful）。
+				if exit.Stage == "read_client" && exit.Graceful {
+					kongDrainPersistDeadline.Store(time.Now().Add(openAIWSPassthroughDrainPersistShare).UnixNano())
+					kongClientGone.Store(true)
+				}
 				if context.Cause(ctx) != nil {
 					return
 				}
@@ -1306,14 +1462,74 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				_ = clientConn.CloseNow()
 			},
 			BeforeWriteClient: func(msgType coderws.MessageType, payload []byte, wroteDownstream bool) error {
+				// [kong] codex 票据的交付边界：response.metadata 带回 state 说明上游没接受本轮
+				// 注入，这一轮输出不受合格票保障。该事件在 turn start 就到，此处拦住即零业务
+				// 正文交付。
+				//
+				// 判定放在 Text 判断**之前**：passthrough 双向都允许二进制帧，而
+				// `response.metadata` 只要是一份 JSON 就能用 Binary 帧发出来——按帧类型提前
+				// return 等于留了一个「换个帧类型就绕过」的出口。非 JSON 的二进制帧取不出
+				// state，守卫对它们是透明的。
+				//
+				// 客户端已走时只收票、不判交付：此刻 relay 在排空上游以便结算，没有业务输出会送给
+				// 任何人，交付判定无从谈起；在这里返回错误会把排空掐断，连带丢掉终帧、usage 与
+				// AfterTurn。
+				// 已进入排空时，票据处理共用排空发起方给的那个绝对截止时刻（kongPersistCtx 会在脱钩
+				// 之后重新施加它——WithoutCancel 会把 deadline 一并丢掉）。
+				kongCtx := ctx
+				if deadline := kongDrainPersistDeadline.Load(); deadline > 0 {
+					var cancelKongCtx context.CancelFunc
+					kongCtx, cancelKongCtx = context.WithDeadline(ctx, time.Unix(0, deadline))
+					defer cancelKongCtx()
+				}
+				if kongClientGone.Load() {
+					s.kongTicket.ObserveWSDownstream(kongCtx, account, kongTurnAttempt.Load(), payload)
+				} else if err := s.kongTicket.GuardWSDownstream(kongCtx, account, kongTurnAttempt.Load(), payload); err != nil {
+					// 判定本身会同步落库，客户端完全可能正好在这期间走掉。**返回错误之前再看一次
+					// 旗标**：此刻若已进入排空，这条错误会把排空掐断，连带丢掉终帧、usage 与完成
+					// 回调，而那一刻已经没有任何业务输出会送给任何人，拒不拒都影响不到客户端。
+					//
+					// 这一次复查之后仍有一个极窄的窗口（断连恰好发生在复查与 return 之间）。那种
+					// 时序下 relay 还没进入排空，我们是先落定的一方，按交付拒绝退出是正确结果，
+					// 与任何一次正常的交付拒绝无异——所以不再为它把 relay 的状态机拆开同步。
+					//
+					// **不在这里补收一次**：判定内部那次落库已经走脱钩且限期的 ctx
+					// （observeWSReissued），票该进库就已经进了。再收一遍会让同一帧产出第二条观察
+					// 事件、多一条 duplicate_state，还可能在第二次落库失败时把首次拿到的
+					// `reissued_ticket_id` 清成空——把"已入库"陈述成"未入库"。
+					if !kongClientGone.Load() {
+						return wrapOpenAIWSKongTicketError(err)
+					}
+				}
 				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
 				// 逐轮的额度快照：原生 WS 没有逐轮响应头，上游把它放在带外事件里
 				// （见 noteOpenAIWSCodexRateLimits）。解析与调用都放在 Text 判断**之前**——
-				// passthrough 双向都允许二进制帧，这份 JSON 用 Binary 帧一样发得出来；
-				// 非 JSON 的二进制帧取不出字段，对它是透明的。
+				// passthrough 双向都允许二进制帧，这份 JSON 用 Binary 帧一样发得出来，理由同上面的
+				// 交付判定；非 JSON 的二进制帧取不出字段，对它是透明的。
 				s.noteOpenAIWSCodexRateLimits(ctx, account, eventType, payload)
 				if msgType != coderws.MessageText {
 					return nil
+				}
+				// 票据上下文的释放只认**正面归属**：把任意 error 都当成本轮结束，会让一个针对上一轮
+				// 的控制帧错误回包摘掉新一轮的保护（口径见 kongWSTurnEventAction 的注释）。
+				//
+				// 响应 id 专门取 `response.id` / `response_id`，不用信封里那个会回落到顶层 `id` 的值
+				// ——后者常常是条目 id，拿它绑定会让本轮永不释放。
+				kongEventResponseID := kongWSResponseIDOf(payload)
+				if current := kongTurnAttempt.Load(); current != nil {
+					switch kongWSTurnEventAction(current, eventType, kongEventResponseID, kongReleasedTurnIDs) {
+					case kongWSTurnBind:
+						bound := *current
+						bound.ResponseID = kongEventResponseID
+						// CAS 而不是直接 Store：这一轮可能已经被客户端侧的新准入换掉了，
+						// 那时不该把旧轮的 id 写回去。
+						kongTurnAttempt.CompareAndSwap(current, &bound)
+					case kongWSTurnClear:
+						if kongTurnAttempt.CompareAndSwap(current, nil) {
+							kongWSMarkReleased(kongReleasedTurnIDs, current, kongEventResponseID)
+						}
+					case kongWSTurnKeep:
+					}
 				}
 				if eventType == "response.created" {
 					failureAccountSideEffectsApplied = false
@@ -1380,6 +1596,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 
 	resultRequestModel, resultUpstreamModel := usageMeta.turnModels(relayResult.RequestModel)
+	// [kong] 同上：帧内没有 state 时补连接级那两项。
+	usageMeta.kongFeatures.Load().RecordOutboundIfAbsent(kongSentHandshakeState)
+	usageMeta.kongFeatures.Load().RecordClientStateIfAbsent(clientTurnStateRaw)
 	result := &OpenAIForwardResult{
 		RequestID: relayResult.RequestID,
 		Usage: OpenAIUsage{
@@ -1399,6 +1618,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 		Stream:                        true,
 		OpenAIWSMode:                  true,
+		KongRequestFeatures:           usageMeta.kongFeatures.Load().Snapshot(),
 		UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(relayResult.TerminalEventType),
 		ResponseHeaders:               cloneHeader(handshakeHeaders),
 		// 这是连接级的握手头，不是本轮响应头（见 CodexQuotaHeaders）。

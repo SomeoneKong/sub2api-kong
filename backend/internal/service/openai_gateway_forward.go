@@ -883,6 +883,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			)
 			return true
 		}
+		// [kong] 门控请求**照常**走 WebSocket 上游，保护由原生 WS 路径自己实现：票在 WS 上不是
+		// 握手头而是每帧 payload 的 client_metadata，上游回送走带内 response.metadata 事件，
+		// 两者都是逐轮的，所以连接池复用不妨碍本轮判定。接入点见 kong_ticket_gateway.go 的 WS 段。
 		retryBudget := s.openAIWSRetryTotalBudget()
 		retryStartedAt := time.Now()
 	wsRetryLoop:
@@ -1067,6 +1070,24 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		upstreamStart := time.Now()
 		resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+		// [kong] 票据判定要**先于**首输出超时判定。
+		//
+		// 首输出守卫的 context 也套在 doOpenAIUpstream 里的票据准入上，所以"等本账号的取票任务"超过
+		// 首输出期限时，守卫会先被触发。照原顺序走的话这次本地拒服被改写成
+		// `504 / first_output_timeout`：票据身份丢失、错误记到上游头上、账号健康度被罚，
+		// `HandleStreamTimeout` 那套处置甚至会把一个好账号停掉调度——而一个字节都没发给上游。
+		//
+		// 换号在这里是安全的：`startTime` 是**每次 Forward** 取的，下一个账号会拿到完整的首输出预算。
+		if err != nil && (KongIsTicketDenied(err) || KongIsDeliveryBlocked(err)) {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if headerGuard != nil {
+				headerGuard.stopHeaderWait()
+				headerGuard.close()
+			}
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
 		if headerGuard != nil && headerGuard.stopHeaderWait() {
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
@@ -1324,6 +1345,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			OpenAIWSMode:                  false,
 			Duration:                      time.Since(startTime),
 			FirstTokenMs:                  firstTokenMs,
+			// [kong] 请求特征：记录器挂在上送用的那个 request 对象上（准入时挂、交付判定时补记上游
+			// 回发的 state），所以这里取到的是这次发送的完整特征。
+			KongRequestFeatures: KongFeaturesFromRequest(upstreamReq),
 		}
 		if imageCount > 0 {
 			forwardResult.ImageCount = imageCount

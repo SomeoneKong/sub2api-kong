@@ -306,6 +306,12 @@ func (s *OpenAIGatewayService) createUpstreamLiveCall(
 
 	resp, err := s.doOpenAIUpstream(upstreamReq, resolveAccountProxyURL(account), account)
 	if err != nil {
+		// [kong] 票据拒服不是传输故障：交给统一转换以保住身份（调度豁免、耗尽呈现）。
+		// 这一层没有 gin.Context——转换函数在票据分支上不碰它（恢复时刻的累计是 nil-safe 的），
+		// 而它在任何 ops 写入之前就返回了。
+		if KongIsTicketDenied(err) || KongIsDeliveryBlocked(err) {
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, nil, account, err, false)
+		}
 		logLiveCreateStageFailure(ctx, account.ID, "upstream_transport", err)
 		return nil, err
 	}
@@ -501,6 +507,12 @@ func (s *OpenAIGatewayService) ProxyLiveSideband(
 	if err != nil {
 		return err
 	}
+	// [kong] 逐帧守卫在建连前解析一次账号（避免每帧读库），装配失败即不转发——这条通路上它是唯一的
+	// 保护点，读失败时放行等于把保护关掉。放在占用控制权之前，失败就不会留下要回收的状态。
+	guardLiveFrame, guardErr := s.kongTicket.LiveFrameGuard(ctx, record.AccountID)
+	if guardErr != nil {
+		return guardErr
+	}
 	owner := uuid.NewString()
 	claimed, err := store.ClaimLiveController(ctx, record.CallHash, LiveControllerProxy, owner)
 	if err != nil {
@@ -529,6 +541,13 @@ func (s *OpenAIGatewayService) ProxyLiveSideband(
 			messageType, payload, readErr := downstream.Read(proxyCtx)
 			if readErr != nil {
 				errCh <- readErr
+				return
+			}
+			// [kong] codex 票据：sideband 是原始双向转发，票无从注入、交付也无从判定。创建端点已经
+			// 挡住门控模型，但协议允许会话中途改模型（session.update），不挡这一步就留了一条
+			// "先建非门控会话、再切到门控模型"的绕行。
+			if ticketErr := guardLiveFrame(payload); ticketErr != nil {
+				errCh <- ticketErr
 				return
 			}
 			if writeErr := upstream.WriteFrame(proxyCtx, messageType, payload); writeErr != nil {
