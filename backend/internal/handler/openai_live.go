@@ -178,6 +178,12 @@ func liveCallIdentity(
 }
 
 func (h *OpenAIGatewayHandler) writeLiveCreateError(c *gin.Context, err error) {
+	// [kong] 票据拒服不是上游故障：一个字节都没发给上游。Live 的创建终点不经过 failover 耗尽 handler，
+	// 所以这条呈现要在这里单独接一次——否则它落成 `502 / api_error / "Live upstream request failed"`，
+	// 把一次本地策略决定说成上游挂了，看板归因也拿不到票据分类。
+	if h.kongWriteLiveTicketDeny(c, err) {
+		return
+	}
 	switch {
 	case errors.Is(err, service.ErrLiveConcurrencyFull):
 		h.errorResponse(c, http.StatusTooManyRequests, "rate_limit_error", "Live concurrency limit reached")
@@ -235,7 +241,13 @@ func (h *OpenAIGatewayHandler) LiveSideband(c *gin.Context) {
 	}
 	defer func() { _ = downstream.CloseNow() }()
 	if err := h.gatewayService.ProxyLiveSideband(c.Request.Context(), record, downstream); err != nil {
-		_ = downstream.Close(coderws.StatusInternalError, "live sideband closed")
+		// [kong] 票据拒服按策略关闭（1008）并带分类：1011「live sideband closed」会让客户端与运维都
+		// 去查网关自己，而这是一次按规则的拒绝——这条通路承载不了票据，重试也不会变。
+		status, reason := coderws.StatusInternalError, "live sideband closed"
+		if denyStatus, denyReason, ok := kongLiveSidebandDenyClose(c, err); ok {
+			status, reason = denyStatus, denyReason
+		}
+		_ = downstream.Close(status, reason)
 		return
 	}
 	_ = downstream.Close(coderws.StatusNormalClosure, "")

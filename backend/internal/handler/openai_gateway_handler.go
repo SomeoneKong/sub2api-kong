@@ -1582,6 +1582,10 @@ func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, 
 	if failoverErr != nil {
 		copyFailoverRetryAfter(c, failoverErr.ResponseHeaders)
 	}
+	// [kong] 同 handleFailoverExhausted：票据拒服不是上游故障，要在通用映射之前判掉。
+	if h.kongWriteTicketDenyExhausted(c, failoverErr, streamStarted, true) {
+		return
+	}
 	if failoverErr != nil && failoverErr.IsCredentialFailure() {
 		status, message := credentialFailoverClientResponse(failoverErr)
 		h.anthropicStreamingAwareError(c, status, "api_error", message, streamStarted)
@@ -2541,7 +2545,14 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	wsAttemptMessage := append([]byte(nil), firstMessage...)
 	waitForWSSameAccountRetry := func(account *service.Account, failoverErr *service.UpstreamFailoverError) bool {
-		if account == nil || failoverErr == nil || failoverErr.StatusCode != http.StatusTooManyRequests || failoverErr.SameAccountRetryDeadline.IsZero() {
+		if account == nil || failoverErr == nil {
+			return false
+		}
+		// [kong] 票据拒服的同账号等待另有判据（RetryableOnSameAccount，只对几秒内可能好转的原因为真）。
+		// 它没有 429 那套 deadline，按原条件会被直接排除，于是 `preparing`——本账号的任务正在跑、产物
+		// 正是本账号要的票——只能靠换号，而换号在 WS 上意味着丢掉这条上游连接与它的上下文缓存。
+		_, kongTicketDeny := service.KongTicketDenyReasonOf(failoverErr)
+		if !kongTicketDeny && (failoverErr.StatusCode != http.StatusTooManyRequests || failoverErr.SameAccountRetryDeadline.IsZero()) {
 			return false
 		}
 		retryLimit := effectiveSameAccountRetryLimit(failoverErr, account)
@@ -3340,6 +3351,11 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 		h.handleFailoverExhaustedSimple(c, http.StatusBadGateway, streamStarted)
 		return
 	}
+	// [kong] 票据拒服必须在通用上游映射之前判掉：它的 StatusCode 是 0，落到 mapUpstreamError 的
+	// default 分支就是 `502 / "Upstream request failed"`——而这里压根没有上游交互。
+	if h.kongWriteTicketDenyExhausted(c, failoverErr, streamStarted, false) {
+		return
+	}
 	if failoverErr.IsOpenAIRequestBodyTooLarge() {
 		service.SetOpsUpstreamError(c, http.StatusRequestEntityTooLarge, service.OpenAIRequestBodyTooLargeClientMessage, "")
 		h.handleStreamingAwareError(
@@ -3791,6 +3807,13 @@ func closeOpenAIWSFailoverExhausted(c *gin.Context, conn *coderws.Conn, failover
 	if failoverErr != nil {
 		if reason := strings.TrimSpace(string(failoverErr.Reason)); reason != "" {
 			errorCode = reason
+		}
+		// [kong] 票据拒服不是上游故障：没有上游交互，而且通常有确定的恢复时刻。1011
+		// 「upstream websocket proxy failed」会让客户端与运维都去查上游。
+		if ok := kongApplyWSTicketDenyClose(c, failoverErr, &intendedStatus, &errorType, &errorCode, &message, &closeStatus); ok {
+			service.MarkOpsStreamFailure(c, errorType, errorCode, message, intendedStatus)
+			closeOpenAIClientWS(conn, closeStatus, message)
+			return
 		}
 		if failoverErr.Stage == service.GatewayFailureStageAccountAuth {
 			intendedStatus = http.StatusServiceUnavailable

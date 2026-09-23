@@ -188,7 +188,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	isCodexCLI := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator")) || (s.cfg != nil && s.cfg.Gateway.ForceCodexCLI)
 
 	type openAIWSClientPayload struct {
-		payloadRaw               []byte
+		payloadRaw []byte
+		// [kong] 本轮准入记下的特征记录器。**逐轮一个**：一次会话每轮各有自己的票，
+		// 用连接级的变量会把上一轮的特征算到这一轮的用量行上。
+		kongFeatures             *KongFeatureRecorder
 		accountIdentitySourceRaw []byte
 		rawForHash               []byte
 		promptCacheKey           string
@@ -228,6 +231,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return rebuilt, nil
 	}
 
+	// [kong] codex 票据：本轮的票据上下文。注入在 parseClientPayload 里写入，交付判定在
+	// writeClientMessage 里读取。
+	//
+	// 这里用普通指针是因为本路径**串行**：读客户端帧、转发、排空上游事件都在同一个 goroutine
+	// 里顺序发生，不存在下一轮的写与本轮的读并发。passthrough 那条是双向 relay 两个 goroutine，
+	// 同样的变量在那边必须是 atomic。
+	var kongTurnAttempt *KongUpstreamAttempt
+	// kongReleasedTurnIDs 记下已经释放过的响应 id，挡住迟到或重复的旧轮终端事件。
+	kongReleasedTurnIDs := make(map[string]bool, 4)
+
 	parseClientPayload := func(turn int, raw []byte) (openAIWSClientPayload, error) {
 		trimmed := bytes.TrimSpace(raw)
 		if len(trimmed) == 0 {
@@ -235,6 +248,20 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		if !gjson.ValidBytes(trimmed) {
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", errors.New("invalid json"))
+		}
+		// [kong] codex 票据：歧义帧在读 `type` / `model` 之前挡住。下面全程按 gjson 的首键语义
+		// 解读并用 sjson 改写（改的也是首处），重复键会让上游读到另一个值。
+		if ticketErr := s.kongTicket.GuardWSFrame(account, trimmed); ticketErr != nil {
+			// 首轮走统一包装（歧义是请求级原因，不会换号但要拿到同一套身份与归因）；后续轮次会话
+			// 已建立，仍按策略关闭。
+			if turn == 1 {
+				return openAIWSClientPayload{}, wrapOpenAIWSFirstTurnKongTicketError(c, ticketErr)
+			}
+			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"codex ticket unavailable for this model",
+				ticketErr,
+			)
 		}
 
 		values := gjson.GetManyBytes(trimmed, "type", "model", "prompt_cache_key", "previous_response_id")
@@ -397,9 +424,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			normalized = next
 		}
 		SetOpsUpstreamModel(c, upstreamModel)
-		// 帧内也是上行载体：客户端把别的账号铸造的 blob 放在 client_metadata 里同样能发到上游
-		// （见 stripForeignOpenAIWSFrameTurnState）。
-		if stripped, _, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, normalized); stripErr != nil {
+		// 帧内也是上行载体：客户端把别的账号铸造的 blob 放在 client_metadata 里同样能发到上游，
+		// 而票据逻辑在非门控 / off / observe 下会原样保留该字段（见 stripForeignOpenAIWSFrameTurnState）。
+		strippedClientState := ""
+		if stripped, strippedState, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, normalized); stripErr != nil {
 			// 载体有歧义且含已知异账号的 blob：不替上游猜解析语义，按策略关连接。
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
 				coderws.StatusPolicyViolation,
@@ -408,6 +436,43 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		} else {
 			normalized = stripped
+			strippedClientState = strippedState
+		}
+		var turnKongFeatures *KongFeatureRecorder
+		// [kong] codex 票据：把票写进本帧的 client_metadata。
+		//
+		// WS 上票不是头而是 payload 字段，且逐轮上送（口径见 kong_ticket_gateway.go 的 WS 段）。
+		// 放在每一帧的模型解析之后，会话中途用 response.create 换成门控模型同样受保护。
+		if next, attempt, err := s.kongTicket.PrepareWSTurn(ctx, account, upstreamModel, normalized); err != nil {
+			// 首轮的账号级拒服可以换号：这一次 parseClientPayload 发生在取上游连接与首帧上送之前，
+			// 客户端也还没收到任何字节（理由与落点见 wrapOpenAIWSFirstTurnKongTicketError）。
+			// 后续轮次会话已建立，换号会丢掉活在那条上游连接里的上下文，仍按策略关闭连接。
+			if turn == 1 {
+				return openAIWSClientPayload{}, wrapOpenAIWSFirstTurnKongTicketError(c, err)
+			}
+			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"codex ticket unavailable for this model",
+				err,
+			)
+		} else {
+			// 剥离发生在准入之前，准入因此看不到客户端自带那份；补回来，否则那条用量行会丢掉
+			// "客户端手里是什么档"，或被连接级的旧头顶替成错误来源。
+			attempt.RecordStrippedClientStateOnFeatures(strippedClientState)
+			if handoffErr := s.kongTicket.GuardWSTurnHandoff(kongTurnAttempt, attempt); handoffErr != nil {
+				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
+					coderws.StatusPolicyViolation,
+					"codex ticket unavailable for this model",
+					handoffErr,
+				)
+			}
+			normalized = next
+			kongWSInheritRetired(kongTurnAttempt, attempt)
+			kongTurnAttempt = attempt
+			// 功能未启用或判不出模型时 attempt 为 nil，此时没有特征。
+			if attempt != nil {
+				turnKongFeatures = attempt.Features
+			}
 		}
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
 			if stripped, changed, stripErr := stripOpenAIImageGenerationToolsFromRawPayload(normalized); stripErr != nil {
@@ -482,6 +547,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 		return openAIWSClientPayload{
 			payloadRaw:               normalized,
+			kongFeatures:             turnKongFeatures,
 			accountIdentitySourceRaw: accountIdentitySourceRaw,
 			rawForHash:               trimmed,
 			promptCacheKey:           promptCacheKey,
@@ -496,6 +562,26 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	writeClientMessage := func(message []byte) error {
+		// [kong] codex 票据的交付边界：response.metadata 带回 state 说明上游没接受本轮注入，
+		// 这一轮的输出不受合格票保障，必须在任何内容分片离开之前停下。该事件在 turn start 就到，
+		// 所以此处拦住即「零业务正文交付」。
+		if err := s.kongTicket.GuardWSDownstream(ctx, account, kongTurnAttempt, message); err != nil {
+			// 映射成明确的策略关闭（1008 + 原因）。裸返回会落到上层通用的
+			// 1011「upstream websocket proxy failed」——那是上游故障的说法，而这是本机的决定。
+			return wrapOpenAIWSKongTicketError(err)
+		}
+		// 票据上下文的释放只认正面归属（口径见 kongWSTurnEventAction）。本路径串行，直接改指针。
+		if eventType, _, _ := parseOpenAIWSEventEnvelope(message); kongTurnAttempt != nil {
+			responseID := kongWSResponseIDOf(message)
+			switch kongWSTurnEventAction(kongTurnAttempt, eventType, responseID, kongReleasedTurnIDs) {
+			case kongWSTurnBind:
+				kongTurnAttempt.ResponseID = responseID
+			case kongWSTurnClear:
+				kongWSMarkReleased(kongReleasedTurnIDs, kongTurnAttempt, responseID)
+				kongTurnAttempt = nil
+			case kongWSTurnKeep:
+			}
+		}
 		writeCtx, cancel := newOpenAIWSDownstreamWriteContext(ctx, hooks, s.openAIWSWriteTimeout())
 		defer cancel()
 		message = restoreCodexToolNamesFromContext(c, message)
@@ -977,13 +1063,37 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	var rejectedFieldRetryState *openAIResponsesRejectedFieldRetryState
-	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
+	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string, kongFeatures *KongFeatureRecorder) (*OpenAIForwardResult, error) {
 		responseModelObserver := &upstreamResponseModelObserver{}
 		if lease == nil {
 			return nil, errors.New("upstream websocket lease is nil")
 		}
 		turnStart := time.Now()
 		wroteDownstream := false
+		mappedModel := ""
+		needModelReplace := false
+		var mappedModelBytes []byte
+		if originalModel != "" {
+			mappedModel = strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+			if mappedModel == "" {
+				mappedModel = normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel))
+			}
+			needModelReplace = mappedModel != "" && mappedModel != originalModel
+			if needModelReplace {
+				mappedModelBytes = []byte(mappedModel)
+			}
+		}
+		// [kong] 上游在握手响应里给的那张票也要收（见 ObserveHandshakeState）。
+		//
+		// 位置有三个约束：连接已握手（拿到 lease 之后）、上游模型已定（所以先算 mappedModel）、
+		// **早于首帧上送**——首帧写失败会直接返回，挂在它后面等于让免费样本取决于本轮业务是否成功。
+		// 一条物理连接只收一次，而"该不该消费"必须先判门控：非门控轮把票消费掉又不入库，同一条
+		// 连接后续的门控轮就再也收不到了（见 ShouldObserveHandshakeState）。
+		if s.kongTicket.ShouldObserveHandshakeState(mappedModel) {
+			if handshakeState := lease.ConsumeHandshakeTurnState(); handshakeState != "" {
+				s.kongTicket.ObserveHandshakeState(ctx, account, mappedModel, handshakeState)
+			}
+		}
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
 			return nil, wrapOpenAIWSIngressTurnError(
 				"write_upstream",
@@ -1017,20 +1127,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		replayCollector := &openAIWSToolCallReplayCollector{}
 		firstEventType := ""
 		lastEventType := ""
-		needModelReplace := false
 		clientDisconnected := false
-		mappedModel := ""
-		var mappedModelBytes []byte
-		if originalModel != "" {
-			mappedModel = strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-			if mappedModel == "" {
-				mappedModel = normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel))
-			}
-			needModelReplace = mappedModel != "" && mappedModel != originalModel
-			if needModelReplace {
-				mappedModelBytes = []byte(mappedModel)
-			}
-		}
 		for {
 			upstreamMessage, readErr := lease.ReadMessageWithContextTimeout(ctx, s.openAIWSReadTimeout())
 			if readErr != nil {
@@ -1182,6 +1279,14 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			imageCounter.AddSSEData(upstreamMessage)
 
+			if clientDisconnected {
+				// [kong] 客户端断连后整块写路径都跳过，连带跳掉了挂在 writeClientMessage 里的收票与
+				// 特征记录（见 GuardWSDownstream）。但上游照样在发 response.metadata，用量行也照样
+				// 结算——那条用量行就会缺掉它唯一的降智证据，票也白丢一次免费样本。这里补上"只收票
+				// 不判定"的那一半：断连之后没有业务输出会送出去，交付判定无从谈起，也不该凭空产出
+				// 一条拒服错误。
+				s.kongTicket.ObserveWSDownstream(ctx, account, kongTurnAttempt, upstreamMessage)
+			}
 			if !clientDisconnected {
 				if needModelReplace && len(mappedModelBytes) > 0 && openAIWSEventMayContainModel(eventType) && bytes.Contains(upstreamMessage, mappedModelBytes) {
 					upstreamMessage = replaceOpenAIWSMessageModel(upstreamMessage, mappedModel, originalModel)
@@ -1261,6 +1366,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					)
 				}
 				imageCount := imageCounter.Count()
+				// [kong] ctx_pool 的 state 是连接级的：客户端放在 upgrade 请求头，本服务放进与上游
+				// 那条连接的握手头，帧内没有它。所以快照之前要从连接级补两项——
+				// 出站那份只认**这条连接握手时真正发出去的**值（复用连接时客户端本次带来的那个一个
+				// 字节都没上送），客户端那份取客户端自己的请求头（详见两个 Record* 的说明）。
+				kongFeatures.RecordOutboundIfAbsent(lease.SentHandshakeTurnState())
+				kongFeatures.RecordClientStateIfAbsent(strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader)))
 				result := &OpenAIForwardResult{
 					RequestID:                     responseID,
 					Usage:                         usage,
@@ -1280,6 +1391,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					ResponseHeadersFromWSHandshake: true,
 					Duration:                       time.Since(turnStart),
 					FirstTokenMs:                   firstTokenMs,
+					// [kong] 请求特征：本轮准入记下的那份（含上游回发的 state，由 GuardWSDownstream 补记）。
+					KongRequestFeatures: kongFeatures.Snapshot(),
 				}
 				if replayInput := replayCollector.Items(); len(replayInput) > 0 {
 					result.wsReplayInput = replayInput
@@ -1298,6 +1411,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	currentPayload := firstPayload.payloadRaw
+	currentKongFeatures := firstPayload.kongFeatures
 	currentOriginalModel := firstPayload.originalModel
 	currentImageBillingModel := firstPayload.imageBillingModel
 	currentImageSizeTier := firstPayload.imageSizeTier
@@ -1806,7 +1920,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 
-		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
+		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort, currentKongFeatures)
 		if relayErr != nil {
 			lastTurnClean = false
 			if isOpenAIWSSessionPreempted(ctx) {
@@ -1967,6 +2081,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 		}
 		currentPayload = nextPayload.payloadRaw
+		currentKongFeatures = nextPayload.kongFeatures
 		currentOriginalModel = nextPayload.originalModel
 		currentImageBillingModel = nextPayload.imageBillingModel
 		currentImageSizeTier = nextPayload.imageSizeTier
