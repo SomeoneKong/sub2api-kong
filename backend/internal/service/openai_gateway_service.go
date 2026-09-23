@@ -532,6 +532,8 @@ type OpenAIGatewayService struct {
 	kongSessionLimit *kongSessionLimit
 	// [kong] 请求存活续期（持有以便退出时停止，setter 在 kong_request_liveness.go）。nil 即不启用。
 	kongLiveness *KongRequestLiveness
+	// [kong] Codex 目录的版本存档（可选依赖，setter 在 kong_codex_catalog.go）。nil 即不启用。
+	kongCodexCatalog *KongCodexCatalog
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService
