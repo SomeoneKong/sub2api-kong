@@ -53,7 +53,7 @@ func EvaluateAccountSchedulingThreshold(account *Account, thresholds map[string]
 	var winner *accountSchedulingThresholdCandidate
 	switch decision.Platform {
 	case PlatformOpenAI:
-		winner = pickLatestResetSchedulingCandidate(openAIThresholdCandidates(account, now), threshold, now)
+		winner = pickLatestResetSchedulingCandidate(kongPlanDrop7dCandidates(account, openAIThresholdCandidates(account, now), now), threshold, now) // [kong] credits 层去掉 7d 候选
 	case PlatformAnthropic:
 		winner = pickLatestResetSchedulingCandidate(anthropicThresholdCandidates(account), threshold, now)
 	case PlatformGrok:
