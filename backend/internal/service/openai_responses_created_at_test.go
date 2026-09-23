@@ -263,7 +263,7 @@ func TestProxyOpenAIWSHTTPBridgeTurn_GrokStampsMissingCreatedAt(t *testing.T) {
 
 	result, err := svc.proxyOpenAIWSHTTPBridgeTurn(
 		context.Background(), c, account, "access-token", payload, len(payload),
-		"grok-4.5", "", "", "", "", 1,
+		"grok-4.5", "", "", "", "", 1, "",
 		func(message []byte) error {
 			events = append(events, append([]byte(nil), message...))
 			return nil
@@ -292,7 +292,7 @@ func TestProxyOpenAIWSHTTPBridgeTurn_BareErrorSynthesizedFailedCarriesCreatedAt(
 	payload := []byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`)
 	var writes [][]byte
 
-	_, err := svc.proxyOpenAIWSHTTPBridgeTurn(context.Background(), c, account, "sk-test", payload, len(payload), "gpt-5", "", "", "", "", 2, func(message []byte) error {
+	_, err := svc.proxyOpenAIWSHTTPBridgeTurn(context.Background(), c, account, "sk-test", payload, len(payload), "gpt-5", "", "", "", "", 2, "", func(message []byte) error {
 		writes = append(writes, append([]byte(nil), message...))
 		return nil
 	})
