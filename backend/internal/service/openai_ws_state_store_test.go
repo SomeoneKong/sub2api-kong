@@ -64,18 +64,35 @@ func TestOpenAIWSStateStore_ResponseConnTTL(t *testing.T) {
 
 func TestOpenAIWSStateStore_SessionTurnStateTTL(t *testing.T) {
 	store := NewOpenAIWSStateStore(nil)
-	store.BindSessionTurnState(9, "session_hash_1", "turn_state_1", 30*time.Millisecond)
+	store.BindSessionTurnState(9, 5, "session_hash_1", "turn_state_1", 30*time.Millisecond)
 
-	state, ok := store.GetSessionTurnState(9, "session_hash_1")
+	state, ok := store.GetSessionTurnState(9, 5, "session_hash_1")
 	require.True(t, ok)
 	require.Equal(t, "turn_state_1", state)
 
 	// group 隔离
-	_, ok = store.GetSessionTurnState(10, "session_hash_1")
+	_, ok = store.GetSessionTurnState(10, 5, "session_hash_1")
 	require.False(t, ok)
 
+	// 账号隔离：turn-state 是 (账号, 会话) 绑定的凭据。failover 换号之后读到上一个账号铸造的那个，
+	// 就会把它发到新账号的上游连接上——跨账号回放。换号即视为未命中，新账号从上游重新要一个。
+	_, ok = store.GetSessionTurnState(9, 6, "session_hash_1")
+	require.False(t, ok, "别的账号铸造的 turn state 不得被读出来")
+
+	// 换号后重新绑定：这条会话此后归新账号，旧账号再读同样不该命中。
+	store.BindSessionTurnState(9, 6, "session_hash_1", "turn_state_2", 30*time.Millisecond)
+	state, ok = store.GetSessionTurnState(9, 6, "session_hash_1")
+	require.True(t, ok)
+	require.Equal(t, "turn_state_2", state)
+	_, ok = store.GetSessionTurnState(9, 5, "session_hash_1")
+	require.False(t, ok)
+
+	// 恢复成账号 5 持有，好让后面的过期断言读的是**同一个账号**——否则过期那条断言会被账号不匹配
+	// 提前满足，取消过期判据它照样通过。
+	store.BindSessionTurnState(9, 5, "session_hash_1", "turn_state_1", 30*time.Millisecond)
+
 	time.Sleep(60 * time.Millisecond)
-	_, ok = store.GetSessionTurnState(9, "session_hash_1")
+	_, ok = store.GetSessionTurnState(9, 5, "session_hash_1")
 	require.False(t, ok)
 }
 
