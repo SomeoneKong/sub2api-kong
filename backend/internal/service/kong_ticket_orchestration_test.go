@@ -1,0 +1,513 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// 编排层的缺陷形态几乎都是「不报错、只是一直拿不到合格票」，所以这些不变量只能靠测试锁住。
+
+// kongStubUpstream 是可编程的上游替身。
+type kongStubUpstream struct {
+	mu sync.Mutex
+
+	proxyState KongTicketProxyState
+	proxyErr   error
+
+	fetchState string
+	fetchErr   error
+	fetchCalls int
+	// 按模型覆盖取票结果，键是模型名；空表示按上面的全局值走。
+	fetchStateFor map[string]string
+	fetchErrFor   map[string]error
+	// fetchHook 在取票时被调用，用于构造并发时序。
+	fetchHook func()
+	// credHook 模拟凭据准备阶段（在 SentAt 之前），用来验证那一段不进取票耗时。
+	credHook func()
+	// beforeChallenge 在每份挑战发出前调用，用来在验证途中改掉前提。
+	beforeChallenge func()
+	// echoState 非空时每份挑战都回显一张票（上游未接受注入）。echoErr 让回票的同时带回一个读流错误
+	// （真实读取层在 2xx 之后断流就是这样返回的）；echoStatus 是回票响应的状态码，0 按 200 算。
+	echoState  string
+	echoErr    error
+	echoStatus int
+
+	// answers 按调用顺序返回；用尽后重复最后一个。
+	answers []*KongUpstreamAnswer
+	// fusedCalls 记有多少次取票带了融合挑战；fusedText 是取票请求要回的正文（空表示不给答案，
+	// 用来构造"融合开着但上游没给正文"这种局面）。
+	fusedCalls int
+	fusedText  string
+	// fusedReadErr 非空时模拟"票拿到了、但正文读失败"（提前 EOF / SSE 错误）。
+	fusedReadErr string
+	// reportedModel / fusedReportedModel 是上游在响应里回报的 model（stg0 的输入）。
+	//
+	// 两者分开：融合样本来自取票请求（**无票状态**），常规挑战带着票发出，两条路径的 stg0 语义相反
+	// ——一个不该判死票、一个该判死。用同一个字段就测不出这个区别。
+	//
+	// 空串表示上游没给这个字段，stg0 判 unknown。默认就是空，所以既有用例不受影响。
+	reportedModel      string
+	fusedReportedModel string
+	// partialAnswerErr 模拟真实读取层的行为：**返回已读到的 answer 连同一个错误**（提前 EOF、坏
+	// JSON、response.failed 都是这样）。
+	//
+	// answerErr / answerErrFor 返回 (nil, err)，覆盖不到"model 已声明、正文才断"这条路径——而那正是
+	// 绕过 stg0 的方式。两者必须都有。
+	partialAnswerErr error
+	// answerErrFor 按调用序号（从 0 起）覆盖挑战结果，用来构造"一份有效 + 两份失败"这种局面。
+	answerErrFor  map[int]error
+	answerErr     error
+	challengeCall int
+}
+
+func (u *kongStubUpstream) ResolveProxyURL(_ context.Context, proxyID *int64) (string, error) {
+	if proxyID == nil {
+		return "", nil
+	}
+	return fmt.Sprintf("http://proxy-%d", *proxyID), nil
+}
+
+func (u *kongStubUpstream) ProxyState(_ context.Context, _ *int64) (KongTicketProxyState, error) {
+	return u.proxyState, u.proxyErr
+}
+
+func (u *kongStubUpstream) FetchTurnState(_ context.Context, _ *Account, _, model string,
+	fused *KongFingerprintChallenge,
+) (*KongUpstreamProbe, error) {
+	u.mu.Lock()
+	u.fetchCalls++
+	hook := u.fetchHook
+	credHook := u.credHook
+	// 按模型覆盖：批量取票要能构造「触发模型成功、另一个模型失败」这种局面。
+	modelErr, hasModelErr := u.fetchErrFor[model]
+	modelState, hasModelState := u.fetchStateFor[model]
+	if fused != nil {
+		u.fusedCalls++
+	}
+	u.mu.Unlock()
+	// 顺序与生产实现一致：凭据准备（buildCodexRequest → GetAccessToken，可能读缓存或同步刷新
+	// OAuth）在前，之后才把请求交给传输层。SentAt 取在两者之间，所以凭据那段不计入耗时。
+	if credHook != nil {
+		credHook()
+	}
+	sentAt := time.Now()
+	if hook != nil {
+		hook()
+	}
+	if hasModelErr {
+		return &KongUpstreamProbe{StatusCode: 500, SentAt: sentAt}, modelErr
+	}
+	if u.fetchErr != nil {
+		return &KongUpstreamProbe{StatusCode: 500, SentAt: sentAt}, u.fetchErr
+	}
+	state := u.fetchState
+	if hasModelState {
+		state = modelState
+	}
+	probe := &KongUpstreamProbe{State: state, StatusCode: 200, SentAt: sentAt}
+	// 生产侧在融合时把正文读回来当第一份样本。桩照做，否则融合路径在测试里根本走不到。
+	//
+	// **FusedAttempted 必须照生产设**：它表示"发起过融合"，与是否读到答案分开。下游用它判断要不要
+	// 留处置记录——桩不设的话，"读正文失败"那条路径在测试里等于不存在。
+	if fused != nil {
+		u.mu.Lock()
+		text := u.fusedText
+		readErr := u.fusedReadErr
+		u.mu.Unlock()
+		probe.FusedAttempted = true
+		switch {
+		case readErr != "":
+			probe.FusedReadErr = readErr
+			// 生产侧读失败时回报值**照样带回来**（`response.created` 在流首就到了）。桩不设它，
+			// "断流但上游已经声明了别的模型"这条路径在测试里就等于不存在。
+			probe.FusedReportedModel = u.fusedReportedModel
+		case text != "":
+			probe.Answer = &KongUpstreamAnswer{
+				Text: text, EchoedState: state, StatusCode: 200,
+				LatencyMs: 28000, OutputTokens: kongIntPtr(1200),
+				ReportedModel: u.fusedReportedModel,
+			}
+		default:
+			probe.FusedReadErr = "桩未提供融合正文"
+		}
+	}
+	return probe, nil
+}
+
+func (u *kongStubUpstream) RunChallenge(_ context.Context, _ *Account, _, _ string, _ KongFingerprintChallenge, _ string) (*KongUpstreamAnswer, error) {
+	u.mu.Lock()
+	hook := u.beforeChallenge
+	u.mu.Unlock()
+	// 挑战发出之后、判定之前的钩子：用来把"前提在挑战期间变了"这件事精确插进去。
+	if hook != nil {
+		hook()
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	idx := u.challengeCall
+	u.challengeCall++
+	// echoState 非空 = 上游又下发了票，即本次注入没被接受。
+	if u.echoState != "" {
+		status := u.echoStatus
+		if status == 0 {
+			status = 200
+		}
+		return &KongUpstreamAnswer{Text: "1,2,3", EchoedState: u.echoState, ReportedModel: u.reportedModel, StatusCode: status}, u.echoErr
+	}
+	if err, ok := u.answerErrFor[idx]; ok {
+		return nil, err
+	}
+	if u.answerErr != nil {
+		return nil, u.answerErr
+	}
+	if len(u.answers) == 0 {
+		return &KongUpstreamAnswer{Text: "1,2,3", ReportedModel: u.reportedModel}, nil
+	}
+	if idx >= len(u.answers) {
+		idx = len(u.answers) - 1
+	}
+	// **复制再改**：kongVerifyAnswers() 把同一个指针放进三个槽位，直接写字段会跨份互相污染。
+	answer := *u.answers[idx]
+	answer.ReportedModel = u.reportedModel
+	if u.partialAnswerErr != nil {
+		// 正文残缺但 model 已经拿到：真实读取层就是这样返回的。
+		answer.Text = ""
+		return &answer, u.partialAnswerErr
+	}
+	return &answer, nil
+}
+
+// kongStubAccounts 是账号装载替身，支持在验证中途改变账号。
+type kongStubAccounts struct {
+	mu       sync.Mutex
+	accounts map[int64]*Account
+}
+
+func (a *kongStubAccounts) GetByID(_ context.Context, id int64) (*Account, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.accounts[id], nil
+}
+
+func (a *kongStubAccounts) set(account *Account) {
+	a.mu.Lock()
+	a.accounts[account.ID] = account
+	a.mu.Unlock()
+}
+
+func kongTestAccount(id int64, mode KongTicketMode, egress KongTicketEgress) *Account {
+	return &Account{
+		ID:          id,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		ProxyID:     nil,
+		Extra: map[string]any{
+			KongTicketModeKey:   string(mode),
+			KongTicketEgressKey: string(egress),
+		},
+	}
+}
+
+func kongTestService(t *testing.T, repo *kongStubRepo, up *kongStubUpstream, accounts *kongStubAccounts) *KongTicketService {
+	t.Helper()
+	bank, err := KongFingerprintBankLoad()
+	if err != nil {
+		t.Fatalf("加载校准资料: %v", err)
+	}
+	params := KongDefaultTicketParams()
+	// 默认关掉批量取票与融合取票：绝大多数用例只关心单模型、单挑战路径，开着会让它们凭空多发
+	// 几次取票、或把取票响应也当成一份样本。两者各自的用例显式打开。
+	return NewKongTicketService(repo, up, accounts, bank, params,
+		[]string{"gpt-6-astra"}, false, false,
+		KongTicketAccept{"gpt-6-astra": []string{"gpt-6-astra"}}, KongStg0Accept{}, 0.9)
+}
+
+// 两个账号共用同一个票据出口时不得并发取票：每次取票都是该出口上的一次活动，并发会互相把
+// 静默清零，最后谁也拿不到合格票。只按账号串行拦不住这种情况。
+func TestKongSharedEgressSerializesFetch(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	// 两个账号都配 direct 出口，业务流量走各自的代理（避免 both_direct 判不可用）。
+	for _, id := range []int64{1, 2} {
+		account := kongTestAccount(id, KongTicketModeFull, KongTicketEgressDirect)
+		proxyID := id + 100
+		account.ProxyID = &proxyID
+		accounts.set(account)
+	}
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		fetchState: strings.Repeat("a", 292),
+		fetchHook: func() {
+			entered <- struct{}{}
+			<-release
+		},
+	}
+	svc := kongTestService(t, repo, up, accounts)
+
+	var wg sync.WaitGroup
+	for _, id := range []int64{1, 2} {
+		wg.Add(1)
+		go func(accountID int64) {
+			defer wg.Done()
+			_, _ = svc.EnsureTicket(context.Background(), accountID, "gpt-6-astra")
+		}(id)
+	}
+
+	// 第一个任务进入取票后卡住；此时第二个账号必须拿不到取票资格。
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("第一个取票任务没能启动")
+	}
+	select {
+	case <-entered:
+		close(release)
+		wg.Wait()
+		t.Fatal("两个账号在同一个票据出口上并发取票了——静默会被互相清零")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	wg.Wait()
+
+	if up.fetchCalls != 1 {
+		t.Errorf("同一出口上发生了 %d 次取票，应当只有 1 次", up.fetchCalls)
+	}
+}
+
+// observed 候选验证失败不得推进 F（冷却起点）：它应当立即升级为主动取票，把这种失败算进冷却
+// 会让升级白等一个冷却期。
+func TestKongObservedFailureDoesNotEnterCooldown(t *testing.T) {
+	cases := []struct {
+		source       string
+		wantCooldown int
+	}{
+		{KongTicketSourceObserved, 0},
+		{KongTicketSourceFetch, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.source, func(t *testing.T) {
+			repo := newKongStubRepo()
+			accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+			account := kongTestAccount(1, KongTicketModeFull, KongTicketEgressDirect)
+			proxyID := int64(100)
+			account.ProxyID = &proxyID
+			accounts.set(account)
+			// 三份回答都只有三个数字：数字个数不足，归因给不出结论。
+			up := &kongStubUpstream{
+				proxyState: KongTicketProxyState{Exists: true},
+				answers:    []*KongUpstreamAnswer{{Text: "1,2,3"}},
+			}
+			svc := kongTestService(t, repo, up, accounts)
+
+			cfg, _ := ParseKongTicketConfig(account.Extra)
+			_, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
+				7, strings.Repeat("a", 292), c.source, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
+			if err == nil {
+				t.Fatal("数字不足时不该判为合格")
+			}
+			if got := repo.countEvents(KongEventCooldown); got != c.wantCooldown {
+				t.Errorf("%s 来源产生了 %d 条 cooldown，应为 %d", c.source, got, c.wantCooldown)
+			}
+		})
+	}
+}
+
+// 数字个数不足时，原始数字序列仍然必须落库：那是这次观测唯一的证据，事后补不回来。
+func TestKongProbesKeepDigitsWhenAttributionFails(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	account := kongTestAccount(1, KongTicketModeFull, KongTicketEgressDirect)
+	proxyID := int64(100)
+	account.ProxyID = &proxyID
+	accounts.set(account)
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		answers:    []*KongUpstreamAnswer{{Text: "[11, 22, 33]"}},
+	}
+	svc := kongTestService(t, repo, up, accounts)
+
+	cfg, _ := ParseKongTicketConfig(account.Extra)
+	_, _ = svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
+		7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
+
+	if len(repo.probes) == 0 {
+		t.Fatal("没有任何探测记录落库")
+	}
+	for _, probe := range repo.probes {
+		if len(probe.Digits) != 3 || probe.DigitCount != 3 {
+			t.Errorf("第 %d 份的原始数字没有保存：Digits=%v DigitCount=%d",
+				probe.PartIndex, probe.Digits, probe.DigitCount)
+		}
+		if probe.InvalidReason == nil || *probe.InvalidReason != KongProbeInsufficientDigits {
+			t.Errorf("第 %d 份应当标为数字不足，实际 %v", probe.PartIndex, probe.InvalidReason)
+		}
+		if probe.VerificationID == "" {
+			t.Errorf("第 %d 份没有验证 ID，无法与事件对上", probe.PartIndex)
+		}
+	}
+}
+
+// 验证期间账号被禁用、模式被切走或出口被改，结论一律不得落库——那是「当时成立、现在不成立」
+// 的判定，写进去等于凭它放行后续请求。
+func TestKongVerifyRejectsStaleConclusion(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(a *Account)
+	}{
+		{"账号被禁用", func(a *Account) { a.Schedulable = false }},
+		{"模式被切走", func(a *Account) { a.Extra[KongTicketModeKey] = string(KongTicketModeOff) }},
+		{"票据出口被改", func(a *Account) { a.Extra[KongTicketEgressKey] = string(KongTicketEgressNone) }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			repo := newKongStubRepo()
+			accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+			account := kongTestAccount(1, KongTicketModeFull, KongTicketEgressDirect)
+			proxyID := int64(100)
+			account.ProxyID = &proxyID
+			accounts.set(account)
+
+			up := &kongStubUpstream{proxyState: KongTicketProxyState{Exists: true}}
+			svc := kongTestService(t, repo, up, accounts)
+			cfg, _ := ParseKongTicketConfig(account.Extra)
+
+			// 第一次复核通过，之后立刻改变前提。
+			changed := &Account{}
+			*changed = *account
+			changed.Extra = map[string]any{}
+			for k, v := range account.Extra {
+				changed.Extra[k] = v
+			}
+			c.mutate(changed)
+			up.fetchHook = nil
+			accounts.set(changed)
+
+			_, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
+				7, strings.Repeat("a", 292), KongTicketSourceObserved, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
+			if err == nil {
+				t.Fatal("前提已失效，不该给出有效结论")
+			}
+			if len(repo.statusSets) != 0 {
+				t.Errorf("前提失效后仍然改写了票状态: %+v", repo.statusSets)
+			}
+		})
+	}
+}
+
+// 票在验证期间被撤销或跳过时，SetTicketStatus 不会更新——那个返回值必须被检查，否则会凭一个
+// 过时的结论把票重新当成可用。
+func TestKongVerifyHonorsStatusUpdateResult(t *testing.T) {
+	repo := newKongStubRepo()
+	notUpdated := false
+	repo.setStatusOK = &notUpdated
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	account := kongTestAccount(1, KongTicketModeFull, KongTicketEgressDirect)
+	proxyID := int64(100)
+	account.ProxyID = &proxyID
+	accounts.set(account)
+
+	// 用足量数字让归因得出结论，走到落库那一步。
+	digits := make([]string, 0, 260)
+	for i := 0; i < 260; i++ {
+		digits = append(digits, fmt.Sprintf("%d", (i*37)%355+1))
+	}
+	answer := &KongUpstreamAnswer{Text: "[" + strings.Join(digits, ",") + "]"}
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		answers:    []*KongUpstreamAnswer{answer, answer, answer},
+	}
+	svc := kongTestService(t, repo, up, accounts)
+	cfg, _ := ParseKongTicketConfig(account.Extra)
+
+	id, err := svc.verifyTicket(context.Background(), account, cfg, "gpt-6-astra",
+		7, strings.Repeat("a", 292), KongTicketSourceFetch, time.Now().Add(time.Hour), nil, time.Now(), false, nil)
+	if err == nil || id != 0 {
+		t.Fatalf("状态未更新时不该授予资格，得到 id=%d err=%v", id, err)
+	}
+}
+
+// 入库边界不看票的长度：上游 state 是不透明 token，长度不代表档位，按长度拒收会在碰巧撞上时把合格票
+// 挡掉。任何非空的票都入库，档位交给指纹验证。
+func TestKongStoreTicketIgnoresLength(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	svc := kongTestService(t, repo, &kongStubUpstream{}, accounts)
+
+	for _, n := range []int{1, 292, 312, 780} {
+		if _, _, _, err := svc.storeTicket(context.Background(), 1, "gpt-6-astra", strings.Repeat("a", n), KongTicketSourceObserved, nil); err != nil {
+			t.Errorf("长度 %d 的票应当入库: %v", n, err)
+		}
+	}
+	if len(repo.inserted) != 4 {
+		t.Errorf("四张不同长度的票都该入库，实际插入 %d 条", len(repo.inserted))
+	}
+	if _, _, _, err := svc.storeTicket(context.Background(), 1, "gpt-6-astra", "", KongTicketSourceObserved, nil); err == nil {
+		t.Error("空票不该入库")
+	}
+}
+
+// 事件写失败时，出口活动必须仍然被记住：那次网络请求已经发出，静默确实被清零了。只信库里的
+// 值会让下一个请求立刻再取一次票。
+func TestKongEgressActivitySurvivesEventWriteFailure(t *testing.T) {
+	repo := newKongStubRepo()
+	repo.insertEventErr = fmt.Errorf("事件表写不进去")
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	account := kongTestAccount(1, KongTicketModeFull, KongTicketEgressDirect)
+	proxyID := int64(100)
+	account.ProxyID = &proxyID
+	accounts.set(account)
+	up := &kongStubUpstream{
+		proxyState: KongTicketProxyState{Exists: true},
+		fetchErr:   fmt.Errorf("取票失败"),
+	}
+	svc := kongTestService(t, repo, up, accounts)
+	cfg, _ := ParseKongTicketConfig(account.Extra)
+
+	_, _ = svc.fetchAndVerify(context.Background(), account, cfg, "gpt-6-astra", time.Now())
+
+	in, err := svc.buildScheduleInput(context.Background(), account, cfg, "gpt-6-astra", time.Now(), false)
+	if err != nil {
+		t.Fatalf("构造调度输入: %v", err)
+	}
+	if in.LastEgressUsed == nil {
+		t.Error("事件写失败后出口活动丢失了——下一个请求会以为出口仍然静默，立刻再取一次票")
+	}
+}
+
+// 同一张票重复出现不是新信息：不得新增行、不得延长期限、不得解除候选跳过标记。
+func TestKongStoreTicketDeduplicates(t *testing.T) {
+	repo := newKongStubRepo()
+	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
+	svc := kongTestService(t, repo, &kongStubUpstream{}, accounts)
+	state := strings.Repeat("a", 292)
+
+	firstID, firstExpiry, inserted, err := svc.storeTicket(context.Background(), 1, "gpt-6-astra", state, KongTicketSourceObserved, nil)
+	if err != nil || !inserted {
+		t.Fatalf("第一次应当入库: inserted=%v err=%v", inserted, err)
+	}
+	secondID, secondExpiry, inserted, err := svc.storeTicket(context.Background(), 1, "gpt-6-astra", state, KongTicketSourceObserved, nil)
+	if err != nil {
+		t.Fatalf("重复票不该报错: %v", err)
+	}
+	if inserted {
+		t.Error("重复票被当成新票——它会凭空延长寿命、并被当成新信息解除跳过标记")
+	}
+	if secondID != firstID {
+		t.Errorf("重复票应返回既有 id %d，得到 %d", firstID, secondID)
+	}
+	if !secondExpiry.IsZero() {
+		t.Errorf("重复票不该带回新期限，得到 %v（首次 %v）", secondExpiry, firstExpiry)
+	}
+	if len(repo.inserted) != 1 {
+		t.Errorf("库里应只有一行，实际 %d 行", len(repo.inserted))
+	}
+}

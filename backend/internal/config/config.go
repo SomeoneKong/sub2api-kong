@@ -955,6 +955,8 @@ const (
 
 // GatewayConfig API网关相关配置
 type GatewayConfig struct {
+	// KongCodexTicket 是本 fork 的 Codex 票据配置，字段定义在 kong_ticket_config.go。
+	KongCodexTicket KongCodexTicketConfig `mapstructure:"kong_codex_ticket"`
 	// 等待上游响应头的超时时间（秒），0表示无超时
 	// 注意：这不影响流式数据传输，只控制等待响应头的时间
 	ResponseHeaderTimeout int `mapstructure:"response_header_timeout"`
@@ -1824,6 +1826,10 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	trustedProxiesConfigured := viper.InConfig("server.trusted_proxies") ||
 		viper.IsSet("server.trusted_proxies") || trustedProxiesEnvConfigured
 
+	// 必须在 Unmarshal 之前：票据的布尔项若拿到非法值会让整次解码失败、进而终止启动，
+	// 而那是个配置笔误不该有的后果（见 kong_ticket_config.go）。
+	normalizeKongTicketEnv()
+
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config error: %w", err)
@@ -1835,6 +1841,8 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 		cfg.Security.ForwardedClientIPHeaders = normalizeStringSlice(strings.Split(forwardedClientIPHeadersEnv, ","))
 	}
 	cfg.Server.TrustedProxiesConfigured = trustedProxiesConfigured
+	// 票据配置的空值语义要自己兜：viper 的 AutomaticEnv 忽略空环境变量（见 kong_ticket_config.go）。
+	applyKongTicketEnvOverrides(&cfg.Gateway.KongCodexTicket)
 	if cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs == 0 {
 		cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs = 15000
 	}
@@ -2259,6 +2267,13 @@ func setDefaults() {
 	viper.SetDefault("image_storage.access_key_id", "")
 	viper.SetDefault("image_storage.secret_access_key", "")
 	viper.SetDefault("image_storage.public_base_url", "")
+	// 同一个理由（viper 只解码 AllKeys() 里的键）：本 fork 的票据配置没有 config 文件可依，
+	// 现网全靠 GATEWAY_KONG_CODEX_TICKET_* 环境变量，不注册空默认值就永远读不到。
+	viper.SetDefault("gateway.kong_codex_ticket.accept_extra", DefaultKongTicketAcceptExtra)
+	viper.SetDefault("gateway.kong_codex_ticket.stg0_accept", DefaultKongTicketStg0Accept)
+	viper.SetDefault("gateway.kong_codex_ticket.batch_fetch_all_models", DefaultKongTicketBatchFetchAllModels)
+	viper.SetDefault("gateway.kong_codex_ticket.fetch_fused_fingerprint", DefaultKongTicketFetchFusedFingerprint)
+	viper.SetDefault("gateway.kong_codex_ticket.event_retention_days", DefaultKongTicketEventRetentionDays)
 
 	// Ops (vNext)
 	viper.SetDefault("ops.enabled", true)

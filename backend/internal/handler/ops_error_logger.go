@@ -1240,7 +1240,10 @@ func OpsErrorLoggerMiddleware(ops *service.OpsService) gin.HandlerFunc {
 		}
 		applyOpsLatencyFieldsFromContext(c, entry)
 		applyOpsUpstreamFieldsFromContext(c, entry)
-		if parsed.StreamFailure {
+		// [kong] 流内的票据拒服帧是本地写的，不是上游回的：不据它合成上游状态与文案。此前真实尝试的上游
+		// 错误仍由上面的上下文字段保留。
+		_, kongDenyServed := service.KongTicketDenyServedReason(c)
+		if parsed.StreamFailure && !kongDenyServed {
 			if message := strings.TrimSpace(parsed.Message); message != "" {
 				entry.UpstreamErrorMessage = &message
 			}
@@ -2045,7 +2048,12 @@ func inferResponsesFailedOpsErrorType(code string) string {
 	}
 }
 
-func inferStreamFailureStatus(_ *gin.Context, parsed parsedOpsError) int {
+func inferStreamFailureStatus(c *gin.Context, parsed parsedOpsError) int {
+	// [kong] 票据拒服是本地按策略拒绝，逻辑状态与流开始前的呈现一致，固定 503。流内错误帧不带状态码，
+	// 按错误类型推断会让 Messages 那条（`api_error`）落成 502。
+	if _, served := service.KongTicketDenyServedReason(c); served {
+		return http.StatusServiceUnavailable
+	}
 	if parsed.StatusCode >= 400 && parsed.StatusCode <= 599 {
 		return parsed.StatusCode
 	}
@@ -2244,6 +2252,17 @@ func classifyOpsErrorLog(c *gin.Context, errType, message, code string, status i
 	isBusinessLimited = localModelConfiguration || routingCapacityLimited || (clientBusinessLimited && !effectiveUpstreamError) || localBusinessLimited
 	errorOwner = classifyOpsErrorOwner(phase, message)
 	errorSource = classifyOpsErrorSource(phase, message)
+	// [kong] 票据拒服是本系统的路由决定：拿不到合格票，这个池子此刻没有可用账号，**一个字节都没发给
+	// 上游**。按通用分类它会落到 `internal`（owner/source 已经对了，但那个 phase 指向"网关自己有
+	// bug"，照样把排查引向错误方向）。钉成 routing 才是实情——与"无可用账号"同类。
+	//
+	// 判据只认「最终返回的就是票据拒服」这个标记，不认"本请求期间有账号拒过服"：后者在换号后遇到真实
+	// 上游故障时照样在，据它归因就是把上游故障记成本地拒服。
+	if _, served := service.KongTicketDenyServedReason(c); served {
+		phase = "routing"
+		errorOwner = classifyOpsErrorOwner(phase, message)
+		errorSource = classifyOpsErrorSource(phase, message)
+	}
 	return phase, isBusinessLimited, errorOwner, errorSource
 }
 

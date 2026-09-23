@@ -256,6 +256,9 @@ type OpenAIForwardResult struct {
 	// UpstreamEndpoint is the actual upstream API path used for this request.
 	// It avoids guessing when one downstream protocol can use multiple upstream endpoints.
 	UpstreamEndpoint string
+	// KongRequestFeatures 是本次上送的请求特征（fork 专有，见 kong_ticket_request_feature.go）。
+	// nil 表示这条通路没记到任何特征——客户端与上游都没给 state，或该通路尚未接采集。
+	KongRequestFeatures *KongRequestFeatures
 	// ResponseHeadersFromWSHandshake 标记 ResponseHeaders 装的是**连接级的 WS 握手响应头**，
 	// 不是本轮的响应头。原生 WS 逐轮没有响应头，三条通路把握手头放进来供限流信号与
 	// retry-after 使用，但那份额度是**拨号时刻**的，而连接池的连接活得很久——拿它回填逐轮额度会把
@@ -517,6 +520,17 @@ type OpenAIGatewayService struct {
 	// openaiCodexTurnStateSweepForTest 仅测试注入：见 setTurnStateSweepForTest。
 	openaiCodexTurnStateSweepForTest atomic.Pointer[func()]
 	openaiCodexTurnStateWrites       atomic.Uint64
+
+	// [kong] codex 票据守卫。可选依赖：未启用时为 nil，所有接入点都是空操作。
+	// 用 setter 注入而不是加进构造函数参数表，是为了不动上游那个很长的签名。
+	kongTicket *KongTicketGateway
+}
+
+// SetKongTicketGateway 注入 codex 票据守卫（可选依赖）。
+//
+// 装配后调用一次；传 nil 等于不启用，转发链路上的接入点全部退化为空操作。
+func (s *OpenAIGatewayService) SetKongTicketGateway(g *KongTicketGateway) {
+	s.kongTicket = g
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

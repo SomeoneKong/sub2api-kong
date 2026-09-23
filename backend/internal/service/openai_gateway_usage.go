@@ -367,6 +367,10 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 		)
 	}
 
+	// [kong] 门控请求却没采到特征 = 这条通路没接采集。它不会报错，只会让那一列静默全空，
+	// 所以在这里喊一声（判据与只在门控模型上喊的理由见 WarnMissingRequestFeatures）。
+	s.kongTicket.WarnMissingRequestFeatures(sentModel, input.InboundEndpoint, result.OpenAIWSMode, result.KongRequestFeatures)
+
 	imageSizeBreakdown := cloneImageSizeBreakdown(result.ImageSizeBreakdown)
 	if result.Usage.ImageCacheReadTokens > 0 {
 		if imageSizeBreakdown == nil {
@@ -389,6 +393,7 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 		ServiceTier:              result.ServiceTier,
 		ReasoningEffort:          result.ReasoningEffort,
 		RequestedReasoningEffort: coalesceRequestedReasoningEffort(result.RequestedReasoningEffort, result.ReasoningEffort),
+		KongRequestFeatures:      result.KongRequestFeatures,
 		InboundEndpoint:          optionalTrimmedStringPtr(input.InboundEndpoint),
 		UpstreamEndpoint:         optionalTrimmedStringPtr(input.UpstreamEndpoint),
 		InputTokens:              actualInputTokens,

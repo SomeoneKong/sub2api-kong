@@ -202,8 +202,15 @@ func NewHTTPUpstream(cfg *config.Config) service.HTTPUpstream {
 //   - inFlight > 0 的客户端不会被淘汰，确保活跃请求不被中断
 func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
 	applyGrokCLIProxyHeaders(req)
+	// 下面几处失败都发生在**发包之前**：包上标记，调用方才能区分本地失败与真实网络失败。
+	//
+	// context 已取消时也算：传输层会在拨号之前就返回，一个字节都没出去。不做这个前置检查的话，
+	// 那种取消会和「拨号后被取消」混在一起——后者确实发过包。
+	if err := req.Context().Err(); err != nil {
+		return nil, &service.HTTPUpstreamNotSentError{Err: err}
+	}
 	if err := s.validateRequestHost(req); err != nil {
-		return nil, err
+		return nil, &service.HTTPUpstreamNotSentError{Err: err}
 	}
 	profile := service.HTTPUpstreamProfileDefault
 	if req != nil {
@@ -213,7 +220,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	// 获取或创建对应的客户端，并标记请求占用
 	entry, err := s.acquireClientWithProfile(proxyURL, accountID, accountConcurrency, profile)
 	if err != nil {
-		return nil, err
+		return nil, &service.HTTPUpstreamNotSentError{Err: err}
 	}
 
 	// 执行请求
@@ -268,14 +275,18 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	}
 	slog.Debug("tls_fingerprint_enabled", "account_id", accountID, "target", targetHost, "proxy", proxyInfo, "profile", profile.Name)
 
+	// 下面几处失败都发生在**发包之前**：包上标记，调用方才能区分本地失败与真实网络失败。
+	if err := req.Context().Err(); err != nil {
+		return nil, &service.HTTPUpstreamNotSentError{Err: err}
+	}
 	if err := s.validateRequestHost(req); err != nil {
-		return nil, err
+		return nil, &service.HTTPUpstreamNotSentError{Err: err}
 	}
 
 	entry, err := s.acquireClientWithTLS(proxyURL, accountID, accountConcurrency, profile, upstreamProfile)
 	if err != nil {
 		slog.Debug("tls_fingerprint_acquire_client_failed", "account_id", accountID, "error", err)
-		return nil, err
+		return nil, &service.HTTPUpstreamNotSentError{Err: err}
 	}
 
 	client := s.httpClientForUpstreamRequest(entry.client, req)
