@@ -544,6 +544,9 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		clearBinding()
 		return nil, false, nil
 	}
+	if !s.service.kongPlanReuseSticky(ctx, req.GroupID, kongPlanGuardianOwner(ctx, sessionHash, req.PreserveStickyBinding), account, !req.PreserveStickyBinding) { // [kong] 暂停或入层之前的绑定：不删、不改
+		return nil, false, nil
+	}
 	// Free-tier soft gate: sticky session must not pin an over-quota free OAuth account.
 	// Admin QueryQuota / import probes do not use this path.
 	if account != nil && len(s.filterGrokFreeQuotaAccounts(ctx, []Account{*account})) == 0 {
@@ -571,7 +574,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		)
 		return nil, true, nil
 	}
-	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
+	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, accountID, KongEffectiveConcurrency(account)) // [kong] 生效上限
 	if acquireErr != nil && req.DisableStickyEscape {
 		return nil, false, acquireErr
 	}
@@ -603,7 +606,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 			Account: account,
 			WaitPlan: &AccountWaitPlan{
 				AccountID:      accountID,
-				MaxConcurrency: account.Concurrency,
+				MaxConcurrency: KongEffectiveConcurrency(account), // [kong] 生效上限
 				Timeout:        cfg.StickySessionWaitTimeout,
 				MaxWaiting:     cfg.StickySessionMaxWaiting,
 			},
@@ -2292,6 +2295,7 @@ func (s *OpenAIGatewayService) selectLegacyAccountByPreviousResponse(
 	if sessionHash != "" {
 		_ = s.bindOpenAIStickySessionDuringSelection(ctx, groupID, sessionHash, account.ID)
 	}
+	s.kongSessionTouch(ctx, account, sessionHash) // [kong] 会话上限：续接放行登记
 	return selection, true, nil
 }
 
@@ -2367,6 +2371,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 				decision.StickySessionHit = true
 				decision.SelectedAccountID = selection.Account.ID
 				decision.SelectedAccountType = selection.Account.Type
+				s.kongSessionTouch(ctx, selection.Account, sessionHash) // [kong] 会话上限：guardian 亲和放行登记
 				return selection, decision, nil
 			}
 		}
@@ -2374,6 +2379,8 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		if preserveGuardianParentBinding {
 			legacySessionHash = ""
 		}
+		// [kong] 会话上限：不带哈希进入旧版选号是为了保住父会话绑定，计数仍用请求自己的会话。
+		ctx = KongWithSessionCountHash(ctx, sessionHash)
 		if requiredTransport == OpenAIUpstreamTransportAny || requiredTransport == OpenAIUpstreamTransportHTTPSSE {
 			effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
 			for {

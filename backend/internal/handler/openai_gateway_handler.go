@@ -638,6 +638,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	c.Request = c.Request.WithContext(service.WithOpenAIGuardianParentAffinity(
 		c.Request.Context(), c, sessionHashBody, reqModel,
 	))
+	c.Request = c.Request.WithContext(service.KongWithSessionCountHash(c.Request.Context(), sessionHash)) // [kong] 账号槽连带续期会话
 	requireCompact := legacyCompact
 
 	maxAccountSwitches := h.maxAccountSwitches
@@ -1281,6 +1282,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
 	promptCacheKey := h.gatewayService.ExtractSessionID(c, body)
 	sessionHash, promptCacheKey = resolveOpenAIMessagesMetadataSession(c, sessionHash, promptCacheKey, reqModel, body)
+	c.Request = c.Request.WithContext(service.KongWithSessionCountHash(c.Request.Context(), sessionHash)) // [kong] 账号槽连带续期会话
 	if h.rejectIfCyberSessionBlocked(c, apiKey, body, reqModel, cyberBlockFormatAnthropic) {
 		return
 	}
@@ -2321,7 +2323,7 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 	fastReleaseFunc, fastAcquired, err := h.concurrencyHelper.TryAcquireAccountSlot(
 		ctx,
 		account.ID,
-		selection.WaitPlan.MaxConcurrency,
+		service.KongWaitConcurrency(account.ID, selection.WaitPlan.MaxConcurrency), // [kong] 抢槽时读当前生效上限
 	)
 	if err != nil {
 		reqLog.Warn("openai.account_slot_quick_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
@@ -2356,6 +2358,7 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 			zap.Int64("account_id", account.ID),
 			zap.Int("max_waiting", selection.WaitPlan.MaxWaiting),
 		)
+		kongHotNoteRequestWait(c, account.ID, service.KongHotWaitRejected) // [kong] 限速挤压
 		writeError(http.StatusTooManyRequests, "rate_limit_error", gatewayQueueFullCode, "Too many pending requests, please retry later")
 		return nil, openAISlotAcquireFailed
 	}
@@ -2377,6 +2380,7 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 		reqStream,
 		streamStarted,
 	)
+	kongHotNoteRequestWait(c, account.ID, kongHotWaitOutcome(c, err)) // [kong] 限速挤压
 	if err != nil {
 		reqLog.Warn("openai.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		status, errType, code, message := concurrencyErrorResponse(err, "account")
@@ -2708,6 +2712,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		openAIWSIngressFallbackSessionSeed(subject.UserID, apiKey.ID, apiKey.GroupID),
 	)
 	ctx = service.WithOpenAIGuardianParentAffinity(ctx, c, firstMessage, reqModel)
+	// [kong] 会话数上限：首轮抢槽起就带上会话计数身份，账号槽连带续期会话；连接上的后续轮次也按它续期。
+	ctx = service.KongWithSessionCountHash(ctx, sessionHash)
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	profitVetoCount := 0
@@ -2835,6 +2841,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		account := selection.Account
+		kongPlanWS := h.gatewayService.KongPlanWSBegin(ctx, account) // [kong] 记下建连时的定层与窗口序号
 		accountMaxConcurrency := account.Concurrency
 		if selection.WaitPlan != nil && selection.WaitPlan.MaxConcurrency > 0 {
 			accountMaxConcurrency = selection.WaitPlan.MaxConcurrency
@@ -2869,7 +2876,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			fastReleaseFunc, fastAcquired, err := h.concurrencyHelper.TryAcquireAccountSlot(
 				ctx,
 				account.ID,
-				selection.WaitPlan.MaxConcurrency,
+				service.KongWaitConcurrency(account.ID, selection.WaitPlan.MaxConcurrency), // [kong] 抢槽时读当前生效上限
 			)
 			if err != nil {
 				reqLog.Warn("openai.websocket_account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
@@ -2877,6 +2884,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				return
 			}
 			if !fastAcquired {
+				service.KongHotNoteWait(account.ID, service.KongHotWaitWSBusy) // [kong] 限速挤压
 				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account is busy, please retry later")
 				return
 			}
@@ -3058,6 +3066,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 						zap.String("reason", reason))
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer eligible for this connection, please reconnect", nil)
 				}
+				if !h.gatewayService.KongPlanWSTurnAllowed(turnCtx, account, kongPlanWS) { // [kong] 额度资格与入层复核
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer eligible for this connection, please reconnect", nil)
+				}
 				turnPricing.freeze(turnAt)
 				if turn == 1 {
 					return nil
@@ -3072,7 +3083,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if !userAcquired {
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "too many concurrent requests, please retry later", nil)
 				}
-				accountReleaseFunc, accountAcquired, err := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
+				accountReleaseFunc, accountAcquired, err := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, service.KongWSTurnConcurrency(account, accountMaxConcurrency)) // [kong] 生效上限
 				if err != nil {
 					if userReleaseFunc != nil {
 						userReleaseFunc()
@@ -3083,6 +3094,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					if userReleaseFunc != nil {
 						userReleaseFunc()
 					}
+					service.KongHotNoteWait(account.ID, service.KongHotWaitWSBusy) // [kong] 限速挤压
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is busy, please retry later", nil)
 				}
 				currentUserRelease = wrapReleaseOnDone(ctx, userReleaseFunc)
@@ -3253,12 +3265,13 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 						return
 					}
 					if currentAccountRelease == nil {
-						accountRelease, acquired, acquireErr := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
+						accountRelease, acquired, acquireErr := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, service.KongWSTurnConcurrency(account, accountMaxConcurrency)) // [kong] 生效上限
 						if acquireErr != nil || !acquired {
 							reqLog.Warn("openai.websocket_same_account_retry_slot_unavailable",
 								zap.Int64("account_id", account.ID),
 								zap.Error(acquireErr),
 							)
+							kongHotNoteWSRetryBusy(account.ID, acquireErr) // [kong] 限速挤压
 							closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account is busy, please retry later")
 							return
 						}
