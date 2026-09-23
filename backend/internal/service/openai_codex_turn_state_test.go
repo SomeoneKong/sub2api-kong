@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func newTurnStateTestContext(t *testing.T, apiKeyID int64, sessionID string) (*gin.Context, *httptest.ResponseRecorder) {
@@ -54,7 +56,7 @@ func TestRelayOpenAICodexTurnState_SetsHeaderAndRecordsProvenance(t *testing.T) 
 
 	require.Equal(t, "blob-A", c.Writer.Header().Get("X-Codex-Turn-State"))
 
-	raw, ok := svc.openaiCodexTurnStateOrigins.Load("7\x00sess-relay")
+	raw, ok := svc.openaiCodexTurnStateOrigins.Load(openAICodexTurnStateKey("7\x00sess-relay", "blob-A"))
 	require.True(t, ok)
 	origin, ok := raw.(openAICodexTurnStateOrigin)
 	require.True(t, ok)
@@ -71,8 +73,9 @@ func TestRelayOpenAICodexTurnState_ClearsStaleValueWhenUpstreamAbsent(t *testing
 	svc.relayOpenAICodexTurnState(c, &Account{ID: 43}, http.Header{})
 
 	require.Empty(t, c.Writer.Header().Get("X-Codex-Turn-State"))
-	_, ok := svc.openaiCodexTurnStateOrigins.Load("7\x00sess-stale")
-	require.False(t, ok)
+	// 断言整表为空，而不是查某个键：按 blob 记之后键里含 blob 指纹，查一个猜出来的键永远命中不了，
+	// 那种断言即使真的发生了错误登记也照样通过。
+	require.Zero(t, countOpenAICodexTurnStateOrigins(svc))
 }
 
 func TestStageOpenAICodexTurnState_StagedHeaders(t *testing.T) {
@@ -86,12 +89,11 @@ func TestStageOpenAICodexTurnState_StagedHeaders(t *testing.T) {
 	stageOpenAICodexTurnState(&staged, upstream)
 	require.NotNil(t, staged)
 	require.Equal(t, "blob-B", staged.Get("X-Codex-Turn-State"))
-	_, noted := svc.openaiCodexTurnStateOrigins.Load("9\x00sess-staged")
-	require.False(t, noted, "暂存阶段不得记录溯源：该 attempt 仍可能 failover 丢弃")
+	require.Zero(t, countOpenAICodexTurnStateOrigins(svc), "暂存阶段不得记录溯源：该 attempt 仍可能 failover 丢弃")
 
 	// 真正提交时才记录
 	svc.noteStagedOpenAICodexTurnStateCommitted(c, &Account{ID: 44}, staged)
-	raw, ok := svc.openaiCodexTurnStateOrigins.Load("9\x00sess-staged")
+	raw, ok := svc.openaiCodexTurnStateOrigins.Load(openAICodexTurnStateKey("9\x00sess-staged", "blob-B"))
 	require.True(t, ok)
 	origin, ok := raw.(openAICodexTurnStateOrigin)
 	require.True(t, ok)
@@ -126,7 +128,7 @@ func TestStagedTurnState_AbandonedAttemptDoesNotPoisonProvenance(t *testing.T) {
 	svc.guardOpenAICodexTurnStateEcho(c, &Account{ID: 52}, h)
 	require.Equal(t, "blob-A", h.Get("x-codex-turn-state"))
 
-	raw, ok := svc.openaiCodexTurnStateOrigins.Load("11\x00sess-abandoned")
+	raw, ok := svc.openaiCodexTurnStateOrigins.Load(openAICodexTurnStateKey("11\x00sess-abandoned", "blob-A"))
 	require.True(t, ok)
 	origin, ok := raw.(openAICodexTurnStateOrigin)
 	require.True(t, ok)
@@ -140,8 +142,9 @@ func TestNoteStagedOpenAICodexTurnStateCommitted_NoopWithoutState(t *testing.T) 
 	svc.noteStagedOpenAICodexTurnStateCommitted(c, &Account{ID: 60}, nil)
 	svc.noteStagedOpenAICodexTurnStateCommitted(c, &Account{ID: 60}, http.Header{"X-Request-Id": []string{"rid"}})
 
-	_, ok := svc.openaiCodexTurnStateOrigins.Load("12\x00sess-nostate")
-	require.False(t, ok)
+	// 断言整表为空，而不是查某个键：按 blob 记之后键里含 blob 指纹，查一个猜出来的键永远命中不了，
+	// 那种断言即使真的发生了错误登记也照样通过。
+	require.Zero(t, countOpenAICodexTurnStateOrigins(svc))
 }
 
 func TestGuardOpenAICodexTurnStateEcho(t *testing.T) {
@@ -189,14 +192,14 @@ func TestGuardOpenAICodexTurnStateEcho(t *testing.T) {
 	t.Run("expired_provenance_passthrough_and_pruned", func(t *testing.T) {
 		svc := &OpenAIGatewayService{}
 		c, _ := newTurnStateTestContext(t, 7, "sess-g4")
-		svc.openaiCodexTurnStateOrigins.Store("7\x00sess-g4", openAICodexTurnStateOrigin{
+		svc.openaiCodexTurnStateOrigins.Store(openAICodexTurnStateKey("7\x00sess-g4", "blob-A"), openAICodexTurnStateOrigin{
 			accountID: 42,
 			expiresAt: time.Now().Add(-time.Minute),
 		})
 		h := newOutbound("blob-A")
 		svc.guardOpenAICodexTurnStateEcho(c, &Account{ID: 43}, h)
 		require.Equal(t, "blob-A", h.Get("x-codex-turn-state"))
-		_, ok := svc.openaiCodexTurnStateOrigins.Load("7\x00sess-g4")
+		_, ok := svc.openaiCodexTurnStateOrigins.Load(openAICodexTurnStateKey("7\x00sess-g4", "blob-A"))
 		require.False(t, ok)
 	})
 
@@ -206,6 +209,39 @@ func TestGuardOpenAICodexTurnStateEcho(t *testing.T) {
 		h := newOutbound("blob-A")
 		svc.guardOpenAICodexTurnStateEcho(c, &Account{ID: 43}, h)
 		require.Equal(t, "blob-A", h.Get("x-codex-turn-state"))
+	})
+
+	t.Run("foreign_value_in_any_position_strips_header", func(t *testing.T) {
+		for _, order := range [][]string{{"blob-unknown", "blob-A"}, {"blob-A", "blob-unknown"}, {"blob-B", "blob-A"}} {
+			svc := &OpenAIGatewayService{}
+			c, _ := newTurnStateTestContext(t, 7, "sess-g6")
+			for account, blob := range map[int64]string{42: "blob-A", 43: "blob-B"} {
+				upstream := http.Header{}
+				upstream.Set("x-codex-turn-state", blob)
+				svc.relayOpenAICodexTurnState(c, &Account{ID: account}, upstream)
+			}
+
+			h := http.Header{}
+			for _, v := range order {
+				h.Add("x-codex-turn-state", v)
+			}
+			svc.guardOpenAICodexTurnStateEcho(c, &Account{ID: 43}, h)
+			require.Empty(t, h.Values("x-codex-turn-state"), "order=%v", order)
+		}
+	})
+
+	t.Run("multiple_values_without_foreign_kept", func(t *testing.T) {
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "sess-g7")
+		upstream := http.Header{}
+		upstream.Set("x-codex-turn-state", "blob-B")
+		svc.relayOpenAICodexTurnState(c, &Account{ID: 43}, upstream)
+
+		h := http.Header{}
+		h.Add("x-codex-turn-state", "blob-B")
+		h.Add("x-codex-turn-state", "blob-unknown")
+		svc.guardOpenAICodexTurnStateEcho(c, &Account{ID: 43}, h)
+		require.Equal(t, []string{"blob-B", "blob-unknown"}, h.Values("x-codex-turn-state"))
 	})
 
 	t.Run("no_echo_noop", func(t *testing.T) {
@@ -228,14 +264,73 @@ func TestSweepOpenAICodexTurnStateOrigins_PrunesExpiredEntries(t *testing.T) {
 		expiresAt: time.Now().Add(time.Hour),
 	})
 
-	// 计数器推进到触发清扫的边界
-	svc.openaiCodexTurnStateWrites.Store(255)
-	svc.sweepOpenAICodexTurnStateOrigins()
+	// 清扫逻辑本身：过期的清掉、未过期的留着。
+	svc.sweepOpenAICodexTurnStateOriginsNow()
 
 	_, expiredOK := svc.openaiCodexTurnStateOrigins.Load("expired")
 	require.False(t, expiredOK)
 	_, aliveOK := svc.openaiCodexTurnStateOrigins.Load("alive")
 	require.True(t, aliveOK)
+}
+
+// 触发点只负责调度：全表遍历不许占住调用方那条 goroutine——登记发生在下行交付路径上（WS 的上游 reader、
+// SSE 的写出点），条目又是每个已交付 blob 一条，同步扫会挤掉终帧与 usage。
+//
+// 用可阻塞的清扫替身来断言，而不是"最终一致 + 读表"：后者在把 go 去掉、改成同步执行时照样通过，测不出回归。
+func TestSweepOpenAICodexTurnStateOrigins_RunsOffCallerGoroutine(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	// 带缓冲：替身的阻塞有 2s 上限，测试若被调度延迟超过它，替身已经退出，无缓冲的送值就会挂死。
+	release := make(chan struct{}, 1)
+	started := make(chan struct{}, 4)
+	var runs atomic.Int32
+	svc.setTurnStateSweepForTest(func() {
+		runs.Add(1)
+		started <- struct{}{}
+		// 有上限地阻塞：清扫若被改回同步执行，触发点会卡在这里，超时让它以断言失败收场而不是挂死。
+		select {
+		case <-release:
+		case <-time.After(2 * time.Second):
+		}
+	})
+	t.Cleanup(func() {
+		close(release)
+		svc.setTurnStateSweepForTest(nil)
+	})
+
+	// 触发点必须在清扫结束**之前**就返回。
+	svc.openaiCodexTurnStateWrites.Store(255)
+	svc.sweepOpenAICodexTurnStateOrigins()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("后台清扫没有被调度起来")
+	}
+	require.Equal(t, int32(1), runs.Load(), "触发点返回时清扫还阻塞着——说明它没有占住调用方 goroutine")
+
+	// 单飞：上一轮还没结束时再触发，不许叠加第二轮。
+	//
+	// 这里必须等一小会儿再判定"没有第二轮"：goroutine 是异步起的，紧跟着读计数器只会读到"还没来得及跑"，
+	// 把单飞判据删掉照样通过。
+	svc.openaiCodexTurnStateWrites.Store(255)
+	svc.sweepOpenAICodexTurnStateOrigins()
+	select {
+	case <-started:
+		t.Fatal("已有一轮在扫时不该再起一轮")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// 放开之后，下一次触发能正常起来。
+	release <- struct{}{}
+	require.Eventually(t, func() bool { return !svc.openaiCodexTurnStateSweeping.Load() }, time.Second, 5*time.Millisecond,
+		"单飞标记要在清扫结束后复位")
+	svc.openaiCodexTurnStateWrites.Store(255)
+	svc.sweepOpenAICodexTurnStateOrigins()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("复位之后应当能再起一轮")
+	}
+	require.Equal(t, int32(2), runs.Load())
 }
 
 func TestWriteOpenAIPassthroughResponseHeaders_RelaysAndClearsTurnState(t *testing.T) {
@@ -393,4 +488,182 @@ func TestBuildOpenAIWSHeaders_CarriesSessionBetaFeatures(t *testing.T) {
 	apiKeyHeaders := build(t, &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}, "")
 	require.Empty(t, apiKeyHeaders.Get("x-codex-beta-features"),
 		"非 Codex 后端不注入")
+}
+
+// WS 三条通路的剥离与溯源：原生 WS 上客户端是从带内 `response.metadata` 事件里拿到 state 的，
+// 它下次连进来会放在 upgrade 请求头或帧内 client_metadata 上回带。不记这一笔，剥离对 WS 铸造的 state
+// 就是空操作；记的粒度不对（只记会话最近账号）则会同时造成误放行与误剥离。
+func TestOpenAIWSCodexTurnStateEchoGuard(t *testing.T) {
+	metadataFrame := func(state string) []byte {
+		return []byte(`{"type":"response.metadata","response":{"headers":{"x-codex-turn-state":"` + state + `"}}}`)
+	}
+	upgradeWith := func(t *testing.T, session, state string) *gin.Context {
+		c, _ := newTurnStateTestContext(t, 7, session)
+		c.Request.Header.Set(openAIWSTurnStateHeader, state)
+		return c
+	}
+
+	t.Run("带内下发的 state 记溯源，换号后回带即剥离", func(t *testing.T) {
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-1")
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, metadataFrame("blob-ws"))
+
+		next := upgradeWith(t, "ws-sess-1", "blob-ws")
+		require.Empty(t, svc.openAIWSClientTurnStateForAccount(next, &Account{ID: 43}), "别的账号铸造的 state 不许用")
+		// **不得改动客户端那份请求头**：同一个请求里后面还可能重试回原账号。
+		require.Equal(t, "blob-ws", next.Request.Header.Get(openAIWSTurnStateHeader))
+	})
+
+	t.Run("同账号回带保留", func(t *testing.T) {
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-2")
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, metadataFrame("blob-ws"))
+
+		next := upgradeWith(t, "ws-sess-2", "blob-ws")
+		require.Equal(t, "blob-ws", svc.openAIWSClientTurnStateForAccount(next, &Account{ID: 42}))
+	})
+
+	t.Run("换号剥离之后重试回原账号，原值仍然可用", func(t *testing.T) {
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-retry")
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, metadataFrame("blob-A"))
+
+		next := upgradeWith(t, "ws-sess-retry", "blob-A")
+		require.Empty(t, svc.openAIWSClientTurnStateForAccount(next, &Account{ID: 43}))
+		require.Equal(t, "blob-A", svc.openAIWSClientTurnStateForAccount(next, &Account{ID: 42}),
+			"B 那次的判定不得把客户端原值抹掉")
+	})
+
+	t.Run("同会话并存两个账号的 blob，各判各的", func(t *testing.T) {
+		// 同一 session-id 下可以并存父子线程，一次 failover 也会让会话先后持有两个账号的 blob。
+		// 按"会话最近账号"记会同时造成误放行（旧 blob 发给新账号）与误剥离（本账号自己的 blob）。
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-mixed")
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, metadataFrame("blob-A"))
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 43}, metadataFrame("blob-B"))
+
+		require.Empty(t, svc.openAIWSClientTurnStateForAccount(upgradeWith(t, "ws-sess-mixed", "blob-A"), &Account{ID: 43}),
+			"A 的 blob 发给 B 必须剥")
+		require.Equal(t, "blob-A", svc.openAIWSClientTurnStateForAccount(upgradeWith(t, "ws-sess-mixed", "blob-A"), &Account{ID: 42}),
+			"A 的 blob 发给 A 不许误剥")
+		require.Equal(t, "blob-B", svc.openAIWSClientTurnStateForAccount(upgradeWith(t, "ws-sess-mixed", "blob-B"), &Account{ID: 43}))
+		require.Equal(t, "blob-unknown", svc.openAIWSClientTurnStateForAccount(upgradeWith(t, "ws-sess-mixed", "blob-unknown"), &Account{ID: 43}),
+			"没登记过的 blob 按约定保留")
+	})
+
+	t.Run("帧内载体同样受判定", func(t *testing.T) {
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-frame")
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, metadataFrame("blob-A"))
+
+		frame := []byte(`{"type":"response.create","model":"gpt-5.1","client_metadata":{"x-codex-turn-state":"blob-A","keep":"me"}}`)
+		stripped, strippedState, err := svc.stripForeignOpenAIWSFrameTurnState(c, &Account{ID: 43}, frame)
+		require.NoError(t, err)
+		require.Equal(t, "blob-A", strippedState, "被剥掉的原值要交回调用方：剥完之后帧里再也读不到它")
+		require.False(t, gjson.GetBytes(stripped, "client_metadata.x-codex-turn-state").Exists(), "异账号的帧内 blob 必须剥")
+		require.Equal(t, "me", gjson.GetBytes(stripped, "client_metadata.keep").String(), "其它字段不得受影响")
+		require.Equal(t, "blob-A", gjson.GetBytes(frame, "client_metadata.x-codex-turn-state").String(), "不得改动调用方那份")
+
+		kept, keptState, err := svc.stripForeignOpenAIWSFrameTurnState(c, &Account{ID: 42}, frame)
+		require.NoError(t, err)
+		require.Empty(t, keptState, "没剥就没有被剥值")
+		require.Equal(t, "blob-A", gjson.GetBytes(kept, "client_metadata.x-codex-turn-state").String(), "同账号不许剥")
+	})
+
+	t.Run("转义写法的键同样要被判定", func(t *testing.T) {
+		// 廉价前置排除比的是原始字节，而解析器读的是解码后的键：`x-codex-turn-stat\u0065` 是一段合法
+		// JSON，字面串比不中、解码出来却仍是那个键。只按字面串提前返回就等于给了一条绕过通道。
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-escaped")
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, metadataFrame("blob-A"))
+
+		frame := []byte(`{"type":"response.create","client_metadata":{"x-codex-turn-stat\u0065":"blob-A"}}`)
+		out, stripped, err := svc.stripForeignOpenAIWSFrameTurnState(c, &Account{ID: 43}, frame)
+		require.NoError(t, err)
+		require.Equal(t, "blob-A", stripped)
+		require.NotContains(t, string(out), "blob-A", "异账号的 blob 不得留在帧里")
+	})
+
+	t.Run("载体有歧义且含异账号 blob 时拒服", func(t *testing.T) {
+		// gjson 读第一处、sjson 也只删第一处，而上游可能按末键解码：删掉第一处之后帧里反而只剩那个
+		// 异账号的值，JSON 还变得毫无歧义。所以这种帧不许发，拒服。
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-dup")
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, metadataFrame("blob-A"))
+
+		for name, frame := range map[string]string{
+			"内层重复键":                `{"client_metadata":{"x-codex-turn-state":"blob-A","x-codex-turn-state":"blob-A"}}`,
+			"外层重复 client_metadata": `{"client_metadata":{"x-codex-turn-state":"blob-X"},"client_metadata":{"x-codex-turn-state":"blob-A"}}`,
+			"未知值遮住异账号值":            `{"client_metadata":{"x-codex-turn-state":"blob-unknown","x-codex-turn-state":"blob-A"}}`,
+		} {
+			out, _, err := svc.stripForeignOpenAIWSFrameTurnState(c, &Account{ID: 43}, []byte(frame))
+			require.Error(t, err, name)
+			require.JSONEq(t, frame, string(out), name+"：拒服时原样返回，不做半截改写")
+		}
+
+		// 同样歧义但不含异账号 blob 时不拦：这条路只负责跨账号隔离，不替帧语义歧义做裁决。
+		clean := `{"client_metadata":{"x-codex-turn-state":"blob-unknown","x-codex-turn-state":"blob-unknown2"}}`
+		out, _, err := svc.stripForeignOpenAIWSFrameTurnState(c, &Account{ID: 43}, []byte(clean))
+		require.NoError(t, err)
+		require.JSONEq(t, clean, string(out))
+	})
+
+	t.Run("map 载体不得就地改内层 map", func(t *testing.T) {
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-map")
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, metadataFrame("blob-A"))
+
+		shared := map[string]any{"x-codex-turn-state": "blob-A", "keep": "me"}
+		payload := map[string]any{"client_metadata": shared}
+		require.Equal(t, "blob-A", svc.stripForeignOpenAIWSMapTurnState(c, &Account{ID: 43}, payload))
+
+		next, _ := payload["client_metadata"].(map[string]any)
+		require.NotNil(t, next)
+		_, present := next["x-codex-turn-state"]
+		require.False(t, present, "异账号的 blob 必须剥")
+		require.Equal(t, "me", next["keep"])
+		require.Equal(t, "blob-A", shared["x-codex-turn-state"], "客户端原始请求体共享的那份内层 map 不得被改")
+	})
+
+	t.Run("带 codex. 前缀的载体事件同样记溯源", func(t *testing.T) {
+		// 原生 WS 上游发的就是这个拼写。漏认它，WS 铸造的 state 永远进不了溯源表，
+		// 那道跨账号剥离对 WS 就是个空操作——判定「查无来源」一律放行。
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-prefixed")
+		frame := []byte(`{"type":"codex.response.metadata","headers":{"x-codex-turn-state":"blob-prefixed"}}`)
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, frame)
+
+		next := upgradeWith(t, "ws-sess-prefixed", "blob-prefixed")
+		require.Empty(t, svc.openAIWSClientTurnStateForAccount(next, &Account{ID: 43}),
+			"别的账号铸造的 state 不许用")
+		same := upgradeWith(t, "ws-sess-prefixed", "blob-prefixed")
+		require.Equal(t, "blob-prefixed", svc.openAIWSClientTurnStateForAccount(same, &Account{ID: 42}),
+			"本账号自己铸造的那份照常可用")
+	})
+
+	t.Run("非 metadata 事件与不带 state 的事件都不记", func(t *testing.T) {
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "ws-sess-3")
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, []byte(`{"type":"response.completed"}`))
+		svc.noteOpenAIWSCodexTurnStateDelivered(c, &Account{ID: 42}, []byte(`{"type":"response.metadata","response":{"headers":{}}}`))
+
+		require.Zero(t, countOpenAICodexTurnStateOrigins(svc), "这两种事件都不该产生任何登记")
+
+		next := upgradeWith(t, "ws-sess-3", "blob-unknown")
+		require.Equal(t, "blob-unknown", svc.openAIWSClientTurnStateForAccount(next, &Account{ID: 43}),
+			"没登记过来源就不该剥——无从判定来源却剥，等于无谓丢掉客户端上下文")
+	})
+}
+
+// countOpenAICodexTurnStateOrigins 数溯源表里的条目。
+//
+// 否定断言必须用它而不是 Load 某个键：溯源按 blob 记之后键里含 blob 指纹，查一个猜出来的键永远不会命中，
+// 那样的断言即使真的发生了错误登记也照样通过。
+func countOpenAICodexTurnStateOrigins(svc *OpenAIGatewayService) int {
+	n := 0
+	svc.openaiCodexTurnStateOrigins.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
 }

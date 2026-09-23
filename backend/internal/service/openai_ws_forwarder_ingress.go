@@ -397,6 +397,18 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			normalized = next
 		}
 		SetOpsUpstreamModel(c, upstreamModel)
+		// 帧内也是上行载体：客户端把别的账号铸造的 blob 放在 client_metadata 里同样能发到上游
+		// （见 stripForeignOpenAIWSFrameTurnState）。
+		if stripped, _, stripErr := s.stripForeignOpenAIWSFrameTurnState(c, account, normalized); stripErr != nil {
+			// 载体有歧义且含已知异账号的 blob：不替上游猜解析语义，按策略关连接。
+			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"invalid websocket request payload",
+				stripErr,
+			)
+		} else {
+			normalized = stripped
+		}
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
 			if stripped, changed, stripErr := stripOpenAIImageGenerationToolsFromRawPayload(normalized); stripErr != nil {
 				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", stripErr)
@@ -487,7 +499,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		writeCtx, cancel := newOpenAIWSDownstreamWriteContext(ctx, hooks, s.openAIWSWriteTimeout())
 		defer cancel()
 		message = restoreCodexToolNamesFromContext(c, message)
-		return clientConn.Write(writeCtx, coderws.MessageText, message)
+		writeErr := clientConn.Write(writeCtx, coderws.MessageText, message)
+		if writeErr == nil {
+			// 客户端确实拿到了这一帧，里面若带着上游给的 turn-state，登记铸造账号供下次剥离判定。
+			//
+			// 记在**写成功之后**、且记在这个共用写函数里：上面的交付守卫可能拦掉这一帧，写本身也可能
+			// 失败，那两种情况客户端手里并没有这个 blob，提前登记会让它下次回带自己合法的旧 blob 时被
+			// 误剥。放这里还顺带覆盖了同样经由本函数下发的 HTTP bridge 那条路。
+			s.noteOpenAIWSCodexTurnStateDelivered(c, account, message)
+		}
+		return writeErr
 	}
 
 	readClientMessage := func() ([]byte, error) {
@@ -522,7 +543,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	useHTTPBridge := forceHTTPBridge || s.shouldBridgeOpenAIWSHTTP(account, firstPayload.payloadBytes, firstPayload.previousResponseID)
-	turnState := strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
+	// 只取本账号可以用的那一份：已知由别的账号铸造的 blob 不往上游发，否则它会被原样放进本账号与
+	// 上游那条连接的握手头（见 openAIWSClientTurnStateForAccount）。
+	turnState := s.openAIWSClientTurnStateForAccount(c, account)
 	stateStore := s.getOpenAIWSStateStore()
 	groupID := getOpenAIGroupIDFromContext(c)
 	apiKeyID := getAPIKeyIDFromContext(c)
@@ -545,7 +568,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			return
 		}
 		if turnState == "" && stateStore != nil && sessionHash != "" {
-			if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, sessionHash); ok {
+			if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, account.ID, sessionHash); ok {
 				turnState = savedTurnState
 			}
 		}
@@ -593,9 +616,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				if err := hooks.BeforeTurn(turn); err != nil {
 					return err
 				}
-			}
-			if turnState != "" && c != nil && c.Request != nil {
-				c.Request.Header.Set(openAIWSTurnStateHeader, turnState)
 			}
 			if c != nil && sessionHash != "" {
 				c.Set(openAIWSIngressSessionHashContextKey, sessionHash)
@@ -689,6 +709,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				currentBridgePayload.imageInputSize,
 				grokCacheIdentity,
 				turn,
+				turnState,
 				writeClientMessage,
 			)
 			if bridgeErr != nil && isOpenAIWSSessionPreempted(ctx) {
@@ -930,7 +951,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if handshakeTurnState := strings.TrimSpace(lease.HandshakeHeader(openAIWSTurnStateHeader)); handshakeTurnState != "" {
 			turnState = handshakeTurnState
 			if stateStore != nil && sessionHash != "" {
-				stateStore.BindSessionTurnState(groupID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
+				stateStore.BindSessionTurnState(groupID, account.ID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
 			}
 			updatedHeaders := cloneHeader(baseAcquireReq.Headers)
 			if updatedHeaders == nil {
