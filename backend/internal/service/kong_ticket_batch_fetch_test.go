@@ -194,8 +194,10 @@ func TestKongBatchFetchCoversAllModelsWithoutExtraVerify(t *testing.T) {
 		if batch["total"] != 2 {
 			t.Errorf("%s 的 batch.total 应为 2，实为 %v", e.Model, batch["total"])
 		}
-		if _, ok := e.Detail["state_fingerprint"]; !ok {
-			t.Errorf("%s 的事件缺 state_fingerprint——那是回答「各模型是不是同一张票」的唯一记录", e.Model)
+		// 必须是内容哈希：长度加前缀的表示在上游 token 前缀近乎恒定时会让不同的票同键，
+		// 这个问题就会被恒答成「是同一张」。
+		if got := e.Detail["state_fingerprint"]; got != kongStateFingerprint(up.fetchState) {
+			t.Errorf("%s 的 state_fingerprint = %v, want 内容哈希 %q", e.Model, got, kongStateFingerprint(up.fetchState))
 		}
 	}
 }

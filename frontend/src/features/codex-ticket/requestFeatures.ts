@@ -66,7 +66,7 @@ export function requestFeatures(row: RequestFeatureRow | null | undefined): Requ
 
   const reissued = stateText(f.reissued_len, f.reissued_fp)
   if (reissued) {
-    // 上游回发的票入库了才有 id；312 这类按长度黑名单拒收的只有指纹与长度，那时库里没有这张票。
+    // 上游回发的票入库了才有 id；入库失败的只有指纹与长度，那时库里没有这张票。
     const suffix = typeof f.reissued_ticket_id === 'number' ? ` #${f.reissued_ticket_id}` : ''
     out.push({ key: '上游回发', value: reissued + suffix })
   }

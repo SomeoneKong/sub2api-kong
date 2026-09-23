@@ -22,16 +22,3 @@ func KongIsUpstreamNotAttempted(err error) bool {
 	var target *KongErrUpstreamNotAttempted
 	return errors.As(err, &target)
 }
-
-// KongErrTicketRejected 表示一张票按既定规则被拒收（目前只有长度黑名单）。
-//
-// 它是**预期结果**而不是故障：拒收时已经写过事件，调用方不该再记一条持久化失败。
-type KongErrTicketRejected struct{ Reason string }
-
-func (e *KongErrTicketRejected) Error() string { return "ticket rejected: " + e.Reason }
-
-// KongIsExpectedTicketRejection 报告这个错误是否为既定规则下的预期拒收。
-func KongIsExpectedTicketRejection(err error) bool {
-	var target *KongErrTicketRejected
-	return errors.As(err, &target)
-}

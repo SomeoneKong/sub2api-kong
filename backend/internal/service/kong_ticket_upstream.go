@@ -252,7 +252,7 @@ func (u *kongTicketUpstream) sendWith(req *http.Request, proxyURL string, accoun
 // 请求刻意**不带**任何票：上游的规则是「带有效票就不下发、不带才下发」，带着票去取票只会拿回空。
 func (u *kongTicketUpstream) FetchTurnState(ctx context.Context, account *Account, egressProxyURL, model string, fused *KongFingerprintChallenge) (*KongUpstreamProbe, error) {
 	// 融合时要等整份答案生成完（生产实测单份挑战 27–31s），60 秒的取票期限不够用，改用挑战那一档。
-	// 仍远小于 292 窗口的约 4 分钟寿命。
+	// 仍远小于正常档窗口的约 4 分钟寿命。
 	budget := kongFetchTimeout
 	prompt := kongCodexProbePrompt
 	if fused != nil {

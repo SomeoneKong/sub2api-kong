@@ -456,58 +456,72 @@ func TestKongStg0StatsSerializesEmptyListAsArray(t *testing.T) {
 	}
 }
 
-// 取到降智档票（312，长度黑名单）是**按规则拒收**，不是存储故障。
+// 票的长度不参与任何判定。
 //
-// 两者都要推进退避（网络活动已发生，而且上游正在发 312，立刻重试只会再拿一张），但归因必须分开：
-// 记成 store_ticket_failed 会让排查往"数据库坏了"的方向走，而真实原因是上游给了什么。
+// 上游 state 是不透明 token，长度只是其明文长度的旁路泄露，上游一改明文结构就失效；按长度拒收会在
+// 碰巧撞上时把合格票挡掉——无谓的拒服与放行降智同级。所以任何长度都必须入库、进候选，档位只由验证
+// 判定。用例里的长度刻意包含 312——那是最容易被误当成档位标记的一个值。
+func TestKongTicketOfAnyLengthEntersCandidates(t *testing.T) {
+	for _, n := range []int{312, 780, 1} {
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			state := strings.Repeat("a", n)
+			up := &kongStubUpstream{
+				proxyState: KongTicketProxyState{Exists: true},
+				fetchState: state,
+				answers:    kongVerifyAnswers(),
+			}
+			svc, repo := kongBatchSetup(t, up, false)
+			_, _ = svc.EnsureTicket(context.Background(), 1, kongBatchAstra)
+
+			stored := false
+			for _, tk := range repo.inserted {
+				if tk.State == state {
+					stored = true
+				}
+			}
+			if !stored {
+				t.Fatalf("长度 %d 的票没有入库——长度不该成为拒收理由", n)
+			}
+			for _, ev := range repo.events {
+				if ev.Detail == nil {
+					continue
+				}
+				if ev.Detail["reason"] == "state_len_denylisted" {
+					t.Errorf("不该再有按长度拒收的事件：%v", ev.Detail)
+				}
+				if ev.EventType == KongEventFetch && ev.Detail["phase"] == "store_ticket" {
+					t.Errorf("取票不该以入库失败收场：%v", ev.Detail)
+				}
+			}
+			// 探测记录上的票身份必须是内容哈希，不能含长度或前缀——那种表示在上游 token 前缀近乎
+			// 恒定时会把不同的票坍缩成同一个键。
+			for _, pr := range repo.probes {
+				if pr.TicketFingerprint != kongStateFingerprint(state) {
+					t.Errorf("探测记录的票身份 = %q, want 内容哈希 %q", pr.TicketFingerprint, kongStateFingerprint(state))
+				}
+			}
+		})
+	}
+}
+
+// 票身份一律用内容哈希。
 //
-// observe 路径一直用 KongIsExpectedTicketRejection 做这个区分，fetch 路径此前没做——同一件事在两条
-// 路径上归因不一致。
-func TestKongDenylistedTicketIsRejectionNotStoreFailure(t *testing.T) {
-	up := &kongStubUpstream{
-		proxyState: KongTicketProxyState{Exists: true},
-		// 312 在长度黑名单里。
-		fetchState: strings.Repeat("a", 312),
-		answers:    kongVerifyAnswers(),
+// 上游 token 以版本字节加时间戳开头（`gAAAAAB…`），前若干字符在数周内几乎不变。用"长度 + 前缀"当身份
+// 键时，同一长度的所有票会坍缩成同一个键：批量取票据此判断"各模型是不是同一张票"会恒答"是"，进而
+// 得出"票与模型无关、可以跨模型复用"的假结论；探测记录也就无法关联回各自的票。
+func TestKongTicketIdentityIsContentHash(t *testing.T) {
+	head := "gAAAAABq"
+	a := head + strings.Repeat("x", 772)
+	b := head + strings.Repeat("y", 772)
+	if len(a) != len(b) || a[:8] != b[:8] {
+		t.Fatal("夹具前提不成立：两张票应同长度、同前缀")
 	}
-	svc, repo := kongBatchSetup(t, up, false)
-
-	if _, err := svc.EnsureTicket(context.Background(), 1, kongBatchAstra); err == nil {
-		// 拿不到票是预期的；这里只要求它别静默成功。
-		t.Log("取票未返回错误，继续检查事件归因")
+	fa, fb := kongStateFingerprint(a), kongStateFingerprint(b)
+	if fa == fb {
+		t.Fatalf("同长度同前缀但内容不同的两张票得到了同一个身份 %q", fa)
 	}
-
-	var cooldownReasons []string
-	for _, ev := range repo.events {
-		if ev.EventType == KongEventCooldown && ev.Detail != nil {
-			if r, ok := ev.Detail["reason"].(string); ok {
-				cooldownReasons = append(cooldownReasons, r)
-			}
-		}
-	}
-	if len(cooldownReasons) == 0 {
-		t.Fatal("取到 312 之后必须推进退避，否则下一个请求立刻再取一张 312")
-	}
-	for _, r := range cooldownReasons {
-		if r == "store_ticket_failed" {
-			t.Error("按规则拒收被记成存储故障——那会让排查方向指向数据库，而真实原因是上游给了降智档票")
-		}
-		if r != "ticket_rejected" {
-			t.Errorf("冷却原因 = %q, want ticket_rejected", r)
-		}
-	}
-	// 长度黑名单那条 observe 事件照旧要有：它带着 state_len，是"上游给了什么"的直接证据。
-	var sawDenylist bool
-	for _, ev := range repo.events {
-		if ev.Detail != nil && ev.Detail["reason"] == "state_len_denylisted" {
-			sawDenylist = true
-			if ev.StateLen == nil || *ev.StateLen != 312 {
-				t.Error("那条事件要带上票长度，否则看不出上游给的是哪一档")
-			}
-		}
-	}
-	if !sawDenylist {
-		t.Error("缺少 state_len_denylisted 事件")
+	if strings.Contains(fa, "len:") || strings.Contains(fa, head) {
+		t.Errorf("身份键不该含长度或前缀：%q", fa)
 	}
 }
 
@@ -608,12 +622,11 @@ func TestKongTicketDetailDistinguishesStg0Conclusion(t *testing.T) {
 	}
 }
 
-// 取样行回答的是「现在还在采什么样」，判据必须覆盖取样的**每一个**出口。
+// 取样行要反映**最近一次**取样，不能停在一条更早的处置上。
 //
-// 线上现象：账号连续几天只能取到 312（被长度黑名单挡在验证之前，写 observe/skipped），之后取到一张
-// 292 并进了验证流。那次取票只写 fetch 事件，于是这一行仍停在几天前那条 312 上——它声称"现在被黑
-// 名单挡着、没在采样"，而实际此刻采到的是 292 且正在验证。这一行的全部用途就是这个信号，信号本身
-// 反了比没有更糟。
+// 库里仍留着按长度拒收时期写下的 observe/skipped 事件（`state_len_denylisted`）。其后一次取票只写
+// fetch 事件，若取样行不认它，就会一直停在那条旧处置上，声称"没在采样"——而此刻实际正在验证。
+// 这一行的全部用途就是这个信号，信号反了比没有更糟。
 func TestKongLastSampleReflectsLatestFetch(t *testing.T) {
 	const model = kongBatchAstra
 	repo, _, svc := kongManualFixture(t, model)
@@ -622,15 +635,15 @@ func TestKongLastSampleReflectsLatestFetch(t *testing.T) {
 	ctx := context.Background()
 
 	denylisted := 312
-	accepted := 292
+	accepted := 780
 	events := []*KongTicketEvent{
-		// 昨天：收到 312，被长度黑名单挡在验证之前。
+		// 较早：一条按长度拒收时期留下的处置。
 		{
 			AccountID: 1, Model: model, EventType: KongEventObserve, Outcome: KongOutcomeSkipped,
 			StateLen: &denylisted, CreatedAt: now.Add(-12 * time.Hour),
 			Detail: map[string]any{"reason": "state_len_denylisted"},
 		},
-		// 此刻：取到 292，直接进验证流——这一步只写 fetch。
+		// 此刻：取到票，直接进验证流——这一步只写 fetch。
 		{
 			AccountID: 1, Model: model, EventType: KongEventFetch, Outcome: KongOutcomeSuccess,
 			StateLen: &accepted, TicketID: &ticket.ID, CreatedAt: now.Add(-time.Minute),
@@ -673,11 +686,11 @@ func TestKongLastSampleReflectsLatestFetch(t *testing.T) {
 		gotLen = strconv.Itoa(*sample.StateLen)
 	}
 	if gotLen != strconv.Itoa(accepted) {
-		t.Errorf("取样长度应当是最近一次取到的 %d，实得 %s——页面会显示成仍被黑名单挡着",
+		t.Errorf("取样长度应当是最近一次取到的 %d，实得 %s——页面会停在那条旧处置上",
 			accepted, gotLen)
 	}
 	if sample.Reason == "state_len_denylisted" {
-		t.Error("取样原因仍是长度黑名单，那是十二小时前那张票的处置")
+		t.Error("取样原因仍是十二小时前那条旧处置")
 	}
 	if sample.Outcome != KongOutcomeSuccess {
 		t.Errorf("取样结果 = %q, want %q", sample.Outcome, KongOutcomeSuccess)

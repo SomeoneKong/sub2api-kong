@@ -428,20 +428,23 @@ func TestKongVerifyHonorsStatusUpdateResult(t *testing.T) {
 	}
 }
 
-// 312 是已实测的降智档位长度，必须在入库边界就挡掉——放进去会白烧一次完整验证。
-func TestKongStoreTicketDenylist(t *testing.T) {
+// 入库边界不看票的长度：上游 state 是不透明 token，长度不代表档位，按长度拒收会在碰巧撞上时把合格票
+// 挡掉。任何非空的票都入库，档位交给指纹验证。
+func TestKongStoreTicketIgnoresLength(t *testing.T) {
 	repo := newKongStubRepo()
 	accounts := &kongStubAccounts{accounts: map[int64]*Account{}}
 	svc := kongTestService(t, repo, &kongStubUpstream{}, accounts)
 
-	if _, _, _, err := svc.storeTicket(context.Background(), 1, "gpt-6-astra", strings.Repeat("a", 312), KongTicketSourceObserved, nil); err == nil {
-		t.Error("312 字符的票必须被拒绝入库")
+	for _, n := range []int{1, 292, 312, 780} {
+		if _, _, _, err := svc.storeTicket(context.Background(), 1, "gpt-6-astra", strings.Repeat("a", n), KongTicketSourceObserved, nil); err != nil {
+			t.Errorf("长度 %d 的票应当入库: %v", n, err)
+		}
 	}
-	if len(repo.inserted) != 0 {
-		t.Errorf("被拒的票不该入库，实际插入 %d 条", len(repo.inserted))
+	if len(repo.inserted) != 4 {
+		t.Errorf("四张不同长度的票都该入库，实际插入 %d 条", len(repo.inserted))
 	}
-	if _, _, _, err := svc.storeTicket(context.Background(), 1, "gpt-6-astra", strings.Repeat("a", 292), KongTicketSourceObserved, nil); err != nil {
-		t.Errorf("292 字符的票应当入库: %v", err)
+	if _, _, _, err := svc.storeTicket(context.Background(), 1, "gpt-6-astra", "", KongTicketSourceObserved, nil); err == nil {
+		t.Error("空票不该入库")
 	}
 }
 

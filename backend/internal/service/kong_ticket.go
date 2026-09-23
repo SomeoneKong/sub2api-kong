@@ -362,7 +362,7 @@ type KongTicketRepository interface {
 	//
 	// 与 OldestCandidate 相反的顺序是刻意的，两条路径要的不是同一件事：自动路径在清一个队列，
 	// 先验快过期的那张才有机会用上它；人工按下按钮要的是「这个模型尽快有一张能用的当前票」，
-	// 那就该挑剩余 TTL 最长的。批量取票之后最新那张还通常正是刚在 292 窗口里取回的 fetch 票。
+	// 那就该挑剩余 TTL 最长的。批量取票之后最新那张还通常正是刚在正常档窗口里取回的 fetch 票。
 	// 不受 minAge 约束——那条压的是自动验证的频率。
 	NewestCandidate(ctx context.Context, accountID int64, model string, now time.Time) (*KongTicket, error)
 	// InsertTicket 插入一张票。第二个返回值为假表示这张票原值已经存在——重复出现不是新信息，

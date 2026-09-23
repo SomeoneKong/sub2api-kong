@@ -129,7 +129,7 @@ type KongTicketGrant struct {
 // EnsureTicket 为一个门控请求准备票。
 //
 // 这是请求驱动的唯一入口：没有定时器，闲置期完全无活动。闲置本身也在为下一张好票做准备——
-// 票据出口因此积累静默，而静默是拿到 292 的前提。
+// 票据出口因此积累静默，而静默是拿到正常档票的前提。
 func (s *KongTicketService) EnsureTicket(ctx context.Context, accountID int64, model string) (*KongTicketGrant, error) {
 	return s.ensureTicketOpts(ctx, accountID, model, true)
 }
@@ -749,7 +749,7 @@ func (s *KongTicketService) otherGatedModels(exclude string) []string {
 //
 // 开了 batchFetch 时，**所有门控模型的票在同一瞬间并发取回**。三点要一起看才成立：
 //
-//  1. 依据是一条实测事实——292 窗口一旦打开约 4 分钟内有效，且窗口内的活动不会把它提前关闭。
+//  1. 依据是一条实测事实——正常档窗口一旦打开约 4 分钟内有效，且窗口内的活动不会把它提前关闭。
 //     所以一次静默换来的是一个"可连续取票的窗口"，不是一张票。
 //  2. **并发而不是串行**：全部请求同一瞬间发出，于是不存在"窗口在批次中途关闭"这回事，也就不需要
 //     批次预算与顺序安排。
@@ -783,7 +783,7 @@ func (s *KongTicketService) fetchAndVerify(ctx context.Context, account *Account
 	// **静默值全批共用，且必须在发起任何取票之前算。** 取票自己就是该出口上的活动：第一发一落地
 	// noteEgressUse 就把"上次活动"推到了现在，之后再算就得到 idle≈0。那个数字字面为真，却把事实
 	// 记错了——全批骑的是同一个窗口，产生这个窗口的静默就是批前这一段。记 0 会让日后读事件的人
-	// 以为"静默 0 秒也能拿到 292"。
+	// 以为"静默 0 秒也能拿到正常档票"。
 	idle := s.idleSeconds(ctx, ticketEgress, time.Now())
 
 	models := []string{model}
@@ -967,12 +967,12 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 		out.err = fmt.Errorf("上游未下发票")
 		return out
 	}
-	// 成批时额外记票原值的指纹（长度 + 前 8 字符，与探测记录同一种表示，不是凭据本身）。
+	// 成批时额外记票原值的指纹（内容哈希，与探测记录、请求特征同一种表示，不是凭据本身）。
 	// 用途是回答一个开放问题：批内各模型拿到的是不是同一张票。若恒为同一张，就等于实测出"票与
 	// 模型无关"，跨模型复用可以直接落地，这套批量取票还能再简化一层。
 	extra := map[string]any{}
 	if batched {
-		extra["state_fingerprint"] = kongTicketFingerprint(probe.State)
+		extra["state_fingerprint"] = kongStateFingerprint(probe.State)
 	}
 	// 标明这次取票是否融合了指纹挑战。**按"是否发起过"记，不按"是否读到答案"记**：读失败时额度
 	// 一样花了，记成 false 会让"额度花在哪了"这个问题答错。读失败另记原因。
@@ -991,22 +991,12 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 	if err != nil {
 		extra["error"] = err.Error()
 		extra["phase"] = "store_ticket"
-		// **按既定规则拒收不是故障**：取到 312（长度黑名单）说明上游给的是降智档票，我们照规则不收
-		// ——那是预期结果。记成 store_ticket_failed 会让排查往"数据库/存储坏了"的方向走，而真实原因
-		// 是上游给了什么。判据用既有的 KongIsExpectedTicketRejection（observe 路径已经在用它）。
-		//
-		// fetch 事件本身仍记 failure：这次取票确实没拿到可用票，而成功率统计要算这一次。
-		reason := "store_ticket_failed"
-		if KongIsExpectedTicketRejection(err) {
-			extra["phase"] = "ticket_rejected"
-			reason = "ticket_rejected"
-		}
+		// fetch 事件记 failure：这次取票确实没拿到可用票，而成功率统计要算这一次。
 		event.Outcome = KongOutcomeFailure
 		event.Detail = detail(extra)
 		s.logEvent(ctx, event)
-		// 退避照样推进，两种情况都要：网络活动已经发生，否则下一个请求立刻再取一次——预期拒收更需要
-		// 退避，因为上游正在发降智档票，立刻重试只会再拿一张 312。
-		cooldown(reason)
+		// 退避照样推进：网络活动已经发生，否则下一个请求会立刻再取一次。
+		cooldown("store_ticket_failed")
 		out.err = err
 		return out
 	}
@@ -1049,7 +1039,7 @@ func (s *KongTicketService) fetchStore(ctx context.Context, account *Account, in
 
 // verifyExistingCandidate 验证缓存里已有的候选。
 //
-// manual 只改**挑哪一张**：人工触发挑最新的（剩余 TTL 最长，且批量取票下它通常就是刚在 292
+// manual 只改**挑哪一张**：人工触发挑最新的（剩余 TTL 最长，且批量取票下它通常就是刚在正常档
 // 窗口里取回的那张），自动触发挑最老的（在清一个队列，先验快过期的才有机会用上它）。挑法之外
 // 两条路径完全相同——验证本身没有"人工版"。
 func (s *KongTicketService) verifyExistingCandidate(ctx context.Context, account *Account, cfg KongTicketConfig, model string, taskStartedAt time.Time, manual bool) (int64, error) {
@@ -1275,7 +1265,7 @@ func (s *KongTicketService) verifyTicket(ctx context.Context, account *Account, 
 	ticketEgress := KongEgressKey(cfg.Egress, cfg.ProxyID)
 	trafficEgress := KongTrafficEgressKey(account.ProxyID)
 	verificationID := uuid.NewString()
-	fingerprint := kongTicketFingerprint(state)
+	fingerprint := kongStateFingerprint(state)
 	snap := kongVerifySnapshot{
 		AccountID: account.ID, Model: model, Mode: cfg.Mode, TicketEgress: ticketEgress,
 		TrafficEgress: trafficEgress, TrafficProxyDigest: kongProxyDigest(trafficProxyURL),
@@ -1936,32 +1926,19 @@ func kongScoresByModel(scores []float64, bank *KongFingerprintBank) map[string]f
 	return out
 }
 
-// kongStateLenDenylist 是一眼就能判定为降智的票长度。
-//
-// 312 是已实测的降智档位长度。它照样会被上游接受，所以不拦住的话会进候选、烧掉一次完整验证
-// （三份挑战、每份几百 token），而结论是注定的。292 不在表里——同为 292 的票也可能不同，长度
-// 只能否定、不能肯定，所以只用它做排除，判定合格仍然必须靠指纹。
-var kongStateLenDenylist = map[int]bool{312: true}
-
 // kongExpiredSweepBatch 是一次机会性清理的上限。
 const kongExpiredSweepBatch = 200
 
 // storeTicket 把一张票收进缓存，返回它的 id 与期限。
 //
-// 三件事挡在入库之前：长度黑名单、按票原值去重、以及顺手清掉已过期的行。放在这里而不是各调用
-// 点，是因为 fetch 与 observed 两条路径都要遵守同一套规则。
+// 两件事挡在入库之前：按票原值去重，以及顺手清掉已过期的行。放在这里而不是各调用点，是因为
+// fetch 与 observed 两条路径都要遵守同一套规则。
+//
+// **不按票的长度或前缀做任何判断。** state 是上游的不透明 token，长度只是其明文长度的旁路泄露，
+// 上游一改明文结构就失效；按长度拒收会在碰巧撞上时把合格票挡掉。档位只由验证（stg0 + 指纹归因）判定。
 func (s *KongTicketService) storeTicket(ctx context.Context, accountID int64, model, state, source string, capture *kongCaptureFacts) (int64, time.Time, bool, error) {
 	if len(state) == 0 {
 		return 0, time.Time{}, false, fmt.Errorf("空票")
-	}
-	if kongStateLenDenylist[len(state)] {
-		n := len(state)
-		s.logEvent(ctx, &KongTicketEvent{
-			AccountID: accountID, Model: model, EventType: KongEventObserve,
-			Outcome: KongOutcomeSkipped, StateLen: &n,
-			Detail: map[string]any{"reason": "state_len_denylisted"},
-		})
-		return 0, time.Time{}, false, &KongErrTicketRejected{Reason: fmt.Sprintf("票长度 %d 在黑名单中", n)}
 	}
 
 	now := time.Now()
@@ -2146,7 +2123,7 @@ func (s *KongTicketService) RevokeUsedTicket(ctx context.Context, accountID int6
 //
 // observe 模式下它还负责触发诊断探测——那是这个模式存在的理由：告诉运维「这个账号当前在什么
 // 档位」，人工据此决定要不要给它开 full。探测走业务出口，不占用票据出口的静默。
-// 返回这张票**可确认的**库内 id。0 表示这次没拿到：按规则拒收（空串、长度黑名单）、落库失败，或者
+// 返回这张票**可确认的**库内 id。0 表示这次没拿到：空串、落库失败，或者
 // 落库结果未知（限期到了、`ON CONFLICT DO NOTHING` 之后回查没成功——那时库里那行可能已经存在）。
 // 所以 0 不等于"库里没有这张票"，调用方不能据此断言未入库。**重复出现的同一张票返回它原来的 id**
 // ——那是同一张票，用量行据此就能看出"上游一直在回发同一个东西"。
@@ -2162,17 +2139,15 @@ func (s *KongTicketService) ObserveState(ctx context.Context, accountID int64, m
 	// observed 票没有采集事实：它是业务响应顺带带回来的，不存在「取票出口」与「取票前静默」。
 	ticketID, expiresAt, inserted, err := s.storeTicket(ctx, accountID, model, state, KongTicketSourceObserved, nil)
 	if err != nil {
-		// 长度黑名单这类**预期拒绝**已经由 storeTicket 自己记过事件，不重复记；其余是持久化故障
-		// ——那种情况下票没进缓存、诊断不会启动，而管理面只看到一条正常的 info，看不出库坏了。
-		if !KongIsExpectedTicketRejection(err) {
-			slog.Error("kong ticket: 被动收票入库失败",
-				"account_id", accountID, "model", model, "state_len", n, "error", err)
-			s.logEvent(ctx, &KongTicketEvent{
-				AccountID: accountID, Model: model, EventType: KongEventObserve,
-				Outcome: KongOutcomeFailure, StateLen: &n,
-				Detail: map[string]any{"error": err.Error(), "phase": "store_ticket"},
-			})
-		}
+		// 入库失败就是持久化故障：票没进缓存、诊断不会启动，而管理面只看到上面那条正常的 info，
+		// 看不出库坏了——所以单独记一条失败。
+		slog.Error("kong ticket: 被动收票入库失败",
+			"account_id", accountID, "model", model, "state_len", n, "error", err)
+		s.logEvent(ctx, &KongTicketEvent{
+			AccountID: accountID, Model: model, EventType: KongEventObserve,
+			Outcome: KongOutcomeFailure, StateLen: &n,
+			Detail: map[string]any{"error": err.Error(), "phase": "store_ticket"},
+		})
 		return 0
 	}
 	if !inserted {
@@ -2285,13 +2260,6 @@ func kongObserveSlot(accountID int64) string {
 	return fmt.Sprintf("observe:%d", accountID)
 }
 
-func kongTicketFingerprint(state string) string {
-	if len(state) <= 12 {
-		return fmt.Sprintf("len:%d", len(state))
-	}
-	return fmt.Sprintf("len:%d:%s", len(state), state[:8])
-}
-
 func kongStrPtr(s string) *string     { return &s }
 func kongIntPtr(v int) *int           { return &v }
 func kongFloatPtr(v float64) *float64 { return &v }
@@ -2384,9 +2352,9 @@ const kongManualVerifyBudgetFloor = 100 * time.Second
 // 一次最多验两张，顺序固定：**先正在服务的那一张，再一张未验候选**。
 //
 //   - 先验当前票是安全优先而不是效率优先：它正在被注入，降智输出正在流出，哪怕它马上就要过期。
-//   - 候选只验**一张**，取最新的那张（剩余 TTL 最长，批量取票下它通常正是刚在 292 窗口里取回的）。
-//     不往更老的翻，是因为候选都来自同一条出口、入库时已过长度黑名单：最新那张归因不合格，基本
-//     就说明账号当前档位低，更老的多半同样不合格，而每张的代价是最多三份真实挑战。
+//   - 候选只验**一张**，取最新的那张（剩余 TTL 最长，批量取票下它通常正是刚在正常档窗口里取回的）。
+//     不往更老的翻，是因为候选都来自同一条出口：最新那张归因不合格，基本就说明账号当前档位低，
+//     更老的多半同样不合格，而每张的代价是最多三份真实挑战。
 //
 // 结论分三态，**只在"真验出问题"时作废**：证据完整而归因不合格（真降档）、或上游明确重发了票
 // （ErrKongTicketNotAccepted，我们那张注入已不作数）→ 作废；重新自证合格 → 通过；超时、429、

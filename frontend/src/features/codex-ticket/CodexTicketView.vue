@@ -234,8 +234,8 @@
                         <span v-if="diagnosisStale(m.diagnosis, row.account_id)" class="text-amber-700 dark:text-amber-300">· 已过期，仅历史</span>
                       </p>
                       <p v-else class="text-xs text-gray-500 dark:text-dark-400">诊断：无样本</p>
-                      <!-- 取样状态与结论分开：每张票都被 312 挡在验证之前时，上面那行会一直停在
-                           几天前的旧结论上，只有这一行能看出现在根本没在采样。 -->
+                      <!-- 取样状态与结论分开：每张票都被挡在验证之前时（如间隔未满），上面那行会一直
+                           停在几天前的旧结论上，只有这一行能看出现在根本没在采样。 -->
                       <p v-if="m.last_sample" class="text-xs text-gray-500 dark:text-dark-400">
                         取样 {{ sampleText(m.last_sample) }} · {{ formatTime(m.last_sample.at) }}
                       </p>

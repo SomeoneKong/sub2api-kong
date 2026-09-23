@@ -44,11 +44,12 @@ type KongRequestFeatures struct {
 	// ReissuedFP / ReissuedLen / ReissuedTicketID 是上游**在响应里又下发**的 state。ReissuedTicketID
 	// 缺省只表示"没拿到可确认的库内 id"（拒收 / 落库失败 / 落库结果未知），不代表库里没有这张票。
 	//
-	// 两重意义：对 full 模式，它等于"上游没接受我们注入的那张"（交付会被拦下）；对所有模式，它是
-	// 逐请求可见的**上游当前档位读数**（292 正常档 / 312 降智档），比聚合统计更早暴露投放切换。
+	// 对 full 模式，它等于"上游没接受我们注入的那张"（交付会被拦下）；对所有模式，它是这一轮上游
+	// 下发了新票的逐请求证据。**长度只作观测记录，不代表档位**：上游 state 是不透明 token，档位只能
+	// 靠指纹验证判定。
 	//
 	// 回发的票会被顺手入库（被动收票），入库了就带上它的 id——凭它能查到这张票后来验成了什么。
-	// **入库失败或按规则被拒（如 312 在长度黑名单里）时只有指纹与长度**：那时库里根本没有这张票，
+	// **入库失败时只有指纹与长度**：那时库里根本没有这张票，
 	// 给个 id 就是假的。
 	ReissuedFP       string `json:"reissued_fp,omitempty"`
 	ReissuedLen      *int   `json:"reissued_len,omitempty"`
@@ -217,10 +218,10 @@ func (r *KongFeatureRecorder) materializeStrippedClientLocked() {
 
 // RecordReissued 记下上游在响应里又下发的 state 及它入库后的 id（0 表示没入库）。
 //
-// 两条下行判定（HTTP 响应头 / WS 的 response.metadata 事件）都经这里，口径因此只有一份。
+// 两条下行判定（HTTP 响应头 / WS 的带内 metadata 事件）都经这里，口径因此只有一份。
 //
-// **三项作为一组整体替换**：一轮里可以先收到一张能入库的票、再收到一张按规则拒收的（如 312 落在
-// 长度黑名单里）。只在 ticketID > 0 时写 id、却不清旧值，会让新的指纹与长度配上**上一张票的 id**
+// **三项作为一组整体替换**：一轮里可以先收到一张能入库的票、再收到一张入库失败的。只在
+// ticketID > 0 时写 id、却不清旧值，会让新的指纹与长度配上**上一张票的 id**
 // ——那是一条指向别的票的假线索，比缺 id 严重。
 func (r *KongFeatureRecorder) RecordReissued(state string, ticketID int64) {
 	if r == nil {

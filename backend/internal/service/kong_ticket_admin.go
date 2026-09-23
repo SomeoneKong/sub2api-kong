@@ -77,9 +77,9 @@ type KongTicketModelStatus struct {
 	Stg0 *KongStg0Stats `json:"stg0"`
 	// LastSample 是最近一次**取样**的处置，与 Diagnosis 回答的问题不同。
 	//
-	// 归因结论只在验证真正跑起来时才有。一个账号可能一直在收票、但每张都因长度黑名单（312）
-	// 或间隔未满被挡在验证之前——那时 Diagnosis 只会停在上一次的旧结论上，运维看不出「现在
-	// 根本没在采样」。两者必须分开表达。
+	// 归因结论只在验证真正跑起来时才有。一个账号可能一直在收票、但每张都因间隔未满被挡在验证
+	// 之前——那时 Diagnosis 只会停在上一次的旧结论上，运维看不出「现在根本没在采样」。两者必须
+	// 分开表达。
 	//
 	// ⚠️ 判据是取样的**全部**出口（见 kongSampleEventTypes）。漏掉一个的后果不是少显示一条，
 	// 而是这一行停在某个更早的事件上、继续声称一件已经不成立的事。
@@ -90,9 +90,9 @@ type KongTicketModelStatus struct {
 type KongTicketSampleNote struct {
 	At      time.Time `json:"at"`
 	Outcome string    `json:"outcome"`
-	// Reason 取事件 detail 里的原因，如 state_len_denylisted / observe_interval_not_due。
+	// Reason 取事件 detail 里的原因，如 observe_interval_not_due。
 	Reason string `json:"reason"`
-	// StateLen 是那张票的长度。312 一眼就能看出这个账号拿到的是降智档。
+	// StateLen 是那张票的长度，只作观测记录：上游 state 是不透明 token，长度不代表档位。
 	StateLen *int `json:"state_len"`
 }
 
@@ -451,9 +451,9 @@ func (s *KongTicketAdminService) latestDiagnosis(ctx context.Context, accountID 
 
 // kongSampleEventTypes 是「取样」的全部出口。判据是**这个事件是否回答"现在在采什么样"**：
 //
-//   - fetch —— 主动取票，成败都算一次取样（失败那条也带 state_len，正是"取到的是降智档"）
+//   - fetch —— 主动取票，成败都算一次取样
 //   - fetch_skipped —— 取票请求压根没发出（缺凭据这类本地失败）
-//   - observe —— 被动收票，含长度黑名单挡掉与按原值去重
+//   - observe —— 被动收票，含按原值去重
 //   - probe_skipped —— 间隔未满、账号不可调度，没有采
 //
 // 集中列一次而不是在调用处枚举：漏掉任一个都不会报错，只会让这一行停在某个更早的事件上、
@@ -466,7 +466,7 @@ var kongSampleEventTypes = []string{
 // lastSample 取最近一次取样处置。
 //
 // 它回答的是「现在还在采样吗、采到的是什么」，与 Diagnosis 的「最近一次归因结论」是两件事：
-// 一个账号可能一直在收票、而每张都被长度黑名单或间隔未满挡在验证之前，那时 Diagnosis 只会停在
+// 一个账号可能一直在收票、而每张都因间隔未满被挡在验证之前，那时 Diagnosis 只会停在
 // 好几天前的旧结论上，只有这一行能看出现在采到的是什么。
 func (s *KongTicketAdminService) lastSample(ctx context.Context, accountID int64, model string) (*KongTicketSampleNote, error) {
 	events, _, err := s.repo.ListEvents(ctx, &KongTicketEventFilter{

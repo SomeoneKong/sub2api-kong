@@ -28,6 +28,7 @@ const reasonTexts: Record<string, string> = {
   ticket_changed_during_verify: '验证期间票已过期或被撤销',
   // 取样处置（observe 与 probe_skipped 事件）
   duplicate_state: '票与上次相同，无新样本',
+  // 后端不按长度拒收、不产生这个原因；库里的历史事件仍带着它，保留以便照常显示。
   state_len_denylisted: '长度在黑名单内，不验证',
   interval_not_elapsed: '未到探测间隔',
   account_unready: '账号不可调度',

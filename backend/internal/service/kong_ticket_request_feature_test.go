@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -157,20 +158,21 @@ func TestKongRequestFeaturesRecordReissuedState(t *testing.T) {
 		}
 	})
 
-	t.Run("回发的是降智档（长度黑名单）：有指纹长度，没有 id", func(t *testing.T) {
-		g, account, _ := kongFeatureTestGateway(t, KongTicketModeOff, ticket)
+	t.Run("回发的票入库失败：有指纹长度，没有 id", func(t *testing.T) {
+		g, account, repo := kongFeatureTestGateway(t, KongTicketModeOff, ticket)
 		req := kongTestGatedRequest(t, `{"model":"gpt-6-astra"}`)
 		attempt, err := g.PrepareUpstream(context.Background(), req, account)
 		if err != nil {
 			t.Fatalf("准入失败: %v", err)
 		}
-		denylisted := strings.Repeat("d", 312)
-		if err := g.AfterUpstream(context.Background(), account, attempt, newResp(denylisted)); err != nil {
+		repo.insertTicketErr = errors.New("票表写不进去")
+		unstored := strings.Repeat("d", 780)
+		if err := g.AfterUpstream(context.Background(), account, attempt, newResp(unstored)); err != nil {
 			t.Fatalf("不该报错: %v", err)
 		}
 		f := attempt.Features.Snapshot()
-		if f == nil || f.ReissuedLen == nil || *f.ReissuedLen != 312 {
-			t.Fatalf("黑名单长度也要如实记下：%+v", f)
+		if f == nil || f.ReissuedLen == nil || *f.ReissuedLen != 780 || f.ReissuedFP != kongStateFingerprint(unstored) {
+			t.Fatalf("入库失败时指纹与长度也要如实记下：%+v", f)
 		}
 		if f.ReissuedTicketID != nil {
 			t.Errorf("没入库就不该有 id：%v", *f.ReissuedTicketID)
@@ -314,7 +316,7 @@ func TestKongRequestFeaturesDistinguishEmptyStateFromAbsent(t *testing.T) {
 	})
 }
 
-// 一轮里先收到能入库的票、再收到被拒收的票时，回发这一组三项必须整体替换。
+// 一轮里先收到能入库的票、再收到一张入库失败的票时，回发这一组三项必须整体替换。
 //
 // 只写 id 不清旧值会让新的指纹与长度配上上一张票的 id——那是一条指向别的票的假线索，比缺 id 严重。
 func TestKongRequestFeaturesReissuedReplacesAsGroup(t *testing.T) {
@@ -340,18 +342,19 @@ func TestKongRequestFeaturesReissuedReplacesAsGroup(t *testing.T) {
 		t.Fatalf("id 指向的不是第一张回发票：%+v", got)
 	}
 
-	// 第二张是降智档，按长度黑名单拒收——库里没有它。
-	denylisted := strings.Repeat("d", 312)
+	// 第二张入库失败——库里没有它。
+	repo.insertTicketErr = errors.New("票表写不进去")
+	unstored := strings.Repeat("d", 780)
 	resp2 := &http.Response{Header: http.Header{}}
-	resp2.Header.Set(openAICodexTurnStateHeader, denylisted)
+	resp2.Header.Set(openAICodexTurnStateHeader, unstored)
 	if err := g.AfterUpstream(context.Background(), account, attempt, resp2); err != nil {
 		t.Fatalf("off 模式不该报错: %v", err)
 	}
 	second := attempt.Features.Snapshot()
-	if second == nil || second.ReissuedLen == nil || *second.ReissuedLen != 312 {
+	if second == nil || second.ReissuedLen == nil || *second.ReissuedLen != 780 {
 		t.Fatalf("第二张回发票的长度没更新：%+v", second)
 	}
-	if second.ReissuedFP != kongStateFingerprint(denylisted) {
+	if second.ReissuedFP != kongStateFingerprint(unstored) {
 		t.Errorf("指纹没更新到第二张：%q", second.ReissuedFP)
 	}
 	if second.ReissuedTicketID != nil {
