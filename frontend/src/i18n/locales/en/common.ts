@@ -213,6 +213,7 @@ export default {
     securityAudit: 'Security Audit',
     contentModeration: 'Content Moderation',
     promptAudit: 'Prompt Audit',
+    kongTicket: 'Codex Ticket',
     auditLogs: 'Audit Logs',
   },
 
