@@ -871,6 +871,7 @@ readLoop:
 
 	if responseID != "" && stateStore != nil {
 		ttl := s.openAIWSResponseStickyTTL()
+		s.kongPlanMarkResponse(ctx, groupID, responseID, account, ttl) // [kong] 续接标记先于响应绑定
 		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
 		stateStore.BindResponseConn(responseID, lease.ConnID(), ttl)
 	}
