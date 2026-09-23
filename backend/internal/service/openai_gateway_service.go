@@ -526,6 +526,12 @@ type OpenAIGatewayService struct {
 
 	// [kong] codex 票：被动收票与请求特征（可选依赖，setter 在 kong_codex_ticket_observe.go）。nil 即不启用。
 	kongTicketObserver *KongTicketObserver
+	// [kong] 账号消耗节奏（可选依赖，setter 在 kong_openai_account_pace_select.go）。nil 即不启用。
+	kongPace *KongOpenAIAccountPace
+	// [kong] 会话数上限（可选依赖，setter 在 kong_openai_session_limit.go）。nil 即不启用。
+	kongSessionLimit *kongSessionLimit
+	// [kong] 请求存活续期（持有以便退出时停止，setter 在 kong_request_liveness.go）。nil 即不启用。
+	kongLiveness *KongRequestLiveness
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

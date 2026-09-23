@@ -411,6 +411,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		} else {
 			normalized = stripped
 		}
+		s.kongSessionRenew(ctx, account) // [kong] 会话数上限：ctx_pool 与 HTTP bridge 每轮续期
 		// [kong] codex 票：本轮的请求特征记录器，出站那一项取剥离之后的帧内值（kong_request_features.go）。
 		turnKongFeatures := KongNewWSFrameFeatures(normalized)
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
@@ -770,6 +771,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			responseID := strings.TrimSpace(result.RequestID)
 			if responseID != "" && stateStore != nil {
 				ttl := s.openAIWSResponseStickyTTL()
+				s.kongPlanMarkResponse(ctx, groupID, responseID, account, ttl) // [kong] 续接标记先于响应绑定
 				logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
 			}
 			nextClientMessage, readErr := readClientMessage()
@@ -1920,6 +1922,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 		if responseID != "" && stateStore != nil {
 			ttl := s.openAIWSResponseStickyTTL()
+			s.kongPlanMarkResponse(ctx, groupID, responseID, account, ttl) // [kong] 续接标记先于响应绑定
 			logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
 			stateStore.BindResponseConn(responseID, connID, ttl)
 		}

@@ -697,7 +697,7 @@ func TestCacheResetCreditsSnapshot(t *testing.T) {
 }
 
 func TestCachePostResetSnapshot(t *testing.T) {
-	repo := &stubQuotaAccountRepo{}
+	repo := &stubQuotaAccountRepo{accounts: map[int64]*Account{100: {ID: 100, Platform: PlatformOpenAI, Type: AccountTypeOAuth}}} // [kong] 窗口转换要读账号
 	svc := &OpenAIQuotaService{accountRepo: repo}
 	credits := &OpenAIRateLimitResetCredits{AvailableCount: 0}
 	balance := "1200.50"

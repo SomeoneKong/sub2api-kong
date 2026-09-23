@@ -159,6 +159,9 @@ func (s *OpenAIGatewayService) setStickySessionAccountID(ctx context.Context, gr
 	if primaryKey == "" {
 		return nil
 	}
+	if err := s.kongPlanMarkSession(ctx, groupID, primaryKey, accountID, ttl); err != nil { // [kong] 先写会话标记，写不进去就不绑定
+		return err
+	}
 
 	if err := s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), primaryKey, accountID, ttl); err != nil {
 		return err
