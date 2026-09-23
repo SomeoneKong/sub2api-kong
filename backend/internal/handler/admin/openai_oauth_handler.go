@@ -514,6 +514,7 @@ func (h *OpenAIOAuthHandler) RefreshQuota(c *gin.Context) {
 		return
 	}
 
+	defer service.KongQuotaAccountLock(c.Request.Context(), accountID)() // [kong] 查询与写缓存同一账号串行，较早的查询不会晚于较新的落库
 	usage, err := h.quotaService.QueryUsage(c.Request.Context(), accountID)
 	if err != nil {
 		response.ErrorFrom(c, err)
