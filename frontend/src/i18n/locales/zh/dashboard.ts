@@ -402,6 +402,8 @@ export default {
     latencyDuration: '总耗时',
     outputTps: '输出 TPS',
     outputTpsHint: '输出 Token ÷ 总耗时（包含首字等待），单位 tok/s。输出 Token 可能包含推理 Token。',
+    latencyOutputSpeed: '速度',
+    latencyOutputSpeedHint: '估算的生成速度：输出 token ÷（总耗时 − 首字）',
     time: '时间',
     ws: 'WS',
     stream: '流式',
