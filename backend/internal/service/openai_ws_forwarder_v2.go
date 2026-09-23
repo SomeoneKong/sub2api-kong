@@ -459,9 +459,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			OpenAIWSMode:                  true,
 			UpstreamTerminalEvent:         upstreamTerminalEvent,
 			ResponseHeaders:               lease.HandshakeHeaders(),
-			Duration:                      time.Since(startTime),
-			FirstTokenMs:                  firstTokenMs,
-			ClientDisconnect:              clientDisconnected,
+			// 这是连接级的握手头，不是本轮响应头（见 CodexQuotaHeaders）。
+			ResponseHeadersFromWSHandshake: true,
+			Duration:                       time.Since(startTime),
+			FirstTokenMs:                   firstTokenMs,
+			ClientDisconnect:               clientDisconnected,
 		}
 	}
 
@@ -647,6 +649,8 @@ readLoop:
 			continue
 		}
 		responseModelObserver.ObserveOpenAI(message, eventType)
+		// 逐轮的额度快照（见 noteOpenAIWSCodexRateLimits）。
+		s.noteOpenAIWSCodexRateLimits(ctx, account, eventType, message)
 		eventCount++
 		if firstEventType == "" {
 			firstEventType = eventType
