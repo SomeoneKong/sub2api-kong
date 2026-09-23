@@ -1024,7 +1024,9 @@ func ParseCodexRateLimitHeaders(headers http.Header) *OpenAICodexUsageSnapshot {
 		snapshot.PrimaryUsedPercent = v
 		hasData = true
 	}
-	if v := parseInt("x-codex-primary-reset-after-seconds"); v != nil {
+	// 荒谬的倒计时会让 reset_at 溢出成过去时间，进而被当成"该窗口已重置"而跳过额度暂停
+	// （见 saneCodexResetAfterSeconds）。两条采集路共用同一道校验，否则同一份输入两侧结论不同。
+	if v := saneCodexResetAfterSeconds(parseInt("x-codex-primary-reset-after-seconds")); v != nil {
 		snapshot.PrimaryResetAfterSeconds = v
 		hasData = true
 	}
@@ -1038,7 +1040,7 @@ func ParseCodexRateLimitHeaders(headers http.Header) *OpenAICodexUsageSnapshot {
 		snapshot.SecondaryUsedPercent = v
 		hasData = true
 	}
-	if v := parseInt("x-codex-secondary-reset-after-seconds"); v != nil {
+	if v := saneCodexResetAfterSeconds(parseInt("x-codex-secondary-reset-after-seconds")); v != nil {
 		snapshot.SecondaryResetAfterSeconds = v
 		hasData = true
 	}
@@ -1166,6 +1168,12 @@ func (s *OpenAIGatewayService) updateCodexUsageSnapshot(ctx context.Context, acc
 	now := time.Now()
 	updates := buildCodexUsageExtraUpdates(snapshot, now)
 	if len(updates) == 0 {
+		return
+	}
+	// Without a used percentage there is no new reading: writing would stamp the
+	// stored percentages with a fresh codex_usage_updated_at and spend the
+	// throttle slot that the next real reading needs.
+	if !hasOpenAIQuotaObservation(updates) {
 		return
 	}
 	if !s.getCodexSnapshotThrottle().Allow(accountID, now) {
