@@ -12,6 +12,7 @@
 
 - **codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）
 - **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）
+- **OpenAI 账号消耗节奏**（旧版选号的重排，设计见 `DESIGN-openai-account-pace.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
@@ -117,6 +118,22 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
 - **前端**（`features/openai-fingerprint-test/`，文案在 feature 内）碰上游的只有两处各两行：
   `AccountActionMenu.vue`「测试连接」下方的菜单项组件与它的 import，`AccountsView.vue` 的弹窗宿主与它的
   import——弹窗不能挂在菜单里，菜单关闭时菜单组件随之卸载。
+
+### OpenAI 账号消耗节奏
+
+- **只挂在旧版选号的第 2 层，只改顺序不改候选**。钩子全在 `openai_gateway_scheduling.go` 的
+  `selectAccountWithLoadAwareness` 里：进入第 2 层处 `kongPaceBegin` + `defer finish`、
+  `shuffleWithinSortGroups` 之后 `reorder`（传入随后倍率排序用的 `rateOrder`）、抢槽循环前 `finalOrder`、两处
+  抢到后 `acquired`、负载读取失败分支开头 `loadFailed`。rebase 时要复核的就是这几处；上游改动这个函数时，要确
+  认 `reorder` 仍在同优先级内的随机打散之后、倍率排序与 compact 分层之前——放到后面会把上游的硬约束冲掉。第 1
+  层（粘性）与第 3 层（兜底等待）刻意不接：粘性优先于短期均衡，兜底等待本就不挑号。过滤条件一概不碰，所以最坏
+  情况也只是退回上游的顺序。
+- **参数放数据目录下的 `openai-account-pace.yaml`，不进 `config.yaml`、也不走环境变量**。要在线调：环境变量每改一
+  次都要重建容器、掐断进行中的流式响应，而组件每分钟检查一次文件，改完即生效；参数又是按套餐分组的嵌套结构，环
+  境变量表达不了。不进 `config.yaml` 是因为上游的 `config.go` 是高频改动面，加字段就多一处 rebase 冲突。文件不
+  存在即功能关闭，改坏时沿用上一份有效配置并在日志与 Redis 的 meta 里报错。
+- **装配**（`wire_gen.go`）：建节奏组件，`SetKongOpenAIAccountPace` 注入网关服务，接好计划组件之后 `Start`；
+  cleanup 里 `StopKongOpenAIAccountPace`。
 
 ## 本地验证的已知差异
 
