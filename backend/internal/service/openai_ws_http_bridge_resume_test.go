@@ -50,6 +50,7 @@ func TestProxyOpenAIWSHTTPBridgeTurnLaterTurn429FailsOverBeforeClientWrite(t *te
 	result, err := svc.proxyOpenAIWSHTTPBridgeTurn(
 		context.Background(), c, account, "access-token", payload, len(payload),
 		"gpt-5.6-sol", "", "", "", "", 281,
+		"",
 		func([]byte) error {
 			writes++
 			return nil
@@ -85,6 +86,7 @@ func TestProxyOpenAIWSHTTPBridgeTurnLaterTurnDoesNotFailOverAfterDownstreamOutpu
 	result, err := svc.proxyOpenAIWSHTTPBridgeTurn(
 		context.Background(), c, account, "sk-test", payload, len(payload),
 		"gpt-5", "", "", "", "", 281,
+		"",
 		func(message []byte) error {
 			writes = append(writes, append([]byte(nil), message...))
 			return nil
@@ -116,13 +118,16 @@ func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t 
 	cfg.Gateway.OpenAIWS.ReadTimeoutSeconds = 3
 	cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 3
 
+	clientRequestHeaderTurnState := ""
 	upstream := &httpUpstreamRecorder{responses: []*http.Response{
 		{
 			StatusCode: http.StatusOK,
-			Header: http.Header{
-				"Content-Type":          []string{"text/event-stream"},
-				openAIWSTurnStateHeader: []string{"old-account-state"},
-			},
+			// 必须用规范化键：Header.Get 查的是规范键，直接用小写常量当 map 键会读不到——那样这条
+			// 用例就成了空场景（A 的局部 state 压根没被赋值，"B 不带 A 的 state" 也就无从谈起）。
+			Header: openAIWSTestHeader(map[string]string{
+				"Content-Type":          "text/event-stream",
+				openAIWSTurnStateHeader: "old-account-state",
+			}),
 			Body: io.NopCloser(strings.NewReader(
 				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_first\",\"output\":[{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"first-ok\"}]},{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"inspect\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
 			)),
@@ -190,6 +195,9 @@ func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t 
 			return
 		}
 		failoverCh <- retryPayload
+		// 换号之前记一笔：两次转发用的是同一个 ginCtx，客户端那份请求头被所有 attempt 共用，
+		// 谁往里写 turn-state，接手的账号就会读到（这正是本用例要挡住的泄漏）。
+		clientRequestHeaderTurnState = ginCtx.Request.Header.Get(openAIWSTurnStateHeader)
 		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(
 			r.Context(), ginCtx, conn, &nextAccount, "access-token-b", retryPayload, nil,
 		)
@@ -259,5 +267,23 @@ func TestOpenAIWSHTTPBridgeLaterTurn429RetriesCurrentTurnOnReplacementAccount(t 
 	require.Contains(t, string(upstream.bodies[2]), "second")
 	require.Equal(t, scopeCodexAccountIdentityValue(&nextAccount, 0, "session", "client-session"), gjson.GetBytes(upstream.bodies[2], "client_metadata.session_id").String())
 	require.Equal(t, scopeCodexAccountIdentityValue(&nextAccount, 0, "thread", "client-thread"), gjson.GetBytes(upstream.bodies[2], "client_metadata.thread_id").String())
-	require.Empty(t, upstream.requests[2].Header.Get(openAIWSTurnStateHeader))
+	// bridge 的 turn-state 必须是**账号本地**的：
+	//   1) A 的第一轮响应确实给了 state（否则下面两条都成了空场景）；
+	//   2) A 的第二轮出站确实回放了它——这是这条 state 的正常用途，不能因为隔离而丢掉；
+	//   3) 换到 B 之后，B 的出站不含 A 的那个；
+	//   4) 客户端那份共用请求头全程不被改动（它被同一请求里所有 attempt 共用）。
+	require.Equal(t, "old-account-state", upstream.requests[1].Header.Get(openAIWSTurnStateHeader),
+		"同账号的后续轮应当回放本账号的 state")
+	require.Empty(t, upstream.requests[2].Header.Get(openAIWSTurnStateHeader),
+		"换号之后不得带上一个账号铸造的 state")
+	require.Empty(t, clientRequestHeaderTurnState, "共用的客户端请求头不得被写入")
+}
+
+// openAIWSTestHeader 按规范化键构造响应头。
+func openAIWSTestHeader(kv map[string]string) http.Header {
+	h := http.Header{}
+	for k, v := range kv {
+		h.Set(k, v)
+	}
+	return h
 }
