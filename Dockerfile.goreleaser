@@ -5,7 +5,8 @@
 # It only packages the pre-built binary, no compilation needed.
 # =============================================================================
 
-ARG ALPINE_IMAGE=alpine:3.21
+# [kong] alpine 3.21 于 2026-11-01 停止维护
+ARG ALPINE_IMAGE=alpine:3.23
 ARG POSTGRES_IMAGE=postgres:18-alpine
 
 FROM ${POSTGRES_IMAGE} AS pg-client
@@ -15,6 +16,9 @@ FROM ${ALPINE_IMAGE}
 LABEL maintainer="Wei-Shaw <github.com/Wei-Shaw>"
 LABEL description="Sub2API - AI API Gateway Platform"
 LABEL org.opencontainers.image.source="https://github.com/Wei-Shaw/sub2api"
+
+# [kong] 官方底座镜像自带的包（CA 包、libssl 等）会落后于源里的安全更新，而 apk add 不升级已装的包。
+RUN apk upgrade --no-cache
 
 # Install runtime dependencies
 RUN apk add --no-cache \
