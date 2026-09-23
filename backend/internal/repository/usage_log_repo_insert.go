@@ -24,64 +24,67 @@ import (
 //
 // When adding a usage_logs column, update all of those call sites together.
 var usageLogInsertArgTypes = [...]string{
-	"bigint",      // user_id
-	"bigint",      // api_key_id
-	"bigint",      // account_id
-	"text",        // request_id
-	"text",        // model
-	"text",        // requested_model
-	"text",        // upstream_model
-	"text",        // upstream_response_model
-	"boolean",     // upstream_model_mismatch
-	"bigint",      // group_id
-	"bigint",      // subscription_id
-	"integer",     // input_tokens
-	"integer",     // output_tokens
-	"integer",     // cache_creation_tokens
-	"integer",     // cache_read_tokens
-	"integer",     // cache_creation_5m_tokens
-	"integer",     // cache_creation_1h_tokens
-	"integer",     // image_output_tokens
-	"numeric",     // image_output_cost
-	"integer",     // image_input_tokens
-	"numeric",     // image_input_cost
-	"numeric",     // input_cost
-	"numeric",     // output_cost
-	"numeric",     // cache_creation_cost
-	"numeric",     // cache_read_cost
-	"numeric",     // total_cost
-	"numeric",     // actual_cost
-	"numeric",     // rate_multiplier
-	"numeric",     // account_rate_multiplier
-	"smallint",    // billing_type
-	"smallint",    // request_type
-	"boolean",     // stream
-	"boolean",     // openai_ws_mode
-	"integer",     // duration_ms
-	"integer",     // first_token_ms
-	"text",        // user_agent
-	"text",        // ip_address
-	"integer",     // image_count
-	"text",        // image_size
-	"text",        // image_input_size
-	"text",        // image_output_size
-	"text",        // image_size_source
-	"jsonb",       // image_size_breakdown
-	"integer",     // video_count
-	"text",        // video_resolution
-	"integer",     // video_duration_seconds
-	"text",        // service_tier
-	"text",        // reasoning_effort
-	"text",        // requested_reasoning_effort
-	"text",        // inbound_endpoint
-	"text",        // upstream_endpoint
-	"boolean",     // cache_ttl_overridden
-	"boolean",     // long_context_billing_applied
-	"bigint",      // channel_id
-	"text",        // model_mapping_chain
-	"text",        // billing_tier
-	"text",        // billing_mode
-	"numeric",     // account_stats_cost
+	"bigint",   // user_id
+	"bigint",   // api_key_id
+	"bigint",   // account_id
+	"text",     // request_id
+	"text",     // model
+	"text",     // requested_model
+	"text",     // upstream_model
+	"text",     // upstream_response_model
+	"boolean",  // upstream_model_mismatch
+	"bigint",   // group_id
+	"bigint",   // subscription_id
+	"integer",  // input_tokens
+	"integer",  // output_tokens
+	"integer",  // cache_creation_tokens
+	"integer",  // cache_read_tokens
+	"integer",  // cache_creation_5m_tokens
+	"integer",  // cache_creation_1h_tokens
+	"integer",  // image_output_tokens
+	"numeric",  // image_output_cost
+	"integer",  // image_input_tokens
+	"numeric",  // image_input_cost
+	"numeric",  // input_cost
+	"numeric",  // output_cost
+	"numeric",  // cache_creation_cost
+	"numeric",  // cache_read_cost
+	"numeric",  // total_cost
+	"numeric",  // actual_cost
+	"numeric",  // rate_multiplier
+	"numeric",  // account_rate_multiplier
+	"smallint", // billing_type
+	"smallint", // request_type
+	"boolean",  // stream
+	"boolean",  // openai_ws_mode
+	"integer",  // duration_ms
+	"integer",  // first_token_ms
+	"text",     // user_agent
+	"text",     // ip_address
+	"integer",  // image_count
+	"text",     // image_size
+	"text",     // image_input_size
+	"text",     // image_output_size
+	"text",     // image_size_source
+	"jsonb",    // image_size_breakdown
+	"integer",  // video_count
+	"text",     // video_resolution
+	"integer",  // video_duration_seconds
+	"text",     // service_tier
+	"text",     // reasoning_effort
+	"text",     // requested_reasoning_effort
+	"text",     // inbound_endpoint
+	"text",     // upstream_endpoint
+	"boolean",  // cache_ttl_overridden
+	"boolean",  // long_context_billing_applied
+	"bigint",   // channel_id
+	"text",     // model_mapping_chain
+	"text",     // billing_tier
+	"text",     // billing_mode
+	"numeric",  // account_stats_cost
+	// [kong] fork 专有列。**插在这里而不是表尾**：上游的 session_id 用例按倒数第 3 / 2 / 1 断言
+	// session_id、native_compaction_v2、created_at 的位置，追加到尾部会把那几个偏移顶掉。
+	"jsonb",       // kong_request_features
 	"text",        // upstream_request_id
 	"text",        // session_id
 	"boolean",     // native_compaction_v2
@@ -283,6 +286,7 @@ func (r *usageLogRepository) createSingle(ctx context.Context, sqlq sqlExecutor,
 			billing_tier,
 			billing_mode,
 			account_stats_cost,
+			kong_request_features,
 			upstream_request_id,
 			session_id,
 			native_compaction_v2,
@@ -293,7 +297,7 @@ func (r *usageLogRepository) createSingle(ctx context.Context, sqlq sqlExecutor,
 			$12, $13, $14, $15,
 			$16, $17, $18, $19,
 			$20, $21, $22, $23, $24, $25,
-			$26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62
+			$26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63
 		)
 		ON CONFLICT (request_id, api_key_id) DO NOTHING
 		RETURNING id, created_at
@@ -743,6 +747,7 @@ func buildUsageLogBatchInsertQuery(keys []string, preparedByKey map[string]usage
 			billing_tier,
 			billing_mode,
 			account_stats_cost,
+			kong_request_features,
 			upstream_request_id,
 			session_id,
 			native_compaction_v2,
@@ -838,6 +843,7 @@ func buildUsageLogBatchInsertQuery(keys []string, preparedByKey map[string]usage
 				billing_tier,
 				billing_mode,
 				account_stats_cost,
+				kong_request_features,
 				upstream_request_id,
 				session_id,
 				native_compaction_v2,
@@ -902,6 +908,7 @@ func buildUsageLogBatchInsertQuery(keys []string, preparedByKey map[string]usage
 				billing_tier,
 				billing_mode,
 				account_stats_cost,
+				kong_request_features,
 				upstream_request_id,
 				session_id,
 				native_compaction_v2,
@@ -1006,6 +1013,7 @@ func buildUsageLogBestEffortInsertQuery(preparedList []usageLogInsertPrepared) (
 			billing_tier,
 			billing_mode,
 			account_stats_cost,
+			kong_request_features,
 			upstream_request_id,
 			session_id,
 			native_compaction_v2,
@@ -1096,6 +1104,7 @@ func buildUsageLogBestEffortInsertQuery(preparedList []usageLogInsertPrepared) (
 			billing_tier,
 			billing_mode,
 			account_stats_cost,
+			kong_request_features,
 			upstream_request_id,
 			session_id,
 			native_compaction_v2,
@@ -1160,6 +1169,7 @@ func buildUsageLogBestEffortInsertQuery(preparedList []usageLogInsertPrepared) (
 			billing_tier,
 			billing_mode,
 			account_stats_cost,
+			kong_request_features,
 			upstream_request_id,
 			session_id,
 			native_compaction_v2,
@@ -1232,6 +1242,7 @@ func execUsageLogInsertNoResult(ctx context.Context, sqlq sqlExecutor, prepared 
 			billing_tier,
 			billing_mode,
 			account_stats_cost,
+			kong_request_features,
 			upstream_request_id,
 			session_id,
 			native_compaction_v2,
@@ -1242,7 +1253,7 @@ func execUsageLogInsertNoResult(ctx context.Context, sqlq sqlExecutor, prepared 
 			$12, $13, $14, $15,
 			$16, $17, $18, $19,
 			$20, $21, $22, $23, $24, $25,
-			$26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62
+			$26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63
 		)
 		ON CONFLICT (request_id, api_key_id) DO NOTHING
 	`, prepared.args...)
@@ -1293,6 +1304,7 @@ func prepareUsageLogInsert(log *service.UsageLog) usageLogInsertPrepared {
 	upstreamModel := nullString(log.UpstreamModel)
 	upstreamResponseModel := nullString(log.UpstreamResponseModel)
 	upstreamModelMismatch := nullBool(log.UpstreamModelMismatch)
+	kongRequestFeatures := nullKongRequestFeaturesJSON(log.KongRequestFeatures)
 
 	var requestIDArg any
 	if requestID != "" {
@@ -1363,6 +1375,7 @@ func prepareUsageLogInsert(log *service.UsageLog) usageLogInsertPrepared {
 			billingTier,
 			billingMode,
 			log.AccountStatsCost, // account_stats_cost
+			kongRequestFeatures,  // kong_request_features
 			upstreamRequestID,    // upstream_request_id
 			sessionID,            // session_id
 			log.NativeCompactionV2,
