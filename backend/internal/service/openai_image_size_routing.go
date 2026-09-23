@@ -225,6 +225,9 @@ func (s *OpenAIGatewayService) bindOpenAIImageSizeSpilloverAccount(ctx context.C
 	if selection.ProfitGateActive() || preserveOpenAIGuardianParentBinding(ctx, sessionHash) {
 		return
 	}
+	if s.kongPlanReplaceBinding(ctx, groupID, sessionHash, selection.Account.ID) { // [kong] 入层换号：把绑定从旧账号条件替换为新账号
+		return
+	}
 	if initialAccountID > 0 {
 		if current, err := s.getStickySessionAccountID(ctx, groupID, sessionHash); err == nil && current == initialAccountID {
 			return

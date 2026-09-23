@@ -361,6 +361,9 @@ func (s *OpenAIGatewayService) BindStickySessionAfterProfitAdmission(ctx context
 	if preserveOpenAIGuardianParentBinding(ctx, sessionHash) {
 		return nil
 	}
+	if s.kongPlanReplaceBinding(ctx, groupID, sessionHash, accountID) { // [kong] 入层换号：把绑定从旧账号条件替换为新账号
+		return nil
+	}
 	if !gatewayProfitControlGateActive(ctx) {
 		return s.BindStickySession(ctx, groupID, sessionHash, accountID)
 	}

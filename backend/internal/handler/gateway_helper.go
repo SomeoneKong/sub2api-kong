@@ -366,7 +366,7 @@ func (h *ConcurrencyHelper) waitForSlotWithPingTimeout(c *gin.Context, slotType 
 		if slotType == "user" {
 			return h.concurrencyService.AcquireUserSlot(ctx, id, maxConcurrency)
 		}
-		return h.concurrencyService.AcquireAccountSlot(ctx, id, maxConcurrency)
+		return h.concurrencyService.AcquireAccountSlot(ctx, id, service.KongWaitConcurrency(id, maxConcurrency)) // [kong] 每次重试读当前生效上限
 	}
 
 	if tryImmediate {
