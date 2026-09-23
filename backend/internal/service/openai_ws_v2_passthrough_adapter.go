@@ -1395,10 +1395,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					KongRequestFeatures:           usageMeta.kongFeatures.Load().Snapshot(),
 					UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(turn.TerminalEventType),
 					ResponseHeaders:               cloneHeader(handshakeHeaders),
-					// [kong] 这是连接级的握手头，不是本轮响应头（见 KongCodexQuotaHeaders）。
-					KongResponseHeadersFromWSHandshake: true,
-					Duration:                           turn.Duration,
-					FirstTokenMs:                       turn.FirstTokenMs,
+					// 这是连接级的握手头，不是本轮响应头（见 CodexQuotaHeaders）。
+					ResponseHeadersFromWSHandshake: true,
+					Duration:                       turn.Duration,
+					FirstTokenMs:                   turn.FirstTokenMs,
 				}
 				logOpenAIWSV2Passthrough(
 					"relay_turn_completed account_id=%d turn=%d request_id=%s terminal_event=%s turn_requested_model=%s turn_upstream_model=%s duration_ms=%d first_token_ms=%d input_tokens=%d output_tokens=%d cache_read_tokens=%d",
@@ -1501,7 +1501,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					}
 				}
 				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
-				// [kong] 逐轮的额度快照：原生 WS 没有逐轮响应头，上游把它放在带外事件里
+				// 逐轮的额度快照：原生 WS 没有逐轮响应头，上游把它放在带外事件里
 				// （见 noteOpenAIWSCodexRateLimits）。解析与调用都放在 Text 判断**之前**——
 				// passthrough 双向都允许二进制帧，这份 JSON 用 Binary 帧一样发得出来，理由同上面的
 				// 交付判定；非 JSON 的二进制帧取不出字段，对它是透明的。
@@ -1620,10 +1620,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		KongRequestFeatures:           usageMeta.kongFeatures.Load().Snapshot(),
 		UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(relayResult.TerminalEventType),
 		ResponseHeaders:               cloneHeader(handshakeHeaders),
-		// [kong] 这是连接级的握手头，不是本轮响应头（见 KongCodexQuotaHeaders）。
-		KongResponseHeadersFromWSHandshake: true,
-		Duration:                           relayResult.Duration,
-		FirstTokenMs:                       relayResult.FirstTokenMs,
+		// 这是连接级的握手头，不是本轮响应头（见 CodexQuotaHeaders）。
+		ResponseHeadersFromWSHandshake: true,
+		Duration:                       relayResult.Duration,
+		FirstTokenMs:                   relayResult.FirstTokenMs,
 	}
 
 	turnCount := int(completedTurns.Load())

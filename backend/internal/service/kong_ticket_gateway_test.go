@@ -241,7 +241,7 @@ func TestKongPrepareWSTurnInjectsClientMetadata(t *testing.T) {
 	if attempt == nil || attempt.Grant == nil {
 		t.Fatal("应当注入了票")
 	}
-	if got := gjson.GetBytes(next, "client_metadata."+kongWSTurnStateMetadataKey).String(); got != state {
+	if got := gjson.GetBytes(next, "client_metadata."+openAIWSTurnStateMetadataKey).String(); got != state {
 		t.Errorf("client_metadata 里的票 = %q, want %q", got, state)
 	}
 	// 既有的 client_metadata 字段不能被抹掉。
@@ -347,7 +347,7 @@ func TestKongGuardWSDownstream(t *testing.T) {
 // 同一条连接上还有别的带外事件，不能按 codex. 前缀泛化。
 func TestKongWSTurnStateMetadataEvent(t *testing.T) {
 	for _, ok := range []string{"response.metadata", "codex.response.metadata", "  codex.response.metadata  "} {
-		if !kongWSTurnStateMetadataEvent(ok) {
+		if !isOpenAIWSTurnStateMetadataEvent(ok) {
 			t.Errorf("%q 应判为载体事件", ok)
 		}
 	}
@@ -356,7 +356,7 @@ func TestKongWSTurnStateMetadataEvent(t *testing.T) {
 		"response.completed", "response.output_text.delta",
 		"metadata", "codex.response.metadata.extra",
 	} {
-		if kongWSTurnStateMetadataEvent(no) {
+		if isOpenAIWSTurnStateMetadataEvent(no) {
 			t.Errorf("%q 不该判为载体事件", no)
 		}
 	}

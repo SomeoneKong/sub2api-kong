@@ -17,16 +17,16 @@ import (
 
 // 线上实测的整帧形状：prolite 账号只有 primary 一个窗口，secondary 显式为 null，
 // credits.balance 是字符串——同一帧里两种数字表示都出现过。
-const kongRealCodexRateLimitsFrame = `{"type":"codex.rate_limits","plan_type":"prolite",` +
+const realCodexRateLimitsFrame = `{"type":"codex.rate_limits","plan_type":"prolite",` +
 	`"rate_limits":{"allowed":true,"limit_reached":false,` +
 	`"primary":{"used_percent":61,"window_minutes":10080,"reset_after_seconds":564029,"reset_at":1790653541},` +
 	`"secondary":null},` +
 	`"code_review_rate_limits":null,"additional_rate_limits":null,` +
 	`"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"promo":null}`
 
-func TestKongParseCodexRateLimitEvent(t *testing.T) {
+func TestParseOpenAIWSCodexRateLimitEvent(t *testing.T) {
 	t.Run("线上实测帧：只有 primary，secondary 为 null", func(t *testing.T) {
-		got := kongParseCodexRateLimitEvent([]byte(kongRealCodexRateLimitsFrame))
+		got := parseOpenAIWSCodexRateLimitEvent([]byte(realCodexRateLimitsFrame))
 		require.NotNil(t, got)
 		require.NotNil(t, got.PrimaryUsedPercent)
 		require.InDelta(t, 61, *got.PrimaryUsedPercent, 0.001)
@@ -49,7 +49,7 @@ func TestKongParseCodexRateLimitEvent(t *testing.T) {
 		frame := []byte(`{"type":"codex.rate_limits","rate_limits":{` +
 			`"primary":{"used_percent":12.5,"window_minutes":10080,"reset_after_seconds":600},` +
 			`"secondary":{"used_percent":88,"window_minutes":300,"reset_after_seconds":60}}}`)
-		norm := kongParseCodexRateLimitEvent(frame).Normalize()
+		norm := parseOpenAIWSCodexRateLimitEvent(frame).Normalize()
 		require.NotNil(t, norm)
 		require.InDelta(t, 88, *norm.Used5hPercent, 0.001)
 		require.InDelta(t, 12.5, *norm.Used7dPercent, 0.001)
@@ -58,7 +58,7 @@ func TestKongParseCodexRateLimitEvent(t *testing.T) {
 	t.Run("数字字符串也认", func(t *testing.T) {
 		frame := []byte(`{"type":"codex.rate_limits","rate_limits":{` +
 			`"primary":{"used_percent":"61.5","window_minutes":"10080"}}}`)
-		got := kongParseCodexRateLimitEvent(frame)
+		got := parseOpenAIWSCodexRateLimitEvent(frame)
 		require.NotNil(t, got)
 		require.InDelta(t, 61.5, *got.PrimaryUsedPercent, 0.001)
 		require.Equal(t, 10080, *got.PrimaryWindowMinutes)
@@ -71,7 +71,7 @@ func TestKongParseCodexRateLimitEvent(t *testing.T) {
 		for _, bad := range []string{"NaN", "Inf", "1e400", "10080.5", "  300  ", " 300 ", "", "12a", "+5x"} {
 			frame := []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{` +
 				`"used_percent":50,"window_minutes":"` + bad + `"}}}`)
-			got := kongParseCodexRateLimitEvent(frame)
+			got := parseOpenAIWSCodexRateLimitEvent(frame)
 			require.NotNil(t, got, "used_percent 仍然有效，快照不该整份丢掉：window=%q", bad)
 			require.Nil(t, got.PrimaryWindowMinutes, "window_minutes=%q 必须被拒（Atoi 也拒）", bad)
 			require.Nil(t, ParseCodexRateLimitHeaders(http.Header{
@@ -83,7 +83,7 @@ func TestKongParseCodexRateLimitEvent(t *testing.T) {
 			frame := []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{"window_minutes":"` + good + `"}}}`)
 			want, err := strconv.Atoi(good)
 			require.NoError(t, err)
-			require.Equal(t, want, *kongParseCodexRateLimitEvent(frame).PrimaryWindowMinutes, "window=%q", good)
+			require.Equal(t, want, *parseOpenAIWSCodexRateLimitEvent(frame).PrimaryWindowMinutes, "window=%q", good)
 		}
 	})
 
@@ -93,16 +93,16 @@ func TestKongParseCodexRateLimitEvent(t *testing.T) {
 		for _, bad := range []string{"360.00000000000001", "10080.0", "1e400", "-1e400"} {
 			frame := []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{` +
 				`"used_percent":50,"window_minutes":` + bad + `}}}`)
-			got := kongParseCodexRateLimitEvent(frame)
+			got := parseOpenAIWSCodexRateLimitEvent(frame)
 			require.NotNil(t, got)
 			require.Nil(t, got.PrimaryWindowMinutes, "window_minutes=%s 必须被拒", bad)
 		}
 		exact := []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{"window_minutes":9007199254740993}}}`)
-		require.Equal(t, 9007199254740993, *kongParseCodexRateLimitEvent(exact).PrimaryWindowMinutes,
+		require.Equal(t, 9007199254740993, *parseOpenAIWSCodexRateLimitEvent(exact).PrimaryWindowMinutes,
 			"整数字面量必须按原值取，不能经 float64")
 		// 非有限的百分比同样挡在外面（ParseFloat 自己就报越界）。
 		inf := []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":1e400,"window_minutes":300}}}`)
-		got := kongParseCodexRateLimitEvent(inf)
+		got := parseOpenAIWSCodexRateLimitEvent(inf)
 		require.Nil(t, got.PrimaryUsedPercent, "非有限百分比必须被拒")
 		require.Equal(t, 300, *got.PrimaryWindowMinutes, "同帧其它正常字段必须保留")
 	})
@@ -110,10 +110,10 @@ func TestKongParseCodexRateLimitEvent(t *testing.T) {
 	t.Run("荒谬的重置秒数两侧都挡，且只丢这一个字段", func(t *testing.T) {
 		// time.Duration(sec)*time.Second 在 sec 超过约 9.22e9 时溢出，reset_at 会落到过去，
 		// 被读成"该窗口已重置"，于是 100% 的窗口被调度直接跳过——额度暂停失效。
-		for _, bad := range []int{9223372037, kongMaxCodexResetAfterSeconds + 1, -1} {
+		for _, bad := range []int{9223372037, maxCodexResetAfterSeconds + 1, -1} {
 			frame := []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{` +
 				`"used_percent":100,"window_minutes":300,"reset_after_seconds":` + strconv.Itoa(bad) + `}}}`)
-			got := kongParseCodexRateLimitEvent(frame)
+			got := parseOpenAIWSCodexRateLimitEvent(frame)
 			require.NotNil(t, got)
 			require.Nil(t, got.PrimaryResetAfterSeconds, "reset_after_seconds=%d 必须被拒", bad)
 			require.InDelta(t, 100, *got.PrimaryUsedPercent, 0.001, "同窗口的水位必须保留")
@@ -128,7 +128,7 @@ func TestKongParseCodexRateLimitEvent(t *testing.T) {
 			require.Nil(t, h.PrimaryResetAfterSeconds, "HTTP 侧 reset_after_seconds=%d 也必须被拒", bad)
 		}
 		okFrame := []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{"reset_after_seconds":564029}}}`)
-		require.Equal(t, 564029, *kongParseCodexRateLimitEvent(okFrame).PrimaryResetAfterSeconds)
+		require.Equal(t, 564029, *parseOpenAIWSCodexRateLimitEvent(okFrame).PrimaryResetAfterSeconds)
 	})
 
 	t.Run("没有可用数据就返回 nil，不产出空快照", func(t *testing.T) {
@@ -140,15 +140,15 @@ func TestKongParseCodexRateLimitEvent(t *testing.T) {
 			`{"type":"response.completed"}`,
 			``,
 		} {
-			require.Nil(t, kongParseCodexRateLimitEvent([]byte(payload)), "payload=%s", payload)
+			require.Nil(t, parseOpenAIWSCodexRateLimitEvent([]byte(payload)), "payload=%s", payload)
 		}
 	})
 }
 
 // 两侧口径必须同源：事件体与响应头描述同一份额度时，落到账号 extra 上的规范字段要一致。
 // 各自归一化会对同一个账号算出不同水位，而那种不一致不报错，只会让调度照两个矛盾的数做决定。
-func TestKongCodexRateLimitEventMatchesHeaderPath(t *testing.T) {
-	fromEvent := kongParseCodexRateLimitEvent([]byte(`{"type":"codex.rate_limits","rate_limits":{` +
+func TestOpenAIWSCodexRateLimitEventMatchesHeaderPath(t *testing.T) {
+	fromEvent := parseOpenAIWSCodexRateLimitEvent([]byte(`{"type":"codex.rate_limits","rate_limits":{` +
 		`"primary":{"used_percent":61,"window_minutes":10080,"reset_after_seconds":564029},` +
 		`"secondary":{"used_percent":7,"window_minutes":300,"reset_after_seconds":120}}}`))
 	fromHeaders := ParseCodexRateLimitHeaders(http.Header{
@@ -195,8 +195,8 @@ func TestNoteOpenAIWSCodexRateLimits(t *testing.T) {
 
 	t.Run("额度事件落到账号 extra", func(t *testing.T) {
 		svc, calls := newSvc(account)
-		svc.noteOpenAIWSCodexRateLimits(context.Background(), &account, kongWSCodexRateLimitsEvent,
-			[]byte(kongRealCodexRateLimitsFrame))
+		svc.noteOpenAIWSCodexRateLimits(context.Background(), &account, openAIWSCodexRateLimitsEvent,
+			[]byte(realCodexRateLimitsFrame))
 		select {
 		case updates := <-calls:
 			require.InDelta(t, 61, updates["codex_7d_used_percent"], 0.001)
@@ -211,8 +211,8 @@ func TestNoteOpenAIWSCodexRateLimits(t *testing.T) {
 		parent := int64(7)
 		shadow := Account{ID: 8, Platform: PlatformOpenAI, ParentAccountID: &parent}
 		svc, calls := newSvc(shadow)
-		svc.noteOpenAIWSCodexRateLimits(context.Background(), &shadow, kongWSCodexRateLimitsEvent,
-			[]byte(kongRealCodexRateLimitsFrame))
+		svc.noteOpenAIWSCodexRateLimits(context.Background(), &shadow, openAIWSCodexRateLimitsEvent,
+			[]byte(realCodexRateLimitsFrame))
 		select {
 		case updates := <-calls:
 			t.Fatalf("影子账号不该写 codex_*：%v", updates)
@@ -225,7 +225,7 @@ func TestNoteOpenAIWSCodexRateLimits(t *testing.T) {
 		// 同一条连接上别的带外事件与业务事件都不该触发写入。
 		for _, et := range []string{"codex.response.metadata", "responsesapi.websocket_timing", "response.completed", ""} {
 			svc.noteOpenAIWSCodexRateLimits(context.Background(), &account, et,
-				[]byte(kongRealCodexRateLimitsFrame))
+				[]byte(realCodexRateLimitsFrame))
 		}
 		select {
 		case updates := <-calls:
@@ -237,22 +237,22 @@ func TestNoteOpenAIWSCodexRateLimits(t *testing.T) {
 
 // 连接级的握手头不得回填逐轮额度：那份是拨号时刻的，会把带内事件采到的实时水位覆盖成旧值
 // （落库节流 30s，一轮超过它就会发生），还会用当前时间重算旧的相对重置秒数。
-func TestKongCodexQuotaHeadersRejectsWSHandshakeHeaders(t *testing.T) {
+func TestCodexQuotaHeadersRejectsWSHandshakeHeaders(t *testing.T) {
 	headers := http.Header{"X-Codex-Primary-Used-Percent": []string{"7"}}
 
 	handshake := &OpenAIForwardResult{ResponseHeaders: headers, OpenAIWSMode: true,
-		KongResponseHeadersFromWSHandshake: true}
-	require.Nil(t, handshake.KongCodexQuotaHeaders(), "握手头不得用于逐轮额度")
+		ResponseHeadersFromWSHandshake: true}
+	require.Nil(t, handshake.CodexQuotaHeaders(), "握手头不得用于逐轮额度")
 
 	// WS-HTTP bridge 同样是 WS 模式，但它的响应头是本轮真实的 HTTP 响应头，必须照常刷新——
 	// 所以判据不能是 !OpenAIWSMode。
 	bridge := &OpenAIForwardResult{ResponseHeaders: headers, OpenAIWSMode: true}
-	require.Equal(t, headers, bridge.KongCodexQuotaHeaders(), "bridge 的本轮响应头必须照常用于额度")
+	require.Equal(t, headers, bridge.CodexQuotaHeaders(), "bridge 的本轮响应头必须照常用于额度")
 
 	plainHTTP := &OpenAIForwardResult{ResponseHeaders: headers}
-	require.Equal(t, headers, plainHTTP.KongCodexQuotaHeaders())
+	require.Equal(t, headers, plainHTTP.CodexQuotaHeaders())
 
-	require.Nil(t, (*OpenAIForwardResult)(nil).KongCodexQuotaHeaders())
+	require.Nil(t, (*OpenAIForwardResult)(nil).CodexQuotaHeaders())
 }
 
 // 三条 WS 通路里的每一个 OpenAIForwardResult 都必须带上握手头标记。
@@ -261,8 +261,8 @@ func TestKongCodexQuotaHeadersRejectsWSHandshakeHeaders(t *testing.T) {
 // 都会让那处构造点从检查里消失，而全局的"至少找到一处"又被其余构造点满足，于是漏标静默通过。
 // 这三个文件里的结果全都是 WS 轮次的结果，所以规则直接取"每一个都必须打标"——bridge 那条路的
 // 结果构造在另一个文件里，它的响应头是本轮真实的 HTTP 响应头，不在此列。
-func TestKongWSResultsMarkHandshakeHeaders(t *testing.T) {
-	const marker = "KongResponseHeadersFromWSHandshake"
+func TestOpenAIWSResultsMarkHandshakeHeaders(t *testing.T) {
+	const marker = "ResponseHeadersFromWSHandshake"
 	total := 0
 	for _, file := range []string{
 		"openai_ws_forwarder_ingress.go",
@@ -314,7 +314,7 @@ func TestKongWSResultsMarkHandshakeHeaders(t *testing.T) {
 //
 // **它保证的是"语法上接上了"，不是"运行时一定执行到"**——后者要靠各通路的行为测试，
 // 而那需要上游连接夹具，目前是已知缺口。
-func TestKongEveryUpstreamWSReaderIngestsRateLimits(t *testing.T) {
+func TestEveryUpstreamWSReaderIngestsRateLimits(t *testing.T) {
 	const ingest = "noteOpenAIWSCodexRateLimits"
 
 	for _, file := range []string{
@@ -326,12 +326,12 @@ func TestKongEveryUpstreamWSReaderIngestsRateLimits(t *testing.T) {
 		parsed, err := parser.ParseFile(fset, file, nil, 0)
 		require.NoError(t, err)
 		readers := 0
-		for _, body := range kongASTFuncBodies(parsed) {
-			if !kongASTCallsDirect(body, "ReadMessageWithContextTimeout", "") {
+		for _, body := range astFuncBodies(parsed) {
+			if !astCallsDirect(body, "ReadMessageWithContextTimeout", "") {
 				continue
 			}
 			readers++
-			require.True(t, kongASTCallsDirect(body, ingest, "s"),
+			require.True(t, astCallsDirect(body, ingest, "s"),
 				"%s:%d 的函数体读了上游帧但没在同一体内接额度采集",
 				file, fset.Position(body.Pos()).Line)
 		}
@@ -354,15 +354,15 @@ func TestKongEveryUpstreamWSReaderIngestsRateLimits(t *testing.T) {
 		fn, ok := kv.Value.(*ast.FuncLit)
 		require.True(t, ok, "BeforeWriteClient 不再是函数字面量——测试的定位方式已失效")
 		hooks++
-		require.True(t, kongASTCallsDirect(fn.Body, ingest, "s"),
+		require.True(t, astCallsDirect(fn.Body, ingest, "s"),
 			"passthrough 的 BeforeWriteClient 回调体内没接额度采集")
 		return true
 	})
 	require.NotZero(t, hooks, "passthrough 里没找到 BeforeWriteClient——测试的定位方式已失效")
 }
 
-// kongASTFuncBodies 列出文件里所有函数体（含闭包）。
-func kongASTFuncBodies(file *ast.File) []*ast.BlockStmt {
+// astFuncBodies 列出文件里所有函数体（含闭包）。
+func astFuncBodies(file *ast.File) []*ast.BlockStmt {
 	var bodies []*ast.BlockStmt
 	ast.Inspect(file, func(n ast.Node) bool {
 		switch fn := n.(type) {
@@ -378,14 +378,14 @@ func kongASTFuncBodies(file *ast.File) []*ast.BlockStmt {
 	return bodies
 }
 
-// kongASTCallsDirect 判断某个函数体里**直接**有没有对应调用——不下钻到嵌套的函数字面量。
+// astCallsDirect 判断某个函数体里**直接**有没有对应调用——不下钻到嵌套的函数字面量。
 //
 // "同一个函数体"这个范围是关键：读点在哪个体里，采集就得在哪个体里。只要范围放宽到整个顶层函数，
 // 把采集写进一个根本没被调用的 closure 也会算作已接入。
 //
 // recv 非空时只认该接收者上的调用（采集用 "s"，同名但挂在别的接收者上的方法不算接入）；
 // recv 为空时不问接收者（上游读点挂在 lease 上）。
-func kongASTCallsDirect(body *ast.BlockStmt, name, recv string) bool {
+func astCallsDirect(body *ast.BlockStmt, name, recv string) bool {
 	found := false
 	var visit func(n ast.Node) bool
 	visit = func(n ast.Node) bool {

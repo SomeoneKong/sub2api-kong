@@ -290,14 +290,14 @@ func TestKongRequestFeaturesDistinguishEmptyStateFromAbsent(t *testing.T) {
 			t.Error("键不存在时必须是不存在")
 		}
 		got := kongOutboundStateFromWSMap(map[string]any{
-			"client_metadata": map[string]any{kongWSTurnStateMetadataKey: ""},
+			"client_metadata": map[string]any{openAIWSTurnStateMetadataKey: ""},
 		})
 		if !got.present || got.value != "" {
 			t.Errorf("键存在且值为空串时应当是「存在且为空」，实得 %+v", got)
 		}
 		// 值不是字符串时上游读不出票，等同没带——不能当成空串。
 		if got := kongOutboundStateFromWSMap(map[string]any{
-			"client_metadata": map[string]any{kongWSTurnStateMetadataKey: 42},
+			"client_metadata": map[string]any{openAIWSTurnStateMetadataKey: 42},
 		}); got.present {
 			t.Error("值不是字符串时应当是不存在")
 		}
@@ -471,7 +471,7 @@ func TestKongPrepareWSMapPayloadDoesNotMutateCallerMetadata(t *testing.T) {
 	// 调用方的请求体：重试循环里复用的就是它。
 	reqBody := map[string]any{
 		"model":           "gpt-6-astra",
-		"client_metadata": map[string]any{kongWSTurnStateMetadataKey: clientOwn, "session_id": "s"},
+		"client_metadata": map[string]any{openAIWSTurnStateMetadataKey: clientOwn, "session_id": "s"},
 	}
 	// 照 buildOpenAIWSCreatePayload 的做法：只拷顶层。
 	shallow := func() map[string]any {
@@ -502,8 +502,8 @@ func TestKongPrepareWSMapPayloadDoesNotMutateCallerMetadata(t *testing.T) {
 		}
 		// 调用方那份请求体必须原样不动。
 		meta := reqBody["client_metadata"].(map[string]any)
-		if meta[kongWSTurnStateMetadataKey] != clientOwn {
-			t.Fatalf("第 %d 次准入改动了调用方的请求体：%v", attempt, meta[kongWSTurnStateMetadataKey])
+		if meta[openAIWSTurnStateMetadataKey] != clientOwn {
+			t.Fatalf("第 %d 次准入改动了调用方的请求体：%v", attempt, meta[openAIWSTurnStateMetadataKey])
 		}
 		if meta["session_id"] != "s" {
 			t.Errorf("第 %d 次准入弄丢了 client_metadata 里的其它键", attempt)
@@ -1039,7 +1039,7 @@ func TestKongNonGatedModelObservedOverWS(t *testing.T) {
 		g, account, _ := kongFeatureTestGateway(t, KongTicketModeFull, ticket)
 		payload := map[string]any{
 			"model":           "gpt-6-sol",
-			"client_metadata": map[string]any{kongWSTurnStateMetadataKey: clientOwn},
+			"client_metadata": map[string]any{openAIWSTurnStateMetadataKey: clientOwn},
 		}
 		attempt, err := g.PrepareWSMapPayload(context.Background(), account, "gpt-6-sol", payload)
 		if err != nil {
@@ -1048,7 +1048,7 @@ func TestKongNonGatedModelObservedOverWS(t *testing.T) {
 		if attempt == nil || attempt.Grant != nil {
 			t.Fatalf("非门控模型应当建不带票的 attempt：%+v", attempt)
 		}
-		if got := payload["client_metadata"].(map[string]any)[kongWSTurnStateMetadataKey]; got != clientOwn {
+		if got := payload["client_metadata"].(map[string]any)[openAIWSTurnStateMetadataKey]; got != clientOwn {
 			t.Error("非门控模型的载荷被改写了")
 		}
 		if f := attempt.Features.Snapshot(); f == nil || f.StateFP != kongStateFingerprint(clientOwn) {

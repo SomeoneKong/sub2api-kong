@@ -49,7 +49,7 @@ func (g *KongTicketGateway) PrepareWSMapPayload(ctx context.Context, account *Ac
 	}
 	meta, ok := payload["client_metadata"]
 	if !ok || meta == nil {
-		payload["client_metadata"] = map[string]any{kongWSTurnStateMetadataKey: grant.State}
+		payload["client_metadata"] = map[string]any{openAIWSTurnStateMetadataKey: grant.State}
 		return kongNewAttempt(model, grant, clientState, kongObservedState(grant.State)), nil
 	}
 	typed, ok := meta.(map[string]any)
@@ -65,7 +65,7 @@ func (g *KongTicketGateway) PrepareWSMapPayload(ctx context.Context, account *Ac
 	for k, v := range typed {
 		next[k] = v
 	}
-	next[kongWSTurnStateMetadataKey] = grant.State
+	next[openAIWSTurnStateMetadataKey] = grant.State
 	payload["client_metadata"] = next
 	return kongNewAttempt(model, grant, clientState, kongObservedState(grant.State)), nil
 }

@@ -115,7 +115,7 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 			continue
 		}
 		prewarmEventCount++
-		// [kong] 预热有自己的读循环，额度事件在这里就被消费掉了、正式循环再也看不到；之后若断连或
+		// 预热有自己的读循环，额度事件在这里就被消费掉了、正式循环再也看不到；之后若断连或
 		// 报错就直接返回，账号会一直留着旧水位（见 noteOpenAIWSCodexRateLimits）。
 		s.noteOpenAIWSCodexRateLimits(ctx, account, eventType, message)
 		if prewarmResponseID == "" && eventResponseID != "" {

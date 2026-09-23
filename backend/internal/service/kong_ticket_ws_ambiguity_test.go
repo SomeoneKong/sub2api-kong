@@ -90,19 +90,19 @@ func TestKongPrepareWSTurnRejectsUnverifiableInjection(t *testing.T) {
 
 	// 客户端在同一个 metadata 对象里塞了两个票据键：sjson 改掉第一个，第二个仍是客户端的。
 	dup := []byte(`{"type":"response.create","model":"gpt-6-astra","client_metadata":{"` +
-		kongWSTurnStateMetadataKey + `":"x","` + kongWSTurnStateMetadataKey + `":"y"}}`)
+		openAIWSTurnStateMetadataKey + `":"x","` + openAIWSTurnStateMetadataKey + `":"y"}}`)
 	if _, attempt, err := g.PrepareWSTurn(context.Background(), account, "gpt-6-astra", dup); !KongIsTicketDenied(err) {
 		t.Errorf("票不唯一时必须拒服，得到 attempt=%v err=%v", attempt, err)
 	}
 
 	// 客户端自带一个票据键、只有一份时，覆盖后是唯一且等于我们的票，应当放行。
 	single := []byte(`{"type":"response.create","model":"gpt-6-astra","client_metadata":{"` +
-		kongWSTurnStateMetadataKey + `":"client-own"}}`)
+		openAIWSTurnStateMetadataKey + `":"client-own"}}`)
 	next, attempt, err := g.PrepareWSTurn(context.Background(), account, "gpt-6-astra", single)
 	if err != nil || attempt == nil || attempt.Grant == nil {
 		t.Fatalf("覆盖客户端自带票应当成功：attempt=%v err=%v", attempt, err)
 	}
-	if got := gjson.GetBytes(next, "client_metadata."+kongWSTurnStateMetadataKey).String(); got != state {
+	if got := gjson.GetBytes(next, "client_metadata."+openAIWSTurnStateMetadataKey).String(); got != state {
 		t.Errorf("注入后的票 = %q, want %q", got, state)
 	}
 }

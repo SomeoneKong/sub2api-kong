@@ -303,9 +303,6 @@ func (g *KongTicketGateway) AfterUpstream(ctx context.Context, account *Account,
 // 本轮证据就在本轮的下行事件里，且 `response.metadata` 在 turn start 就到，先于任何内容分片。
 // ---------------------------------------------------------------------------
 
-// kongWSTurnStateMetadataKey 是 WS 上回送票据的 client_metadata 键。
-const kongWSTurnStateMetadataKey = "x-codex-turn-state"
-
 // kongWSDecisionKeys 是「读成哪个值会改变判定结果」的顶层键。
 //
 //   - `model` 决定这一帧是否受门控；
@@ -391,7 +388,7 @@ func kongWSVerifyInjectedState(raw []byte, want string) string {
 	stateCount := 0
 	got := ""
 	meta.ForEach(func(key, item gjson.Result) bool {
-		if key.String() != kongWSTurnStateMetadataKey {
+		if key.String() != openAIWSTurnStateMetadataKey {
 			return true
 		}
 		stateCount++
@@ -457,7 +454,7 @@ func (g *KongTicketGateway) PrepareWSTurn(ctx context.Context, account *Account,
 		}
 		return payload, nil, denied
 	}
-	next, err := sjson.SetBytes(payload, "client_metadata."+kongWSTurnStateMetadataKey, grant.State)
+	next, err := sjson.SetBytes(payload, "client_metadata."+openAIWSTurnStateMetadataKey, grant.State)
 	if err != nil {
 		// 写不进去就等于没注入。放行会让这一轮不受保障，所以拒。
 		return payload, nil, &KongErrTicketDenied{Reason: "inject_failed: " + err.Error()}
@@ -479,10 +476,10 @@ func (g *KongTicketGateway) GuardWSDownstream(ctx context.Context, account *Acco
 		return nil
 	}
 	eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
-	if !kongWSTurnStateMetadataEvent(eventType) {
+	if !isOpenAIWSTurnStateMetadataEvent(eventType) {
 		return nil
 	}
-	state := kongWSTurnStateFromEvent(payload)
+	state := openAIWSTurnStateFromEvent(payload)
 	if state == "" {
 		return nil
 	}
@@ -537,10 +534,10 @@ func (g *KongTicketGateway) ObserveWSDownstream(ctx context.Context, account *Ac
 	if !g.Enabled() || account == nil || len(payload) == 0 {
 		return
 	}
-	if eventType, _, _ := parseOpenAIWSEventEnvelope(payload); !kongWSTurnStateMetadataEvent(eventType) {
+	if eventType, _, _ := parseOpenAIWSEventEnvelope(payload); !isOpenAIWSTurnStateMetadataEvent(eventType) {
 		return
 	}
-	state := kongWSTurnStateFromEvent(payload)
+	state := openAIWSTurnStateFromEvent(payload)
 	if state == "" {
 		return
 	}
@@ -600,49 +597,6 @@ func (g *KongTicketGateway) ObserveHandshakeState(ctx context.Context, account *
 		return
 	}
 	g.svc.ObserveState(ctx, account.ID, model, state)
-}
-
-// kongWSTurnStateMetadataEvent 判断一帧是不是带内 turn-state 的载体事件。
-//
-// **两种拼写都要认。** 原生 WS 上游发的是 `codex.response.metadata`（实测线上帧得到；codex-rs 的
-// `codex-api/src/endpoint/responses_websocket.rs` 是**客户端接收侧**，它按这个名字取 models-etag，
-// `sse/responses.rs` 的公共事件表也列了它），SSE 上则是不带前缀的 `response.metadata`。只认后者，WS 这条路一帧也匹配不上——票明明就在帧里，
-// 只是类型名对不上，而三处调用点全部静默 return，于是收票、交付判定、溯源登记在 WS 上同时失效。
-//
-// 不用「剥掉 codex. 前缀」的写法：上游同一条连接上还发 `codex.rate_limits`、
-// `responsesapi.websocket_timing` 这类带外事件，按前缀泛化等于把未知事件也当成载体。
-func kongWSTurnStateMetadataEvent(eventType string) bool {
-	switch strings.TrimSpace(eventType) {
-	case "response.metadata", "codex.response.metadata":
-		return true
-	default:
-		return false
-	}
-}
-
-// kongWSTurnStateFromEvent 从 `response.metadata` 事件里取票。
-//
-// 两处都要看且键名大小写不敏感：codex 先读 `response.headers`、再回落到顶层 `headers`
-// （codex-rs/codex-api/src/sse/responses.rs）。只认一处会在另一种形态下漏判成「上游接受了」。
-func kongWSTurnStateFromEvent(payload []byte) string {
-	for _, path := range []string{"response.headers", "headers"} {
-		headers := gjson.GetBytes(payload, path)
-		if !headers.IsObject() {
-			continue
-		}
-		found := ""
-		headers.ForEach(func(key, value gjson.Result) bool {
-			if strings.EqualFold(key.String(), kongWSTurnStateMetadataKey) {
-				found = strings.TrimSpace(value.String())
-				return false
-			}
-			return true
-		})
-		if found != "" {
-			return found
-		}
-	}
-	return ""
 }
 
 // ProtectsAccount 报告这个账号是否在保护范围内（模式为 full）。

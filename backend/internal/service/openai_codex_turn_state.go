@@ -121,6 +121,58 @@ func (s *OpenAIGatewayService) noteStagedOpenAICodexTurnStateCommitted(c *gin.Co
 	s.noteOpenAICodexTurnStateProvenance(c, account, state)
 }
 
+// openAIWSTurnStateMetadataKey 是原生 WS 上 turn-state 的载体键：客户端放在 `response.create` 帧的
+// `client_metadata` 里上送，上游放在带内 metadata 事件的 headers 里下发。
+//
+// WS 与 HTTP 的通道是对称的，只是载体不同（口径取自 codex 客户端源码）：
+//
+//	                客户端 → 上游                              上游 → 客户端
+//	HTTP   `x-codex-turn-state` 请求头                        响应头
+//	WS     payload 的 `client_metadata["x-codex-turn-state"]`  带内 metadata 事件的 headers
+const openAIWSTurnStateMetadataKey = "x-codex-turn-state"
+
+// isOpenAIWSTurnStateMetadataEvent 判断一帧是不是带内 turn-state 的载体事件。
+//
+// **两种拼写都要认。** 原生 WS 上游发的是 `codex.response.metadata`（实测线上帧得到），SSE 上则是
+// 不带前缀的 `response.metadata`。只认后者，WS 这条路一帧也匹配不上——state 明明就在帧里，只是类型名
+// 对不上，调用点全部静默 return。
+//
+// 不用「剥掉 codex. 前缀」的写法：上游同一条连接上还发 `codex.rate_limits`、
+// `responsesapi.websocket_timing` 这类带外事件，按前缀泛化等于把未知事件也当成载体。
+func isOpenAIWSTurnStateMetadataEvent(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "response.metadata", "codex.response.metadata":
+		return true
+	default:
+		return false
+	}
+}
+
+// openAIWSTurnStateFromEvent 从带内 metadata 事件里取 turn-state。
+//
+// 两处都要看且键名大小写不敏感：codex 先读 `response.headers`、再回落到顶层 `headers`
+// （codex-rs/codex-api/src/sse/responses.rs）。只认一处会在另一种形态下漏掉它。
+func openAIWSTurnStateFromEvent(payload []byte) string {
+	for _, path := range []string{"response.headers", "headers"} {
+		headers := gjson.GetBytes(payload, path)
+		if !headers.IsObject() {
+			continue
+		}
+		found := ""
+		headers.ForEach(func(key, value gjson.Result) bool {
+			if strings.EqualFold(key.String(), openAIWSTurnStateMetadataKey) {
+				found = strings.TrimSpace(value.String())
+				return false
+			}
+			return true
+		})
+		if found != "" {
+			return found
+		}
+	}
+	return ""
+}
+
 func extractOpenAICodexTurnState(upstream http.Header) string {
 	if upstream == nil {
 		return ""
@@ -201,20 +253,16 @@ func (s *OpenAIGatewayService) openAICodexTurnStateIsForeign(c *gin.Context, acc
 // stripForeignOpenAIWSFrameTurnState 删掉**帧内**已知由别的账号铸造的 turn-state。
 //
 // 原生 WS 的上行载体有两个：连接级的 upgrade 请求头，以及**逐轮的帧内** `client_metadata`
-// （口径见 kong_ticket_gateway.go 的 WS 段）。只守住头等于只关了一半——客户端把旧账号的 blob 放在每个
-// `response.create` 帧里照样能发出去，而票据功能关闭、模型非门控、off/observe 这些情形下那个字段会被
-// 原样保留，指望票据逻辑替它兜底是不成立的。
+// （见 openAIWSTurnStateMetadataKey）。只守住头等于只关了一半——客户端把旧账号的 blob 放在每个
+// `response.create` 帧里照样能发出去。
 //
-// 返回可能是新分配的 payload；调用方必须用返回值。必须在票据注入**之前**调用：我们自己注入的那张票
-// 从来没登记过溯源，走到这里只会是"查无来源"而被保留，但顺序反了会让判定看到的"客户端那份"其实是
-// 我们刚写进去的票。
+// 返回可能是新分配的 payload；调用方必须用返回值。任何改写帧内 turn-state 的逻辑都必须排在它之后：
+// 顺序反了，判定看到的"客户端那份"就是刚写进去的值。
 //
 // **载体有歧义时拒服，不替上游猜解析语义**：`client_metadata` 或那个键出现多次时，gjson 读到的是第一处、
 // sjson 也只删第一处，而上游完全可能按末键解码——删掉第一处之后帧里反而只剩那个异账号的值，JSON 还变得
-// 毫无歧义。这条与 kongWSFrameAmbiguity / kongWSVerifyInjectedState 同一口径，区别只在那两处仅对受保护
-// 账号生效，而跨账号隔离必须与票据功能、模式、模型都无关。
-// 第二个返回值是**被剥掉的那个客户端原值**：请求特征里"客户端手里那张是什么档"只能由它提供，剥完再采集
-// 就只剩不存在了（调用方据此补记，见 KongFeatureRecorder.RecordStrippedClientState）。
+// 毫无歧义。
+// 第二个返回值是**被剥掉的那个客户端原值**：剥完之后帧里就再也读不到它了，调用方要留痕只能从这里拿。
 func (s *OpenAIGatewayService) stripForeignOpenAIWSFrameTurnState(c *gin.Context, account *Account, payload []byte) ([]byte, string, error) {
 	if s == nil || len(payload) == 0 {
 		return payload, "", nil
@@ -223,7 +271,7 @@ func (s *OpenAIGatewayService) stripForeignOpenAIWSFrameTurnState(c *gin.Context
 	// 多半压根没有这个键，没必要为它整份解析 JSON。
 	// 注意转义：这一步比的是**原始字节**，而解析器读的是解码后的键——`x-codex-turn-stat\u0065` 是一段
 	// 合法 JSON，字面串比不中，解码出来却仍是那个键。所以带反斜杠的帧一律落到完整遍历，不能在这里放过。
-	if !bytes.Contains(payload, []byte(kongWSTurnStateMetadataKey)) && bytes.IndexByte(payload, '\\') < 0 {
+	if !bytes.Contains(payload, []byte(openAIWSTurnStateMetadataKey)) && bytes.IndexByte(payload, '\\') < 0 {
 		return payload, "", nil
 	}
 	states, unique := openAIWSFrameTurnStates(payload)
@@ -243,7 +291,7 @@ func (s *OpenAIGatewayService) stripForeignOpenAIWSFrameTurnState(c *gin.Context
 	if !unique {
 		return payload, "", errors.New("client_metadata 的 turn-state 载体有歧义，且其中含已知由别的账号铸造的值")
 	}
-	next, err := sjson.DeleteBytes(payload, "client_metadata."+kongWSTurnStateMetadataKey)
+	next, err := sjson.DeleteBytes(payload, "client_metadata."+openAIWSTurnStateMetadataKey)
 	if err != nil {
 		return payload, "", fmt.Errorf("剥离异账号 turn-state 失败: %w", err)
 	}
@@ -272,7 +320,7 @@ func openAIWSFrameTurnStates(raw []byte) (states []string, unique bool) {
 		}
 		metaCount++
 		item.ForEach(func(metaKey, metaItem gjson.Result) bool {
-			if metaKey.String() != kongWSTurnStateMetadataKey {
+			if metaKey.String() != openAIWSTurnStateMetadataKey {
 				return true
 			}
 			if state := strings.TrimSpace(metaItem.String()); state != "" {
@@ -285,7 +333,7 @@ func openAIWSFrameTurnStates(raw []byte) (states []string, unique bool) {
 	if len(states) != 1 || metaCount != 1 {
 		return states, false
 	}
-	byPath := strings.TrimSpace(gjson.GetBytes(raw, "client_metadata."+kongWSTurnStateMetadataKey).String())
+	byPath := strings.TrimSpace(gjson.GetBytes(raw, "client_metadata."+openAIWSTurnStateMetadataKey).String())
 	return states, byPath == states[0]
 }
 
@@ -294,7 +342,7 @@ func openAIWSFrameTurnStates(raw []byte) (states []string, unique bool) {
 // **不就地改内层 map**：`client_metadata` 与客户端原始请求体是同一个对象（顶层只做过浅拷贝，见
 // buildOpenAIWSCreatePayload），就地删会把客户端本次带来的值永久抹掉——failover 重试回原账号时，连它
 // 自己合法的那份也没了。
-// 返回被剥掉的那个客户端原值（供请求特征补记，理由同字节帧那版）。
+// 返回被剥掉的那个客户端原值（理由同字节帧那版）。
 func (s *OpenAIGatewayService) stripForeignOpenAIWSMapTurnState(c *gin.Context, account *Account, payload map[string]any) string {
 	if s == nil || payload == nil {
 		return ""
@@ -303,7 +351,7 @@ func (s *OpenAIGatewayService) stripForeignOpenAIWSMapTurnState(c *gin.Context, 
 	if !ok || meta == nil {
 		return ""
 	}
-	raw, ok := meta[kongWSTurnStateMetadataKey]
+	raw, ok := meta[openAIWSTurnStateMetadataKey]
 	if !ok {
 		return ""
 	}
@@ -317,7 +365,7 @@ func (s *OpenAIGatewayService) stripForeignOpenAIWSMapTurnState(c *gin.Context, 
 	}
 	next := make(map[string]any, len(meta))
 	for k, v := range meta {
-		if k == kongWSTurnStateMetadataKey {
+		if k == openAIWSTurnStateMetadataKey {
 			continue
 		}
 		next[k] = v
@@ -344,10 +392,10 @@ func (s *OpenAIGatewayService) noteOpenAIWSCodexTurnStateDelivered(c *gin.Contex
 	if s == nil || c == nil || account == nil || len(payload) == 0 {
 		return
 	}
-	if eventType, _, _ := parseOpenAIWSEventEnvelope(payload); !kongWSTurnStateMetadataEvent(eventType) {
+	if eventType, _, _ := parseOpenAIWSEventEnvelope(payload); !isOpenAIWSTurnStateMetadataEvent(eventType) {
 		return
 	}
-	state := kongWSTurnStateFromEvent(payload)
+	state := openAIWSTurnStateFromEvent(payload)
 	if state == "" {
 		return
 	}

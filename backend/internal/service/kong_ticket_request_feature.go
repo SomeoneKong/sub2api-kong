@@ -299,7 +299,7 @@ func kongOutboundStateFromHeader(header http.Header) kongStateObservation {
 
 // kongWSClientMetadataStatePath 是 WS 帧里票所在的 gjson 路径，与注入时的写入路径同源
 // （kong_ticket_gateway.go 的 sjson.SetBytes）。
-const kongWSClientMetadataStatePath = "client_metadata." + kongWSTurnStateMetadataKey
+const kongWSClientMetadataStatePath = "client_metadata." + openAIWSTurnStateMetadataKey
 
 // kongOutboundStateFromWSFrame 取原生 WS 上送帧里的 state。
 func kongOutboundStateFromWSFrame(payload []byte) kongStateObservation {
@@ -319,7 +319,7 @@ func kongOutboundStateFromWSMap(payload map[string]any) kongStateObservation {
 	if !ok {
 		return kongStateObservation{}
 	}
-	raw, ok := meta[kongWSTurnStateMetadataKey]
+	raw, ok := meta[openAIWSTurnStateMetadataKey]
 	if !ok {
 		return kongStateObservation{}
 	}

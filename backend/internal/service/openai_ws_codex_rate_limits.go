@@ -11,10 +11,10 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// kongWSCodexRateLimitsEvent 是上游在原生 WS 上逐轮下发额度快照的带外事件名。
-const kongWSCodexRateLimitsEvent = "codex.rate_limits"
+// openAIWSCodexRateLimitsEvent 是上游在原生 WS 上逐轮下发额度快照的带外事件名。
+const openAIWSCodexRateLimitsEvent = "codex.rate_limits"
 
-// kongParseCodexRateLimitEvent 从 `codex.rate_limits` 事件体里取额度快照。
+// parseOpenAIWSCodexRateLimitEvent 从 `codex.rate_limits` 事件体里取额度快照。
 //
 // 这是 ParseCodexRateLimitHeaders 的对偶：HTTP 侧额度在响应头（`x-codex-primary-*` /
 // `x-codex-secondary-*`），而原生 WS 逐轮没有响应头，上游把同一份数据放进这个带外事件的
@@ -25,7 +25,7 @@ const kongWSCodexRateLimitsEvent = "codex.rate_limits"
 // 而那种不一致不会报错，只会让调度照着两个互相矛盾的数做决定。
 //
 // `x-codex-primary-over-secondary-limit-percent` 在事件里没有对应字段，留空——快照允许缺项。
-func kongParseCodexRateLimitEvent(payload []byte) *OpenAICodexUsageSnapshot {
+func parseOpenAIWSCodexRateLimitEvent(payload []byte) *OpenAICodexUsageSnapshot {
 	if len(payload) == 0 {
 		return nil
 	}
@@ -80,7 +80,7 @@ func kongParseCodexRateLimitEvent(payload []byte) *OpenAICodexUsageSnapshot {
 		return &i
 	}
 	secondsOf := func(window gjson.Result, key string) *int {
-		return kongSaneResetAfterSeconds(intOf(window, key))
+		return saneCodexResetAfterSeconds(intOf(window, key))
 	}
 
 	if primary := limits.Get("primary"); primary.IsObject() {
@@ -125,7 +125,7 @@ func kongParseCodexRateLimitEvent(payload []byte) *OpenAICodexUsageSnapshot {
 // account_scheduling_threshold_eval 的输入，而这两项在原生 WS 上原先唯一的来源是**拨号时刻**的
 // 握手响应头——三条通路把它放进 `OpenAIForwardResult.ResponseHeaders`，成功回调再据此回填额度。
 // 连接池里的连接活得很久，所以纯 WS 流量的账号一直拿着旧水位做调度决定，且没有任何信号。
-// 那条旧来源现在由 KongCodexQuotaHeaders 挡住（否则它会反过来覆盖本文件采到的实时水位）。
+// 那条旧来源现在由 CodexQuotaHeaders 挡住（否则它会反过来覆盖本文件采到的实时水位）。
 //
 // **与交付无关，所以不看客户端还在不在**：额度是账号的事实，客户端走了它照样在变。落库那一步
 // （updateCodexUsageSnapshot）自己带节流与脱钩 goroutine，逐轮调用不会变成写风暴。
@@ -133,19 +133,19 @@ func (s *OpenAIGatewayService) noteOpenAIWSCodexRateLimits(ctx context.Context, 
 	if s == nil || account == nil || len(payload) == 0 {
 		return
 	}
-	if strings.TrimSpace(eventType) != kongWSCodexRateLimitsEvent {
+	if strings.TrimSpace(eventType) != openAIWSCodexRateLimitsEvent {
 		return
 	}
 	// 影子账号的 codex_* 只由 QueryUsage(/wham/usage) 更新，口径与 HTTP 各落点一致。
 	if account.IsShadow() {
 		return
 	}
-	if snapshot := kongParseCodexRateLimitEvent(payload); snapshot != nil {
+	if snapshot := parseOpenAIWSCodexRateLimitEvent(payload); snapshot != nil {
 		s.updateCodexUsageSnapshot(ctx, account.ID, snapshot)
 	}
 }
 
-// KongCodexQuotaHeaders 返回可用于**逐轮**额度刷新的响应头，连接级的握手头返回 nil。
+// CodexQuotaHeaders 返回可用于**逐轮**额度刷新的响应头，连接级的握手头返回 nil。
 //
 // 逐轮额度只认真正属于本轮的响应头。WS 通路把连接级握手响应头放进 ResponseHeaders（供限流信号与
 // retry-after 用），拿它回填会造成两种损害：把带内事件刚写进去的实时水位**覆盖成拨号时刻的旧值**
@@ -154,26 +154,26 @@ func (s *OpenAIGatewayService) noteOpenAIWSCodexRateLimits(ctx context.Context, 
 //
 // 判据只能是这个显式标记，**不能用 `!OpenAIWSMode`**：WS-HTTP bridge 那条路同样是 WS 模式，但它的
 // ResponseHeaders 是本轮真实的 HTTP 响应头，那份额度必须照常刷新。
-func (r *OpenAIForwardResult) KongCodexQuotaHeaders() http.Header {
-	if r == nil || r.KongResponseHeadersFromWSHandshake {
+func (r *OpenAIForwardResult) CodexQuotaHeaders() http.Header {
+	if r == nil || r.ResponseHeadersFromWSHandshake {
 		return nil
 	}
 	return r.ResponseHeaders
 }
 
-// kongMaxCodexResetAfterSeconds 是 `reset_after_seconds` 的合理上限（366 天）。
+// maxCodexResetAfterSeconds 是 `reset_after_seconds` 的合理上限（366 天）。
 //
 // 额度窗口最长是 7 天，这个上限只用来挡住荒谬值。**它挡的不是显示错误而是调度失效**：
 // `time.Duration(sec) * time.Second` 在 sec 超过约 9.22e9 时溢出，算出来的 reset_at 会落到过去
 // （实测 9223372037 秒 → 1734 年），而 openAIQuotaWindowReset 会把"已过去"读成"该窗口已重置"，
 // 于是一个 100% 的窗口被 account_scheduling_threshold_eval 直接跳过——额度暂停失效。
-const kongMaxCodexResetAfterSeconds = 366 * 24 * 60 * 60
+const maxCodexResetAfterSeconds = 366 * 24 * 60 * 60
 
-// kongSaneResetAfterSeconds 挡掉落在合理区间之外的重置秒数（两条采集路共用）。
+// saneCodexResetAfterSeconds 挡掉落在合理区间之外的重置秒数（两条采集路共用）。
 //
 // 只丢这一个字段，同一窗口的其它字段照常保留：水位本身仍然可信，不该因为倒计时荒谬就整份丢掉。
-func kongSaneResetAfterSeconds(sec *int) *int {
-	if sec == nil || *sec < 0 || *sec > kongMaxCodexResetAfterSeconds {
+func saneCodexResetAfterSeconds(sec *int) *int {
+	if sec == nil || *sec < 0 || *sec > maxCodexResetAfterSeconds {
 		return nil
 	}
 	return sec
