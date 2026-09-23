@@ -21,7 +21,12 @@ FRONTEND_CRITICAL_VITEST := \
 	src/views/admin/__tests__/SettingsView.spec.ts \
 	src/features/channel-monitor-v2/__tests__/designSystem.structure.spec.ts \
 	src/features/channel-monitor-v2/__tests__/monitorFormat.spec.ts \
-	src/features/channel-monitor-v2/__tests__/monitorZoom.spec.ts
+	src/features/channel-monitor-v2/__tests__/monitorZoom.spec.ts \
+	src/features/codex-ticket/__tests__/labels.spec.ts \
+	src/features/codex-ticket/__tests__/TicketEventTable.props.spec.ts \
+	src/features/codex-ticket/__tests__/requestFeatures.spec.ts \
+	src/features/codex-ticket/__tests__/CodexTicketView.drafts.spec.ts \
+	src/features/codex-ticket/__tests__/CodexTicketDetailView.route.spec.ts
 
 # 一键编译前后端
 build: build-backend build-frontend
