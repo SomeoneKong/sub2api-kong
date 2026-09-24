@@ -8,8 +8,9 @@
 
 ## 定制的边界
 
-只碰五类东西：**codex ticket 相关的功能**、**OpenAI 账号消耗节奏**（旧版选号的重排，设计见
-`DESIGN-openai-account-pace.md`）、**Codex 模型目录的上下文窗口折算**（见下文维护约定）、
+只碰六类东西：**codex ticket 相关的功能**、**OpenAI 账号消耗节奏**（旧版选号的重排，设计见
+`DESIGN-openai-account-pace.md`）、**Codex 模型目录的上下文窗口折算**、**发往官方 ChatGPT 后端的
+请求体 zstd 压缩**（省出站流量；这两项见下文维护约定）、
 **前端展示调整**（账号页：OpenAI Pro 20x / Pro 5x 只有 7d 主窗口，不显示 5h；管理员用量页：用户列
 可在列设置里隐藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会
 显示），以及
@@ -58,6 +59,7 @@
 | **消耗节奏只挂在旧版选号的第 2 层，只改顺序不改候选** | 钩子全在 `openai_gateway_scheduling.go` 的 `selectAccountWithLoadAwareness` 里，都是单行、带 `[kong]` 注释：进入第 2 层处 `kongPaceBegin` + `defer finish`、`shuffleWithinSortGroups` 之后 `reorder`（传入随后倍率排序用的 `rateOrder`）、抢槽循环前 `finalOrder`、两处抢到后 `acquired`、负载读取失败分支开头 `loadFailed`。rebase 时要复核的就是这几处；上游改动这个函数时，要确认 `reorder` 仍在同优先级内的随机打散之后、倍率排序与 compact 分层之前——放到后面会把上游的硬约束冲掉。第 1 层（粘性）与第 3 层（兜底等待）刻意不接：粘性优先于短期均衡，兜底等待本就不挑号。过滤条件一概不碰，所以最坏情况也只是退回上游的顺序 |
 | 消耗节奏的参数放数据目录下的 `openai-account-pace.yaml`，不进 `config.yaml`、也不像票据那样走环境变量 | 要在线调：环境变量每改一次都要重建容器、掐断进行中的流式响应，而组件每分钟检查一次文件，改完即生效；参数又是按套餐分组的嵌套结构，环境变量表达不了。不进 `config.yaml` 是因为上游的 `config.go` 是高频改动面，加字段就多一处 rebase 冲突。文件不存在即功能关闭，改坏时沿用上一份有效配置并在日志与 Redis 的 meta 里报错 |
 | **Codex 模型目录的上下文窗口折算挂在 `CodexModels` 的每个写出口** | 上游目录的 `max_context_window` 在 codex 里是「配置覆盖允许的上限」，网关按它 × 比例抬高 `context_window`（只往上调），客户端就不必各自配 `model_context_window` 或钉本地目录。handler 的固定账号、分组配置、调度三条分支各自写响应，每处写出前都调 `KongFinalizeCodexModelsManifest`；传给上游构建函数的 If-None-Match 一律为空串，304 由它按折算后的 ETag 判定——否则持有折算前 ETag 的客户端永远拿不到折算结果。rebase 时上游若新增写出分支，要一并接上。比例走环境变量 `KONG_CODEX_CONTEXT_WINDOW_RATIO`：不设置为 1（取 max），0 关闭，写错则关闭并记错误日志 |
+| **出站请求体的 zstd 压缩挂在 `doOpenAIUpstream` 的发送处** | 与票据闸门同一个汇聚点，HTTP 调用点一并覆盖；原生 WS 不经过这里，它的帧由 permessage-deflate 压缩。条件只看最终出站请求：发往 `chatgpt.com`（含子域）的 JSON POST、正文不小于 1 KiB、没有 `Content-Encoding`、账号不走插件（插件自带传输层）。入站的 `Content-Encoding` 在读入时已解码并删除，也不在转发头白名单里，所以客户端自己压缩上来的请求不影响判断。压缩必须在票据准入之后：准入要读明文里的 `model`。插件判定只做一次：压缩了的请求（连同明文重发）直接交 `httpUpstream.Do`，不经 `sendOpenAIUpstream`，否则插件绑定在两次判定之间切换时，压缩正文会落进插件——rebase 时上游若在 `sendOpenAIUpstream` 里加了逻辑，要看压缩路径是否也需要。上游像是不接受压缩（415，或 400 / 422 且错误正文是专指正文解码失败的写法）时用明文重发一次；明文通过了，才把该端点改发明文 24 小时，明文同样被拒说明与压缩无关、端点照旧压缩。普通业务错误不重发，错误正文原样交给调用方。每 10 分钟一行 `kong zstd: 周期计数` 日志给出压缩前后字节数。开关走环境变量 `KONG_OPENAI_REQUEST_ZSTD`：不设置为开，false 关闭，写错则关闭并记错误日志 |
 | 接转发链路用「可选依赖 + setter」 | `OpenAIGatewayService` 的构造函数参数表很长且是上游高频改动面。加字段 + `SetKongTicketGateway` 能把改动收在一处，未注入时所有接入点退化为空操作 |
 | 前端定制放 `frontend/src/features/<主题>/`，上游文件只做单行追加或单处替换 | 票据页面（`features/codex-ticket/`）自包含（自己的 `api.ts` / `types.ts`），碰上游的只有四处各一行：`router/index.ts` 一个路由对象、`AppSidebar.vue` 的 `baseItems` 一项、`i18n/locales/{en,zh}/common.ts` 各一个 `nav.kongTicket`。rebase 时要复核的就是这四处。前端展示调整（`features/openai-usage-window/`、`features/usage-latency/`）碰上游的点分两类：**追加**——`AccountUsageCell.vue` 与 `UsageTable.vue` 各一行 import，`UsageTable.vue` 延迟列网格里的「速度」一行，`i18n/locales/{en,zh}/dashboard.ts` 的 `usage` 段各两个键；**替换**——`AccountUsageCell.vue` OpenAI OAuth 分支 5h 进度条的 `v-if` 条件、管理员 `views/admin/UsageView.vue` 的 `ALWAYS_VISIBLE` 去掉 `user`。替换点在上游改到同一行时必然冲突，rebase 时先看这两处。定制的前端单测都要追加到根 `Makefile` 的 `FRONTEND_CRITICAL_VITEST`，CI 只跑这份清单 |
 | 后端响应结构要显式写 `json` tag | 本功能的 handler 直接序列化 service 层结构体。上游那些结构多数也没 tag，但我们的响应里混着 `gin.H` 的 snake_case 字段——不写 tag 会让同一个响应里两种命名风格并存，前端类型也跟着别扭 |
