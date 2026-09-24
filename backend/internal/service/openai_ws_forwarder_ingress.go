@@ -411,6 +411,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		} else {
 			normalized = stripped
 		}
+		s.kongSessionRenew(ctx, account) // [kong] 会话数上限：ctx_pool 与 HTTP bridge 每轮续期
 		// [kong] codex 票：本轮的请求特征记录器，出站那一项取剥离之后的帧内值（kong_request_features.go）。
 		turnKongFeatures := KongNewWSFrameFeatures(normalized)
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
