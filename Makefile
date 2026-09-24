@@ -22,7 +22,11 @@ FRONTEND_CRITICAL_VITEST := \
 	src/features/channel-monitor-v2/__tests__/designSystem.structure.spec.ts \
 	src/features/channel-monitor-v2/__tests__/monitorFormat.spec.ts \
 	src/features/channel-monitor-v2/__tests__/monitorZoom.spec.ts \
-	src/features/request-features/__tests__/requestFeatures.spec.ts
+	src/features/request-features/__tests__/requestFeatures.spec.ts \
+	src/features/openai-fingerprint-test/__tests__/api.spec.ts \
+	src/features/openai-fingerprint-test/__tests__/labels.spec.ts \
+	src/features/openai-fingerprint-test/__tests__/FingerprintTestMenuItem.spec.ts \
+	src/features/openai-fingerprint-test/__tests__/FingerprintTestHost.spec.ts
 
 # 一键编译前后端
 build: build-backend build-frontend
