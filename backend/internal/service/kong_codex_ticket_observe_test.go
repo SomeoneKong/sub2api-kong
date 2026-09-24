@@ -174,6 +174,44 @@ func TestKongCollectHandshake(t *testing.T) {
 	}
 }
 
+// 经 HTTP 上游发送汇聚点的完整链路：出站请求体被压缩后，特征与收票仍然对得上。
+func TestKongDoOpenAIUpstreamObservesTicket(t *testing.T) {
+	useKongZstd(t, true)
+	svc, upstream := kongZstdTestService(func(int) (*http.Response, error) {
+		return kongTestResponseWithState("issued"), nil
+	})
+	o, c := newKongTestObserver()
+	svc.SetKongTicketObserver(o)
+	req := newKongZstdTestRequest(t, http.MethodPost, kongZstdTestURL, kongZstdTestBody(8<<10))
+	req.Header.Set(openAICodexTurnStateHeader, "sent")
+
+	if _, err := svc.doOpenAIUpstream(req, "", kongZstdTestAccount()); err != nil {
+		t.Fatal(err)
+	}
+	if len(upstream.sent) != 1 || upstream.sent[0].encoding != "zstd" {
+		t.Fatalf("这条用例要覆盖压缩后的请求：%+v", upstream.sent)
+	}
+	kongTestFeaturesEqual(t, KongFeaturesFromRequest(req), kongStrPtr("sent"), kongStrPtr("issued"))
+	if got := kongDrainTickets(c); len(got) != 1 || got[0].Model != "gpt-6-sol" || got[0].State != "issued" {
+		t.Fatalf("收到的票 = %+v", got)
+	}
+}
+
+func TestKongDoOpenAIUpstreamTransportErrorRecordsOutboundOnly(t *testing.T) {
+	svc, _ := kongZstdTestService(func(int) (*http.Response, error) { return nil, io.ErrUnexpectedEOF })
+	o, c := newKongTestObserver()
+	svc.SetKongTicketObserver(o)
+	req := newKongZstdTestRequest(t, http.MethodPost, kongZstdTestURL, []byte(`{"model":"m"}`))
+	req.Header.Set(openAICodexTurnStateHeader, "sent")
+	if _, err := svc.doOpenAIUpstream(req, "", kongZstdTestAccount()); err == nil {
+		t.Fatal("应返回发送错误")
+	}
+	kongTestFeaturesEqual(t, KongFeaturesFromRequest(req), kongStrPtr("sent"), nil)
+	if len(kongDrainTickets(c)) != 0 {
+		t.Fatal("没有响应就没有票")
+	}
+}
+
 // WS 客户端经 HTTP 上游（bridge）的那一轮，用量结果要带上这次上送记下的请求特征。
 //
 // 记录器挂在 doOpenAIUpstream 的出站请求上，而 bridge 的结果在发送循环之外构造：不在那里取，用量行就
