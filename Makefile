@@ -28,7 +28,10 @@ FRONTEND_CRITICAL_VITEST := \
 	src/features/openai-fingerprint-test/__tests__/FingerprintTestMenuItem.spec.ts \
 	src/features/openai-fingerprint-test/__tests__/FingerprintTestHost.spec.ts \
 	src/features/openai-usage-window/__tests__/fiveHourWindow.spec.ts \
-	src/features/usage-latency/__tests__/outputSpeed.spec.ts
+	src/features/usage-latency/__tests__/outputSpeed.spec.ts \
+	src/features/openai-session-limit/__tests__/sessionLimit.spec.ts \
+	src/features/openai-session-limit/__tests__/EditAccountModal.sessionLimit.spec.ts \
+	src/features/openai-session-limit/__tests__/AccountCapacityCell.sessionLimit.spec.ts
 
 # 一键编译前后端
 build: build-backend build-frontend
