@@ -43,6 +43,7 @@ type AdminHandlers struct {
 	Affiliate              *admin.AffiliateHandler
 	Compliance             *admin.ComplianceHandler
 	AuditLog               *admin.AuditLogHandler
+	KongFingerprint        *admin.KongFingerprintHandler // [kong] 账号指纹测试
 }
 
 // Handlers contains all HTTP handlers
