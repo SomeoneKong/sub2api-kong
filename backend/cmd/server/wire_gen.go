@@ -308,6 +308,8 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	kongPace := service.NewKongOpenAIAccountPace(repository.NewKongPaceRepository(db), repository.NewKongPaceStore(redisClient), concurrencyService, service.KongPaceConfigPath(setup.GetDataDir()))
 	openAIGatewayService.SetKongOpenAIAccountPace(kongPace)
 	kongPace.Start()
+	// [kong] 会话数上限：复用上游 Anthropic 会话限制的那份计数缓存。
+	openAIGatewayService.SetKongSessionLimitCache(sessionLimitCache)
 	usageRecordWorkerPool := service.NewUsageRecordWorkerPool(configConfig)
 	userMsgQueueCache := repository.NewUserMsgQueueCache(redisClient)
 	userMessageQueueService := service.ProvideUserMessageQueueService(userMsgQueueCache, rpmCache, configConfig)

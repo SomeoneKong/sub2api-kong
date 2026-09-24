@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// 账号消耗节奏的模型部分：读数判定与记账、进度差、短时惩罚、并发调整与权重。全部是纯函数，
+// 账号消耗节奏的模型部分：读数判定与记账、进度差、短时惩罚、并发与会话调整、权重。全部是纯函数，
 // 公式与取舍见 DESIGN-openai-account-pace.md 第 2、4.3 节。
 
 const (
@@ -289,8 +289,11 @@ func kongPaceShortPenalty(inc6, inc24 float64, plan KongPacePlan, qmax float64) 
 }
 
 // kongPaceConcurrencyAdjust 返回并发占用调整 C（设计文档 2.5）。peak 是近 N 分钟"在途 + 排队"的
-// 峰值（已含本次读到的值）；recentlyUsed 表示最近使用时刻在 N 分钟以内。
+// 峰值（已含本次读到的值）；recentlyUsed 表示最近使用时刻在 N 分钟以内。关闭时恒为 0，空闲加分也不给。
 func kongPaceConcurrencyAdjust(peak, limit int, recentlyUsed bool, c KongPaceConcurrency) float64 {
+	if !c.Enabled {
+		return 0
+	}
 	if peak <= 0 {
 		if recentlyUsed {
 			return 0
@@ -313,10 +316,33 @@ func kongPaceConcurrencyAdjust(peak, limit int, recentlyUsed bool, c KongPaceCon
 	}
 }
 
-// kongPaceWeight 是 w = K × 2^((min(Δ, G) − O − Q − C) ÷ H)。上限只截进度差，让位量、短时惩罚与
-// 并发调整都在截顶之后扣。
-func kongPaceWeight(gap float64, plan KongPacePlan, q, c float64, cfg *KongPaceConfig) float64 {
-	score := math.Min(gap, cfg.GapCapPP) - plan.YieldPP - q - c
+// kongPaceSessionUse 是一个候选的会话占用输入：会话上限在第 2 层入口查得的活跃会话数与账号的会话上限。
+// Full 表示会话上限已把它记为满额（分段时已满，或之后确认登记没通过），占用按 1 计。Active 为 nil 表示入口
+// 没有它的计数（入口时未设上限，确认登记时才按新设的上限被记为满额）。
+type kongPaceSessionUse struct {
+	Active *int
+	Limit  int
+	Full   bool
+}
+
+// kongPaceSessionAdjust 返回会话占用调整 M = Mmax × min(1, 活跃会话数 ÷ 上限)（设计文档 2.6）。
+// 关闭时为 0；记为满额时为 Mmax；没有计数或上限无效时为 0。
+func kongPaceSessionAdjust(u kongPaceSessionUse, s KongPaceSessions) float64 {
+	switch {
+	case !s.Enabled:
+		return 0
+	case u.Full:
+		return s.MaxPenaltyPP
+	case u.Active == nil || u.Limit <= 0:
+		return 0
+	}
+	return s.MaxPenaltyPP * math.Min(1, float64(*u.Active)/float64(u.Limit))
+}
+
+// kongPaceWeight 是 w = K × 2^((min(Δ, G) − O − Q − C − M) ÷ H)。上限只截进度差，让位量、短时惩罚与
+// 两项占用调整都在截顶之后扣。
+func kongPaceWeight(gap float64, plan KongPacePlan, q, c, m float64, cfg *KongPaceConfig) float64 {
+	score := math.Min(gap, cfg.GapCapPP) - plan.YieldPP - q - c - m
 	return plan.Capacity * math.Exp2(score/cfg.GapDoublingPP)
 }
 

@@ -2287,6 +2287,7 @@ func (s *OpenAIGatewayService) selectLegacyAccountByPreviousResponse(
 	if sessionHash != "" {
 		_ = s.bindOpenAIStickySessionDuringSelection(ctx, groupID, sessionHash, account.ID)
 	}
+	s.kongSessionTouch(ctx, account, sessionHash) // [kong] 会话上限：续接放行登记
 	return selection, true, nil
 }
 
@@ -2362,6 +2363,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 				decision.StickySessionHit = true
 				decision.SelectedAccountID = selection.Account.ID
 				decision.SelectedAccountType = selection.Account.Type
+				s.kongSessionTouch(ctx, selection.Account, sessionHash) // [kong] 会话上限：guardian 亲和放行登记
 				return selection, decision, nil
 			}
 		}
@@ -2369,6 +2371,8 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		if preserveGuardianParentBinding {
 			legacySessionHash = ""
 		}
+		// [kong] 会话上限：不带哈希进入旧版选号是为了保住父会话绑定，计数仍用请求自己的会话。
+		ctx = KongWithSessionCountHash(ctx, sessionHash)
 		if requiredTransport == OpenAIUpstreamTransportAny || requiredTransport == OpenAIUpstreamTransportHTTPSSE {
 			effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
 			for {
