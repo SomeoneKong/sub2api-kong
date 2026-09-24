@@ -321,6 +321,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		handshakeTurnState != "",
 		len(handshakeTurnState),
 	)
+	// [kong] codex 票：这条连接握手响应里上游给的那张，按物理连接只收一次（kong_codex_ticket_observe.go）。
+	s.kongTicketObserver.CollectHandshake(account, mappedModel, lease.ConsumeHandshakeTurnState())
 	if handshakeTurnState != "" {
 		if stateStore != nil && sessionHash != "" {
 			stateStore.BindSessionTurnState(groupID, account.ID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
@@ -354,6 +356,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	// 帧内（这条路是 map）同样是上行载体：异账号 blob 要在上送之前剥掉，且不得就地改内层 map
 	// ——它与客户端原始请求体共享（见 stripForeignOpenAIWSMapTurnState）。
 	s.stripForeignOpenAIWSMapTurnState(c, account, payload)
+	// [kong] codex 票：本轮的请求特征记录器，出站那一项取剥离之后 map 里的值（kong_request_features.go）。
+	kongFeatures := KongNewWSMapFeatures(payload)
 
 	if err := s.performOpenAIWSGeneratePrewarm(
 		ctx,
@@ -444,6 +448,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 	}
 	resultWithUsage := func() *OpenAIForwardResult {
+		// [kong] map 里没带 state 时，本轮实际上送的是这条连接握手时发出去的那个。
+		kongFeatures.RecordOutboundIfAbsent(lease.SentHandshakeTurnState())
 		return &OpenAIForwardResult{
 			RequestID:                     responseID,
 			ResponseID:                    responseID,
@@ -464,6 +470,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			Duration:                       time.Since(startTime),
 			FirstTokenMs:                   firstTokenMs,
 			ClientDisconnect:               clientDisconnected,
+			KongRequestFeatures:            kongFeatures.Snapshot(), // [kong]
 		}
 	}
 
@@ -651,6 +658,8 @@ readLoop:
 		responseModelObserver.ObserveOpenAI(message, eventType)
 		// 逐轮的额度快照（见 noteOpenAIWSCodexRateLimits）。
 		s.noteOpenAIWSCodexRateLimits(ctx, account, eventType, message)
+		// [kong] codex 票：带内 metadata 里上游下发的那张记进本轮特征并收票，客户端断连后照样记。
+		s.kongTicketObserver.ObserveWSEvent(account, mappedModel, kongFeatures, eventType, message)
 		eventCount++
 		if firstEventType == "" {
 			firstEventType = eventType
