@@ -39,6 +39,7 @@ type KongPaceConfig struct {
 	Plans         map[string]KongPacePlan `json:"plans"`
 	DefaultPlan   string                  `json:"default_plan"`
 	Concurrency   KongPaceConcurrency     `json:"concurrency"`
+	Sessions      KongPaceSessions        `json:"sessions"`
 	DecisionLog   KongPaceDecisionLog     `json:"decision_log"`
 }
 
@@ -61,8 +62,9 @@ type KongPaceSoftLine struct {
 	Full  float64 `json:"full"`
 }
 
-// KongPaceConcurrency 是并发占用调整的参数。
+// KongPaceConcurrency 是并发占用调整的参数。Enabled 为 false 时调整恒为 0，峰值采样照常。
 type KongPaceConcurrency struct {
+	Enabled           bool                       `json:"enabled"`
 	PeakWindowMinutes int                        `json:"peak_window_minutes"`
 	IdleBonusPP       float64                    `json:"idle_bonus_pp"`
 	BusyRatio         float64                    `json:"busy_ratio"`
@@ -74,6 +76,13 @@ type KongPaceConcurrencyPenalty struct {
 	Free2Plus float64 `json:"free_2_plus"`
 	Free1     float64 `json:"free_1"`
 	Full      float64 `json:"full"`
+}
+
+// KongPaceSessions 是会话占用调整的参数：MaxPenaltyPP 是占用为 1 时的扣分，按占用比例线性。
+// Enabled 为 false 时调整恒为 0，不影响会话上限的分段。
+type KongPaceSessions struct {
+	Enabled      bool    `json:"enabled"`
+	MaxPenaltyPP float64 `json:"max_penalty_pp"`
 }
 
 // KongPaceDecisionLog 是决策记录的参数。
@@ -100,6 +109,7 @@ type kongPaceConfigFile struct {
 	Plans         map[string]*kongPacePlanFile `yaml:"plans"`
 	DefaultPlan   *string                      `yaml:"default_plan"`
 	Concurrency   *kongPaceConcurrencyFile     `yaml:"concurrency"`
+	Sessions      *kongPaceSessionsFile        `yaml:"sessions"`
 	DecisionLog   *kongPaceDecisionLogFile     `yaml:"decision_log"`
 }
 
@@ -120,6 +130,7 @@ type kongPaceSoftLineFile struct {
 }
 
 type kongPaceConcurrencyFile struct {
+	Enabled           *bool                           `yaml:"enabled"`
 	PeakWindowMinutes *int                            `yaml:"peak_window_minutes"`
 	IdleBonusPP       *float64                        `yaml:"idle_bonus_pp"`
 	BusyRatio         *float64                        `yaml:"busy_ratio"`
@@ -130,6 +141,11 @@ type kongPaceConcurrencyPenaltyFile struct {
 	Free2Plus *float64 `yaml:"free_2_plus"`
 	Free1     *float64 `yaml:"free_1"`
 	Full      *float64 `yaml:"full"`
+}
+
+type kongPaceSessionsFile struct {
+	Enabled      *bool    `yaml:"enabled"`
+	MaxPenaltyPP *float64 `yaml:"max_penalty_pp"`
 }
 
 type kongPaceDecisionLogFile struct {
@@ -246,6 +262,7 @@ func ParseKongPaceConfig(data []byte) (KongPaceConfig, error) {
 	} else {
 		c := f.Concurrency
 		cfg.Concurrency = KongPaceConcurrency{
+			Enabled:           kongPaceNeedBool(e, c.Enabled, "concurrency.enabled"),
 			PeakWindowMinutes: kongPaceNeedInt(e, c.PeakWindowMinutes, "concurrency.peak_window_minutes", func(v int) bool { return v >= 1 && v <= kongPacePeakKeep }, "1 <= x <= 60"),
 			IdleBonusPP:       kongPaceNeedFloat(e, c.IdleBonusPP, "concurrency.idle_bonus_pp", nonNegative, ">= 0"),
 			BusyRatio:         kongPaceNeedFloat(e, c.BusyRatio, "concurrency.busy_ratio", func(v float64) bool { return v > 0 && v < 1 }, "0 < x < 1"),
@@ -262,6 +279,15 @@ func ParseKongPaceConfig(data []byte) (KongPaceConfig, error) {
 				e.addf("concurrency.penalty_pp: 需满足 free_2_plus <= free_1 <= full")
 			}
 			cfg.Concurrency.PenaltyPP = pp
+		}
+	}
+
+	if f.Sessions == nil {
+		e.addf("sessions: 缺失")
+	} else {
+		cfg.Sessions = KongPaceSessions{
+			Enabled:      kongPaceNeedBool(e, f.Sessions.Enabled, "sessions.enabled"),
+			MaxPenaltyPP: kongPaceNeedFloat(e, f.Sessions.MaxPenaltyPP, "sessions.max_penalty_pp", nonNegative, ">= 0"),
 		}
 	}
 

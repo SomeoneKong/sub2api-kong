@@ -3040,6 +3040,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			ctx = preemptCtx
 			defer cleanupPreempt()
 		}
+		// [kong] 会话数上限：连接上的后续轮次按建连选号的会话哈希续期。
+		ctx = service.KongWithSessionCountHash(ctx, sessionHash)
 
 		for {
 			err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)
