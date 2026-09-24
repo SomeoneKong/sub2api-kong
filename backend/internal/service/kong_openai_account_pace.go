@@ -351,7 +351,12 @@ type kongPaceAccountView struct {
 	Peak           int        `json:"occupancy_peak"`
 	LastUsedAt     *time.Time `json:"last_used_at,omitempty"`
 	C              float64    `json:"c"`
-	Weight         float64    `json:"w"`
+	// 会话占用只在选号时有（来自会话上限的分段）；不受会话上限约束的候选与 state 里没有这几项，state 里的 w
+	// 也就不含 M。
+	ActiveSessions *int     `json:"active_sessions,omitempty"`
+	MaxSessions    int      `json:"max_sessions,omitempty"`
+	M              *float64 `json:"m,omitempty"`
+	Weight         float64  `json:"w"`
 	// Paced 表示所在的段按节奏排序（段内全是 OpenAI OAuth）；FirstChoice 只对这样的段有意义。
 	Paced        bool       `json:"paced,omitempty"`
 	FirstChoice  float64    `json:"first_choice,omitempty"`
@@ -359,7 +364,8 @@ type kongPaceAccountView struct {
 }
 
 // view 计算一个账号的节奏状态。f 为 nil 表示快照里没有这个账号（刚加入）：按进度正常处理。
-func (p *KongOpenAIAccountPace) view(cfg *KongPaceConfig, id int64, plan string, limit int, f *kongPaceFacts, current int, lastUsed *time.Time, now time.Time) kongPaceAccountView {
+// sess 为 nil 表示没有会话计数，M = 0。
+func (p *KongOpenAIAccountPace) view(cfg *KongPaceConfig, id int64, plan string, limit int, f *kongPaceFacts, current int, lastUsed *time.Time, sess *kongPaceSessionUse, now time.Time) kongPaceAccountView {
 	v := kongPaceAccountView{AccountID: id, Plan: plan, Limit: limit, LastUsedAt: lastUsed}
 	var st *kongPaceAccountState
 	var expires *time.Time
@@ -389,7 +395,12 @@ func (p *KongOpenAIAccountPace) view(cfg *KongPaceConfig, id int64, plan string,
 	v.Peak = max(p.peaks.peak(id, now, window), current)
 	recentlyUsed := lastUsed != nil && now.Sub(*lastUsed) < window
 	v.C = kongPaceConcurrencyAdjust(v.Peak, limit, recentlyUsed, cfg.Concurrency)
-	v.Weight = kongPaceWeight(v.Gap, pp, v.Q, v.C, cfg)
+	var m float64
+	if sess != nil {
+		m = kongPaceSessionAdjust(*sess, cfg.Sessions)
+		v.ActiveSessions, v.MaxSessions, v.M = sess.Active, sess.Limit, &m
+	}
+	v.Weight = kongPaceWeight(v.Gap, pp, v.Q, v.C, m, cfg)
 	return v
 }
 
@@ -398,7 +409,7 @@ func (p *KongOpenAIAccountPace) publish(ctx context.Context, loaded *kongPaceLoa
 	accounts := make(map[int64][]byte, len(snap.accounts))
 	for id, f := range snap.accounts {
 		f := f
-		v := p.view(cfg, id, f.Plan, f.Concurrency, &f, 0, f.LastUsedAt, now)
+		v := p.view(cfg, id, f.Plan, f.Concurrency, &f, 0, f.LastUsedAt, nil, now)
 		data, err := json.Marshal(struct {
 			kongPaceAccountView
 			UpdatedAt time.Time `json:"updated_at"`
@@ -441,7 +452,7 @@ func (p *KongOpenAIAccountPace) maybeLogSummary(loaded *kongPaceLoadedConfig, sn
 	cfg := &loaded.cfg
 	for _, id := range ids {
 		f := snap.accounts[id]
-		v := p.view(cfg, id, f.Plan, f.Concurrency, &f, 0, f.LastUsedAt, now)
+		v := p.view(cfg, id, f.Plan, f.Concurrency, &f, 0, f.LastUsedAt, nil, now)
 		slog.Info("kong pace: 账号状态", "account_id", id, "plan", v.Plan, "used", v.Used, "gap", v.Gap,
 			"deadline_source", v.DeadlineSource, "inc6", v.Inc6, "inc24", v.Inc24, "q", v.Q, "at_line", v.AtLine,
 			"peak", v.Peak, "limit", v.Limit, "c", v.C, "w", v.Weight)
