@@ -223,6 +223,12 @@ export default {
       subscriptionAbnormal: '异常',
       subscriptionExpires: '到期',
       // 容量状态提示
+      kongSessionLimit: {
+        label: '最大会话数',
+        placeholder: '不限制',
+        hint: '同时活跃的会话数上限，子代理与父会话算一个；满额时新会话优先落到其他账号。留空不限制',
+        full: '活跃会话已满，新会话优先落到其他账号（空闲超时：{idle}分钟）'
+      },
       capacity: {
         windowCost: {
           blocked: '5h窗口费用超限，账号暂停调度',
