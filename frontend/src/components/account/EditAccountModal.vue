@@ -1663,6 +1663,7 @@
           <input v-model.number="form.concurrency" type="number" min="1" class="input"
             @input="form.concurrency = Math.max(1, form.concurrency || 1)" />
         </div>
+        <OpenAISessionLimitField v-if="isOpenAIOAuthAccount(account)" v-model="kongMaxSessions" />
         <div>
           <label class="input-label">{{ t('admin.accounts.loadFactor') }}</label>
           <input v-model.number="form.load_factor" type="number" min="1"
@@ -3183,6 +3184,8 @@ import { createStableObjectKeyResolver } from '@/utils/stableObjectKey'
 import { getAccountExpiryTimestamp } from '@/components/account/accountExpiry'
 import { allSelectedGroupsEnableLongContextPricing } from '@/components/account/longContextBilling'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
+import OpenAISessionLimitField from '@/features/openai-session-limit/OpenAISessionLimitField.vue'
+import { applyOpenAISessionLimit, isOpenAIOAuthAccount } from '@/features/openai-session-limit/sessionLimit'
 import {
   OPENAI_WS_MODE_CTX_POOL,
   OPENAI_WS_MODE_OFF,
@@ -4106,10 +4109,14 @@ const applyOpenAIModelMappingCredentials = (credentials: Record<string, unknown>
   }
 }
 
+// [kong] OpenAI OAuth 账号的会话数上限（features/openai-session-limit），空即不限制。
+const kongMaxSessions = ref<number | null>(null)
+
 const syncFormFromAccount = (newAccount: Account | null) => {
   if (!newAccount) {
     return
   }
+  kongMaxSessions.value = newAccount.max_sessions ?? null
   // 进入回填窗口：抑制 CN 模式/协议 watcher 联动重置 base_url（见 syncingForm 注释）。
   syncingForm.value = true
   void nextTick(() => {
@@ -5853,6 +5860,7 @@ const handleSubmit = async () => {
       updatePayload.extra = newExtra
     }
 
+    applyOpenAISessionLimit(updatePayload, props.account, kongMaxSessions.value) // [kong] 有改动才写回 extra
     const canContinue = await ensureAntigravityMixedChannelConfirmed(async () => {
       await submitUpdateAccount(accountID, updatePayload)
     })

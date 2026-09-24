@@ -41,6 +41,7 @@ import { useI18n } from 'vue-i18n'
 import type { Account } from '@/types'
 import CapacityBadge from '@/components/account/CapacityBadge.vue'
 import QuotaBadge from '@/components/account/QuotaBadge.vue'
+import { isOpenAIOAuthAccount } from '@/features/openai-session-limit/sessionLimit'
 
 const props = defineProps<{
   account: Account
@@ -96,7 +97,7 @@ const windowCostTooltip = computed(() => {
 
 // ====== 会话限制 ======
 const showSessionLimit = computed(() =>
-  isAnthropicOAuthOrSetupToken.value &&
+  (isAnthropicOAuthOrSetupToken.value || isOpenAIOAuthAccount(props.account)) &&
   props.account.max_sessions != null &&
   props.account.max_sessions > 0
 )
@@ -117,7 +118,7 @@ const sessionLimitTooltip = computed(() => {
   const current = activeSessions.value
   const max = props.account.max_sessions || 0
   const idle = props.account.session_idle_timeout_minutes || 5
-  if (current >= max) return t('admin.accounts.capacity.sessions.full', { idle })
+  if (current >= max) return t(isOpenAIOAuthAccount(props.account) ? 'admin.accounts.kongSessionLimit.full' : 'admin.accounts.capacity.sessions.full', { idle })
   return t('admin.accounts.capacity.sessions.normal', { idle })
 })
 

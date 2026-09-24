@@ -372,6 +372,12 @@ export default {
       subscriptionAbnormal: 'Abnormal',
       subscriptionExpires: 'Expires',
       // Capacity status tooltips
+      kongSessionLimit: {
+        label: 'Max sessions',
+        placeholder: 'Unlimited',
+        hint: 'Cap on concurrently active sessions; subagents count with their parent session. When full, new sessions go to other accounts first. Leave empty for no limit',
+        full: 'Active sessions full, new sessions go to other accounts first (idle timeout: {idle} min)'
+      },
       capacity: {
         windowCost: {
           blocked: '5h window cost exceeded, account scheduling paused',
