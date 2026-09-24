@@ -22,7 +22,8 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 	if attempt != nil && attempt.Features != nil {
 		*request = *request.WithContext(kongWithFeatures(request.Context(), attempt.Features))
 	}
-	response, err := s.sendOpenAIUpstream(request, proxyURL, account)
+	// [kong] 发往官方 ChatGPT 后端的请求体按 zstd 压缩（见 kong_openai_request_zstd.go）。
+	response, err := s.kongSendOpenAIUpstreamCompressed(request, proxyURL, account)
 	if err != nil {
 		return response, err
 	}
