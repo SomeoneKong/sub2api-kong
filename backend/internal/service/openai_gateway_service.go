@@ -256,6 +256,8 @@ type OpenAIForwardResult struct {
 	// UpstreamEndpoint is the actual upstream API path used for this request.
 	// It avoids guessing when one downstream protocol can use multiple upstream endpoints.
 	UpstreamEndpoint string
+	// [kong] 这一轮发往上游与上游下发的 codex 票的长度与指纹（kong_request_features.go），落进用量行。
+	KongRequestFeatures *KongRequestFeatures
 	// ResponseHeadersFromWSHandshake 标记 ResponseHeaders 装的是**连接级的 WS 握手响应头**，
 	// 不是本轮的响应头。原生 WS 逐轮没有响应头，三条通路把握手头放进来供限流信号与
 	// retry-after 使用，但那份额度是**拨号时刻**的，而连接池的连接活得很久——拿它回填逐轮额度会把
@@ -517,6 +519,9 @@ type OpenAIGatewayService struct {
 	// openaiCodexTurnStateSweepForTest 仅测试注入：见 setTurnStateSweepForTest。
 	openaiCodexTurnStateSweepForTest atomic.Pointer[func()]
 	openaiCodexTurnStateWrites       atomic.Uint64
+
+	// [kong] codex 票：被动收票与请求特征（可选依赖，setter 在 kong_codex_ticket_observe.go）。nil 即不启用。
+	kongTicketObserver *KongTicketObserver
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

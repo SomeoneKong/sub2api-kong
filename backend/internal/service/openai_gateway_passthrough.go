@@ -360,6 +360,8 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	responseID := ""
 	imageCount := 0
 	var imageOutputSizes []string
+	// [kong] 本次上送记下的请求特征。载体是每轮重建的出站 request，所以在循环内取，最后留下的是实际服务的那一次。
+	var kongFeatures *KongRequestFeatures
 	for {
 		actualModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
 		if actualModel == "" {
@@ -376,6 +378,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		upstreamStart := time.Now()
 		resp, err = s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
+		kongFeatures = KongFeaturesFromRequest(upstreamReq) // [kong]
 		if err != nil {
 			// Transport-level failure (proxy/DNS/TCP/TLS — no HTTP response). Convert to
 			// a failover so the handler switches to a healthy account.
@@ -533,6 +536,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		OpenAIWSMode:                  false,
 		Duration:                      time.Since(startTime),
 		FirstTokenMs:                  firstTokenMs,
+		KongRequestFeatures:           kongFeatures, // [kong]
 	}
 	if imageCount > 0 {
 		forwardResult.ImageCount = imageCount

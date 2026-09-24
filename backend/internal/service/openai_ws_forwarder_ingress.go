@@ -188,7 +188,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	isCodexCLI := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator")) || (s.cfg != nil && s.cfg.Gateway.ForceCodexCLI)
 
 	type openAIWSClientPayload struct {
-		payloadRaw               []byte
+		payloadRaw []byte
+		// [kong] 本轮的请求特征记录器，逐轮一个（kong_request_features.go）。
+		kongFeatures             *KongFeatureRecorder
 		accountIdentitySourceRaw []byte
 		rawForHash               []byte
 		promptCacheKey           string
@@ -409,6 +411,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		} else {
 			normalized = stripped
 		}
+		// [kong] codex 票：本轮的请求特征记录器，出站那一项取剥离之后的帧内值（kong_request_features.go）。
+		turnKongFeatures := KongNewWSFrameFeatures(normalized)
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
 			if stripped, changed, stripErr := stripOpenAIImageGenerationToolsFromRawPayload(normalized); stripErr != nil {
 				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", stripErr)
@@ -482,6 +486,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 		return openAIWSClientPayload{
 			payloadRaw:               normalized,
+			kongFeatures:             turnKongFeatures,
 			accountIdentitySourceRaw: accountIdentitySourceRaw,
 			rawForHash:               trimmed,
 			promptCacheKey:           promptCacheKey,
@@ -977,11 +982,14 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	var rejectedFieldRetryState *openAIResponsesRejectedFieldRetryState
-	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
+	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string, kongFeatures *KongFeatureRecorder) (*OpenAIForwardResult, error) {
 		responseModelObserver := &upstreamResponseModelObserver{}
 		if lease == nil {
 			return nil, errors.New("upstream websocket lease is nil")
 		}
+		// [kong] codex 票：这条连接握手响应里上游给的那张，按物理连接只收一次；在写首帧之前收，写失败换连接时
+		// 它也不丢（kong_codex_ticket_observe.go）。
+		s.kongTicketObserver.CollectHandshake(account, openAIWSPayloadStringFromRaw(payload, "model"), lease.ConsumeHandshakeTurnState())
 		turnStart := time.Now()
 		wroteDownstream := false
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
@@ -1050,6 +1058,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			// 逐轮的额度快照：原生 WS 没有逐轮响应头，上游把它放在这个带外事件里
 			// （见 noteOpenAIWSCodexRateLimits）。
 			s.noteOpenAIWSCodexRateLimits(ctx, account, eventType, upstreamMessage)
+			// [kong] codex 票：带内 metadata 里上游下发的那张记进本轮特征并收票，客户端断连后照样记。
+			s.kongTicketObserver.ObserveWSEvent(account, mappedModel, kongFeatures, eventType, upstreamMessage)
 			if responseID == "" && eventResponseID != "" {
 				responseID = eventResponseID
 			}
@@ -1261,6 +1271,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					)
 				}
 				imageCount := imageCounter.Count()
+				// [kong] 帧里没带 state 时，本轮实际上送的是这条连接握手时发出去的那个。
+				kongFeatures.RecordOutboundIfAbsent(lease.SentHandshakeTurnState())
 				result := &OpenAIForwardResult{
 					RequestID:                     responseID,
 					Usage:                         usage,
@@ -1280,6 +1292,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					ResponseHeadersFromWSHandshake: true,
 					Duration:                       time.Since(turnStart),
 					FirstTokenMs:                   firstTokenMs,
+					KongRequestFeatures:            kongFeatures.Snapshot(), // [kong]
 				}
 				if replayInput := replayCollector.Items(); len(replayInput) > 0 {
 					result.wsReplayInput = replayInput
@@ -1298,6 +1311,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	currentPayload := firstPayload.payloadRaw
+	currentKongFeatures := firstPayload.kongFeatures
 	currentOriginalModel := firstPayload.originalModel
 	currentImageBillingModel := firstPayload.imageBillingModel
 	currentImageSizeTier := firstPayload.imageSizeTier
@@ -1806,7 +1820,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 
-		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
+		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort, currentKongFeatures)
 		if relayErr != nil {
 			lastTurnClean = false
 			if isOpenAIWSSessionPreempted(ctx) {
@@ -1967,6 +1981,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 		}
 		currentPayload = nextPayload.payloadRaw
+		currentKongFeatures = nextPayload.kongFeatures
 		currentOriginalModel = nextPayload.originalModel
 		currentImageBillingModel = nextPayload.imageBillingModel
 		currentImageSizeTier = nextPayload.imageSizeTier
