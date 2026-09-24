@@ -284,6 +284,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		QuotaDimension:          a.QuotaDimension,
 	}
 
+	kongExposeOpenAISessionLimit(out, a) // [kong] OpenAI OAuth 账号的会话数上限
 	// 提取 5h 窗口费用控制和会话数量控制配置（仅 Anthropic OAuth/SetupToken 账号有效）
 	if a.IsAnthropicOAuthOrSetupToken() {
 		if limit := a.GetWindowCostLimit(); limit > 0 {
