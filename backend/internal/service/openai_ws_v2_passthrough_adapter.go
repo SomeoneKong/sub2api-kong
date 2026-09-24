@@ -729,6 +729,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	} else {
 		firstClientMessage = next
 	}
+	s.kongSessionRenew(ctx, account) // [kong] 会话数上限：passthrough 首帧续期
 	// [kong] codex 票据：首帧的准入（第一段，歧义判定）。
 	//
 	// 必须在**任何字段解析、模型映射与规范化之前**：那些步骤会重建 JSON（合并重复键、改写字段），
@@ -1203,6 +1204,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					s.kongTicket.ObserveHandshakeState(ctx, account, model, kongHandshakeState)
 					kongHandshakeState = ""
 				}
+				s.kongSessionRenew(ctx, account) // [kong] 会话数上限：passthrough 每轮续期
 				next, attempt, ticketErr := s.kongTicket.PrepareWSTurn(ctx, account, model, payload)
 				if ticketErr != nil {
 					return nil, nil, wrapOpenAIWSKongTicketError(ticketErr)

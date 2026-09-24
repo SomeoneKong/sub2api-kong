@@ -439,6 +439,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			strippedClientState = strippedState
 		}
 		var turnKongFeatures *KongFeatureRecorder
+		s.kongSessionRenew(ctx, account) // [kong] 会话数上限：ctx_pool 与 HTTP bridge 每轮续期
 		// [kong] codex 票据：把票写进本帧的 client_metadata。
 		//
 		// WS 上票不是头而是 payload 字段，且逐轮上送（口径见 kong_ticket_gateway.go 的 WS 段）。

@@ -526,6 +526,8 @@ type OpenAIGatewayService struct {
 	kongTicket *KongTicketGateway
 	// [kong] 账号消耗节奏（可选依赖，setter 在 kong_openai_account_pace_select.go）。nil 即不启用。
 	kongPace *KongOpenAIAccountPace
+	// [kong] 会话数上限（可选依赖，setter 在 kong_openai_session_limit.go）。nil 即不启用。
+	kongSessionLimit *kongSessionLimit
 }
 
 // SetKongTicketGateway 注入 codex 票据守卫（可选依赖）。

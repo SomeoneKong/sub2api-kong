@@ -405,6 +405,7 @@ func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, ac
 		}
 	}
 
+	h.kongFillOpenAIActiveSessions(ctx, account, &item) // [kong] OpenAI OAuth 账号的活跃会话数
 	h.enrichShadowParents(ctx, []AccountWithConcurrency{item})
 
 	return item
@@ -750,6 +751,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 			}
 		}
 	}
+	sessionLimitAccountIDs = kongAppendOpenAISessionLimitAccounts(accounts, sessionLimitAccountIDs, sessionIdleTimeouts) // [kong]
 
 	// 始终获取 RPM 计数（Redis GET，极低开销）
 	if len(rpmAccountIDs) > 0 && h.rpmCache != nil {

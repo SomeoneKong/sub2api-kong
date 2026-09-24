@@ -35,6 +35,7 @@ plans:
       24h: { start: 40, full: 80 }
 default_plan: pro
 concurrency:
+  enabled: true
   peak_window_minutes: 5
   idle_bonus_pp: 10
   busy_ratio: 0.667
@@ -42,6 +43,9 @@ concurrency:
     free_2_plus: 10
     free_1: 30
     full: 50
+sessions:
+  enabled: true
+  max_penalty_pp: 30
 decision_log:
   enabled: true
   retention_days: 90
@@ -69,7 +73,8 @@ func kongPaceRow(id int64, plan string, used float64, reset time.Time, updated t
 
 func TestKongPaceConfig_SampleParses(t *testing.T) {
 	cfg := kongPaceTestConfig(t)
-	if !cfg.Enabled || cfg.GapCapPP != 30 || cfg.Plans["prolite"].Capacity != 0.25 || cfg.Concurrency.PenaltyPP.Free1 != 30 {
+	if !cfg.Enabled || cfg.GapCapPP != 30 || cfg.Plans["prolite"].Capacity != 0.25 || cfg.Concurrency.PenaltyPP.Free1 != 30 ||
+		!cfg.Concurrency.Enabled || !cfg.Sessions.Enabled || cfg.Sessions.MaxPenaltyPP != 30 {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 	if got := cfg.plan("plus"); got.Capacity != 1 {
@@ -102,6 +107,18 @@ func TestKongPaceConfig_Rejects(t *testing.T) {
 		"capacity too large": {func(s string) string {
 			return strings.Replace(s, "capacity: 1\n", "capacity: 1000\n", 1)
 		}, "0 < x <= 100"},
+		"concurrency switch missing": {func(s string) string {
+			return strings.Replace(s, "  enabled: true\n  peak_window_minutes", "  peak_window_minutes", 1)
+		}, "concurrency.enabled: 缺失"},
+		"sessions missing": {func(s string) string {
+			return strings.Replace(s, "sessions:\n  enabled: true\n  max_penalty_pp: 30\n", "", 1)
+		}, "sessions: 缺失"},
+		"sessions switch missing": {func(s string) string {
+			return strings.Replace(s, "sessions:\n  enabled: true\n", "sessions:\n", 1)
+		}, "sessions.enabled: 缺失"},
+		"session penalty negative": {func(s string) string {
+			return strings.Replace(s, "max_penalty_pp: 30", "max_penalty_pp: -1", 1)
+		}, "sessions.max_penalty_pp"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -414,20 +431,59 @@ func TestKongPaceConcurrencyAdjust(t *testing.T) {
 			t.Errorf("peak=%d limit=%d recent=%v: got %v want %v", tc.peak, tc.limit, tc.recent, got, tc.want)
 		}
 	}
+	// 关闭时恒为 0，空闲加分也不给。
+	c.Enabled = false
+	for _, peak := range []int{0, 8, 10} {
+		if got := kongPaceConcurrencyAdjust(peak, 8, false, c); got != 0 {
+			t.Errorf("disabled: peak=%d got %v", peak, got)
+		}
+	}
+}
+
+func TestKongPaceSessionAdjust(t *testing.T) {
+	s := kongPaceTestConfig(t).Sessions
+	cases := []struct {
+		use  kongPaceSessionUse
+		want float64
+	}{
+		{kongPaceSessionUse{Active: kongPaceI(0), Limit: 2}, 0},
+		{kongPaceSessionUse{Active: kongPaceI(1), Limit: 2}, 15},
+		{kongPaceSessionUse{Active: kongPaceI(1), Limit: 4}, 7.5},
+		{kongPaceSessionUse{Active: kongPaceI(3), Limit: 4}, 22.5},
+		{kongPaceSessionUse{Active: kongPaceI(2), Limit: 2}, 30},
+		{kongPaceSessionUse{Active: kongPaceI(5), Limit: 2}, 30}, // 溢出后占用截到 1
+		{kongPaceSessionUse{Active: kongPaceI(1), Limit: 2, Full: true}, 30},
+		{kongPaceSessionUse{Full: true}, 30}, // 入口没有计数、之后才记为满额
+		{kongPaceSessionUse{Active: kongPaceI(1), Limit: 0}, 0},
+		{kongPaceSessionUse{Limit: 2}, 0},
+	}
+	for _, tc := range cases {
+		if got := kongPaceSessionAdjust(tc.use, s); math.Abs(got-tc.want) > 1e-9 {
+			t.Errorf("%+v: got %v want %v", tc.use, got, tc.want)
+		}
+	}
+	s.Enabled = false
+	if got := kongPaceSessionAdjust(kongPaceSessionUse{Active: kongPaceI(2), Limit: 2, Full: true}, s); got != 0 {
+		t.Fatalf("disabled must be 0, got %v", got)
+	}
 }
 
 func TestKongPaceWeight_CapOnlyTheGap(t *testing.T) {
 	cfg := kongPaceTestConfig(t)
 	pro, lite := cfg.Plans["pro"], cfg.Plans["prolite"]
 	// 两个套餐都落后很多：上限只截进度差，让位量照样生效，比例保持 8:1。
-	wPro := kongPaceWeight(70, pro, 0, 0, cfg)
-	wLite := kongPaceWeight(70, lite, 0, 0, cfg)
+	wPro := kongPaceWeight(70, pro, 0, 0, 0, cfg)
+	wLite := kongPaceWeight(70, lite, 0, 0, 0, cfg)
 	if math.Abs(wPro/wLite-8) > 1e-9 {
 		t.Fatalf("yield must survive the cap: pro=%v prolite=%v", wPro, wLite)
 	}
 	// 追赶到上限且只剩 1 个槽的账号，与同套餐进度正常、槽位宽裕的账号相等。
-	if a, b := kongPaceWeight(80, pro, 0, 30, cfg), kongPaceWeight(0, pro, 0, 0, cfg); math.Abs(a-b) > 1e-9 {
+	if a, b := kongPaceWeight(80, pro, 0, 30, 0, cfg), kongPaceWeight(0, pro, 0, 0, 0, cfg); math.Abs(a-b) > 1e-9 {
 		t.Fatalf("free_1 == G must cancel the catch-up bonus: %v vs %v", a, b)
+	}
+	// 会话占用只削弱进度差：落后 G、1/2 个会话的账号仍比进度正常、没有会话的账号优先（2^1.5 倍）。
+	if a, b := kongPaceWeight(30, pro, 0, 0, 15, cfg), kongPaceWeight(0, pro, 0, 0, 0, cfg); math.Abs(a/b-math.Exp2(1.5)) > 1e-9 {
+		t.Fatalf("session adjustment must be subtracted after the cap: %v vs %v", a, b)
 	}
 }
 
@@ -625,6 +681,10 @@ func TestKongPaceFactsTick_PublishUsesLastUsedAt(t *testing.T) {
 	}
 	if c(1) != 0 || c(2) != -10 {
 		t.Fatalf("idle bonus must respect the last use: recent=%v stale=%v", c(1), c(2))
+	}
+	// state 里的 w 是不含会话占用的基础权重，不带会话字段。
+	if s := string(store.published[1]); strings.Contains(s, `"m"`) || strings.Contains(s, "active_sessions") {
+		t.Fatalf("state must not carry session occupancy: %s", s)
 	}
 }
 

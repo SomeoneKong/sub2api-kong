@@ -33,6 +33,10 @@ type kongPaceRound struct {
 	FinalOrder []int64 `json:"final_order,omitempty"`
 	// AcquiredIndex 是抢到的账号在 FinalOrder 中的位置；排在它前面的是复核未通过或抢槽失败的。
 	AcquiredIndex int `json:"acquired_index"`
+	// SessionFull 是会话数已满、不参与本轮的账号；SessionOverflow 是有余量的账号一个都没有、本轮用的就是
+	// 满额账号（见 kong_openai_session_limit.go）。
+	SessionFull     []int64 `json:"session_full,omitempty"`
+	SessionOverflow bool    `json:"session_overflow,omitempty"`
 }
 
 // kongPaceDecision 是一次进入第 2 层的决策，从进入到离开第 2 层。
@@ -51,6 +55,9 @@ type kongPaceDecision struct {
 	rates      openAILegacyUpstreamRateOrder
 	acquiredID int64
 	loadError  bool
+	// sessions 是同一次第 2 层的会话分段。每一轮按它当时的状态取会话占用与满额账号：确认登记没通过的
+	// 账号在之后的轮次里已是满额。
+	sessions *kongSessionGate
 }
 
 // kongPaceBegin 在进入第 2 层时调用。功能未装配或配置文件不存在时返回 nil。
@@ -133,7 +140,7 @@ func (d *kongPaceDecision) reorder(available []accountWithLoad, rates openAILega
 				facts, plan = &f, f.Plan
 			}
 		}
-		views[i] = d.p.view(cfg, acc.ID, plan, acc.Concurrency, facts, current, acc.LastUsedAt, d.now)
+		views[i] = d.p.view(cfg, acc.ID, plan, acc.Concurrency, facts, current, acc.LastUsedAt, d.sessions.paceUse(acc), d.now)
 		views[i].Priority = acc.Priority
 		views[i].CompactTier = openAICompactSupportTier(acc)
 		if rate, ok := rates.rates[acc.ID]; ok && rates.enabled {
@@ -167,7 +174,8 @@ func (d *kongPaceDecision) reorder(available []accountWithLoad, rates openAILega
 		start = end
 	}
 
-	round := kongPaceRound{Candidates: views, PaceOrder: make([]int64, len(order)), AcquiredIndex: -1}
+	round := kongPaceRound{Candidates: views, PaceOrder: make([]int64, len(order)), AcquiredIndex: -1,
+		SessionFull: d.sessions.fullIDs(), SessionOverflow: d.sessions.overflow()}
 	reordered := make([]accountWithLoad, len(order))
 	for pos, i := range order {
 		round.PaceOrder[pos] = available[i].account.ID
@@ -269,6 +277,14 @@ func (d *kongPaceDecision) acquired(accountID int64) {
 			break
 		}
 	}
+}
+
+// attachSessions 接上会话上限的分段：之后每一轮从它取会话占用、满额账号与溢出标记。
+func (d *kongPaceDecision) attachSessions(g *kongSessionGate) {
+	if d == nil {
+		return
+	}
+	d.sessions = g
 }
 
 // loadFailed 记下第 2 层因负载读取失败走了降级分支（不经过重排）。
