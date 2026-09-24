@@ -180,6 +180,22 @@ func (l *openAIWSConnLease) HandshakeHeaders() http.Header {
 	return cloneHeader(l.conn.handshakeHeaders)
 }
 
+// SentHandshakeTurnState 见 openAIWSConn.sentHandshakeTurnState。
+func (l *openAIWSConnLease) SentHandshakeTurnState() string {
+	if l == nil || l.conn == nil {
+		return ""
+	}
+	return l.conn.sentHandshakeTurnState()
+}
+
+// ConsumeHandshakeTurnState 见 openAIWSConn.consumeHandshakeTurnState。
+func (l *openAIWSConnLease) ConsumeHandshakeTurnState() string {
+	if l == nil || l.conn == nil {
+		return ""
+	}
+	return l.conn.consumeHandshakeTurnState()
+}
+
 func (l *openAIWSConnLease) IsPrewarmed() bool {
 	if l == nil || l.conn == nil {
 		return false
@@ -285,6 +301,16 @@ type openAIWSConn struct {
 	handshakeHeaders       http.Header
 	handshakeCompatibility openAIWSHandshakeCompatibilityKey
 	routingAffinity        string
+
+	// [kong] 握手是**物理连接**一生一次的事，而一条连接会被多个会话/请求反复租用。
+	//
+	// handshakeSentTurnState 是拨号时我们实际放进 upgrade 请求头的那个 turn-state。复用连接的后续
+	// 轮次不再发生握手，所以"本轮实际发往上游的 state"只能是这一份，不能拿调用方手里那个（那个
+	// 可能是客户端本次带来、却因为复用而从未上送的值）。
+	// handshakeStateConsumed 让上游在握手响应里给的那张票在一条连接上只被收走一次：每次租用读到
+	// 的都是同一个值，不设闸门会反复入库，同连接换了模型时还会再记到另一个模型名下。
+	handshakeSentTurnState string
+	handshakeStateConsumed atomic.Bool
 
 	leaseCh   chan struct{}
 	closedCh  chan struct{}
@@ -766,6 +792,29 @@ func (c *openAIWSConn) handshakeHeader(name string) string {
 		return ""
 	}
 	return strings.TrimSpace(c.handshakeHeaders.Get(strings.TrimSpace(name)))
+}
+
+// sentHandshakeTurnState 返回拨号时实际上送的 turn-state（连接一生不变）。
+func (c *openAIWSConn) sentHandshakeTurnState() string {
+	if c == nil {
+		return ""
+	}
+	return c.handshakeSentTurnState
+}
+
+// consumeHandshakeTurnState 取上游握手响应里的 turn-state，一条连接只成功一次。
+func (c *openAIWSConn) consumeHandshakeTurnState() string {
+	if c == nil {
+		return ""
+	}
+	state := c.handshakeHeader(openAIWSTurnStateHeader)
+	if state == "" {
+		return ""
+	}
+	if !c.handshakeStateConsumed.CompareAndSwap(false, true) {
+		return ""
+	}
+	return state
 }
 
 func (c *openAIWSConn) matchesHandshakeCompatibility(compatibility openAIWSHandshakeCompatibilityKey) bool {
@@ -2152,6 +2201,8 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 	accountID := req.Account.ID
 	evict := func() { p.evictConn(accountID, id) }
 	pooledConn.onPeerClosed.Store(&evict)
+	// headers 已经过 HeadersFactory，是真正发出去的那一份。
+	pooledConn.handshakeSentTurnState = strings.TrimSpace(headers.Get(openAIWSTurnStateHeader))
 	pooledConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req.Account, req.Headers)
 	pooledConn.routingAffinity = normalizeOpenAIWSRoutingAffinity(req.Headers)
 	return pooledConn, nil
