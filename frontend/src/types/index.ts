@@ -1815,6 +1815,11 @@ export interface AdminUsageLog extends UsageLog {
   upstream_model_mismatch?: boolean | null
   model_mapping_chain?: string | null
   upstream_request_id?: string | null
+  /**
+   * 这条请求的请求特征（fork 专有）：这一轮发往上游的票与上游回发的票，各自的长度与指纹。
+   * 缺省表示没采到任何特征——**不是"没有 state"**。
+   */
+  kong_request_features?: import('@/features/request-features/requestFeatures').KongRequestFeatures | null
 
   // 账号计费倍率（仅管理员可见）
   account_rate_multiplier?: number | null
