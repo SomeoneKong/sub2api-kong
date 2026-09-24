@@ -1,0 +1,22 @@
+-- 903: 用量行带上逐请求的「请求特征」（fork 专有）。
+--
+-- 它回答的是"这一条业务请求本身带了什么可用于降智判断的东西"。在此之前这些信息无处可查：
+-- usage_logs 没有任何 turn-state 相关的列，而 kong_ticket_cache.state_len 是**票**的长度
+-- ——一张票服务几十次请求，对不到具体某一条上；off / observe 模式下客户端自带的 state 更是
+-- 从不进我们的库。
+--
+-- **用 JSONB 而不是逐特征加列**：这一列注定会长出更多特征（响应侧的回发 state、客户端身份标识
+-- 的指纹……），而 usage_logs 的插入路径有一份按位置对齐的参数表与八处 VALUES 列清单，每加一列
+-- 都要同步改那九处。特征是观测用的稀疏键值，不参与计费与调度，也不需要建索引，JSONB 的代价只是
+-- 每行几十字节。
+--
+-- 当前的键（缺省即"没有这项"，**不存原值只存指纹**——state 是可注入的凭据）：
+--   state_fp / state_len               实际发往上游的那个 state
+--   client_state_fp / client_state_len 客户端自己带来的那个（full 模式下被我们替换掉的那份）
+--   ticket_id                          我们注入的是哪张票（kong_ticket_cache.id）
+--   mode                               该账号当时的票据模式（off / observe / full）
+--   reissued_fp / reissued_len         上游在响应里又下发的 state（= 它没接受我们注入的那张）
+--
+-- NULL 表示这条请求没有任何特征（非门控模型、计 token 端点，或该通路尚未接采集）。
+ALTER TABLE usage_logs
+    ADD COLUMN IF NOT EXISTS kong_request_features JSONB;
