@@ -17,6 +17,7 @@
 - **发往官方 ChatGPT 后端的请求体 zstd 压缩**（省出站流量，见下文挂点一节）
 - **前端展示调整**（账号页：OpenAI Pro 20x / Pro 5x 只有 7d 主窗口，不显示 5h；管理员用量页：用户列可在列设置里隐
   藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会显示）
+- **OpenAI 账号会话数上限**（软上限，设计见 `DESIGN-openai-session-limit.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
@@ -170,6 +171,28 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
   上游的「输出 TPS」之后：上游是输出 token ÷ 总耗时，含排队与首字等待；这里除以去掉首字的生成时长，口径不同，
   两行并存），`i18n/locales/{en,zh}/dashboard.ts` 的 `usage` 段各两个键。**替换**：`AccountUsageCell.vue` OpenAI
   OAuth 分支 5h 进度条的 `v-if` 条件、管理员 `views/admin/UsageView.vue` 的 `ALWAYS_VISIBLE` 去掉 `user`。
+
+### OpenAI 账号会话数上限
+
+- **挂在旧版选号的三层与 WS 每轮入口，只登记与分段，不删除登记**。`selectAccountWithLoadAwareness` 里：第 1 层抢到
+  槽与排队两处返回前 `kongSessionTouch`；候选判空之后 `kongSessionGateBegin`（传入节奏决策）；`available` 构造
+  后 `preferRoomLoads`；负载读取失败分支 `preferRoomAccounts`；两处抢到槽后 `confirm`（在 `kongPace.acquired`
+  与绑定粘性会话之前，不通过要释放槽）；第 3 层排序后 `roomFirst`、返回排队计划前 `confirm`。
+  `openai_account_scheduler.go` 里续接与 guardian 命中处 `kongSessionTouch`，guardian 回退进入旧版选号前
+  `KongWithSessionCountHash`。
+- **各 OpenAI 入口都要把会话哈希放进请求上下文**：`openai_gateway_handler.go` 的 Responses、Messages、WS 与
+  `openai_chat_completions.go` 在算出会话哈希后用 `KongWithSessionCountHash` 放进去，WS 的 ingress 每轮解析
+  （ctx_pool 与 HTTP bridge 共用）与 passthrough 的首帧、每轮处 `kongSessionRenew` 从上下文取。上游新增 OpenAI
+  入口时要一并接上。
+- **显示侧**：`dto/mappers.go` 一行导出上限，`admin/account_handler.go` 列表与详情各一行查活跃数。
+- **rebase 时复核**这些位置；上游改动三层结构时要保证第 3 层两段的并集仍是原候选——软上限不能新增拒绝。
+- **装配**（`wire_gen.go`）：`SetKongSessionLimitCache` 注入上游的 `SessionLimitCache`，计数复用它。
+- **不要加"请求失败就注销"**：同一会话会同时有多个请求在途，一个失败时别的可能还在原账号上执行，登记只刷新或按空闲
+  超时过期。
+- **前端**（`features/openai-session-limit/`）同样分两类。**追加**：`EditAccountModal.vue` 的两行 import、并发数网格里
+  的输入框、`syncFormFromAccount` 里取值、提交前的 `applyOpenAISessionLimit`，
+  `i18n/locales/{en,zh}/admin/accounts.ts` 的 `kongSessionLimit` 段。**替换**：`AccountCapacityCell.vue` 会话徽标
+  的显示条件与满额提示。
 
 ## 本地验证的已知差异
 
