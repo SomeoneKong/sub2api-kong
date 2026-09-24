@@ -138,6 +138,8 @@ type openAIWSPassthroughUsageMeta struct {
 	requestedReasoningEffort atomic.Pointer[string]
 	requestModel             atomic.Pointer[string]
 	upstreamModel            atomic.Pointer[string]
+	// [kong] 本轮的请求特征记录器（kong_request_features.go），与上面几项同样逐轮更新。
+	kongFeatures atomic.Pointer[KongFeatureRecorder]
 
 	// 仅在 client->upstream filter goroutine 中读写；Load 侧通过上方原子指针同步。
 	sessionRequestModel string
@@ -917,6 +919,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		statusCode,
 		openAIWSHeaderValueForLog(handshakeHeaders, "x-request-id"),
 	)
+	// [kong] codex 票：这条路每次自己拨号，握手响应里上游给的那张拨完就收；帧里没带 state 时，本轮实际
+	// 上送的是 upgrade 请求头里发出去的那个（kong_codex_ticket_observe.go）。
+	s.kongTicketObserver.CollectHandshake(account, capturedSessionModel, handshakeHeaders.Get(openAIWSTurnStateHeader))
+	kongSentHandshakeState := strings.TrimSpace(headers.Get(openAIWSTurnStateHeader))
 
 	upstreamFrameConn, ok := upstreamConn.(openaiwsv2.FrameConn)
 	if !ok {
@@ -1125,6 +1131,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			//     service_tier 时按 default 处理，billing 应如实反映。
 			if policyErr == nil && blocked == nil && isResponseCreate {
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
+				usageMeta.kongFeatures.Store(KongNewWSFrameFeatures(out)) // [kong] codex 票
 				_, actualModel := usageMeta.turnModels(requestModelForThisFrame)
 				SetOpsUpstreamModel(c, actualModel)
 				responseCreateAtCopy := responseCreateAt
@@ -1157,6 +1164,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	} else {
 		firstClientMessage = stripped
 	}
+	usageMeta.kongFeatures.Store(KongNewWSFrameFeatures(firstClientMessage)) // [kong] codex 票：首帧的请求特征记录器
 	upstreamFirstMessageSent := false
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
 	firstWriteErr := relayUpstreamFrameConn.WriteFrame(firstWriteCtx, coderws.MessageText, firstClientMessage)
@@ -1226,6 +1234,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					hooks.TurnStarted(turnNo, turn.StartedAt)
 				}
 				turnRequestModel, turnUpstreamModel := usageMeta.turnModels(turn.RequestModel)
+				usageMeta.kongFeatures.Load().RecordOutboundIfAbsent(kongSentHandshakeState) // [kong]
 				turnResult := &OpenAIForwardResult{
 					RequestID: turn.RequestID,
 					Usage: OpenAIUsage{
@@ -1245,6 +1254,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 					Stream:                        true,
 					OpenAIWSMode:                  true,
+					KongRequestFeatures:           usageMeta.kongFeatures.Load().Snapshot(), // [kong]
 					UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(turn.TerminalEventType),
 					ResponseHeaders:               cloneHeader(handshakeHeaders),
 					// 这是连接级的握手头，不是本轮响应头（见 CodexQuotaHeaders）。
@@ -1312,6 +1322,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				// passthrough 双向都允许二进制帧，这份 JSON 用 Binary 帧一样发得出来；
 				// 非 JSON 的二进制帧取不出字段，对它是透明的。
 				s.noteOpenAIWSCodexRateLimits(ctx, account, eventType, payload)
+				// [kong] codex 票：带内 metadata 里上游下发的那张记进本轮特征并收票，客户端走后排空期间照样记。
+				s.kongTicketObserver.ObserveWSEvent(account, kongStringValue(usageMeta.upstreamModel.Load()), usageMeta.kongFeatures.Load(), eventType, payload)
 				if msgType != coderws.MessageText {
 					return nil
 				}
@@ -1380,6 +1392,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 
 	resultRequestModel, resultUpstreamModel := usageMeta.turnModels(relayResult.RequestModel)
+	usageMeta.kongFeatures.Load().RecordOutboundIfAbsent(kongSentHandshakeState) // [kong]
 	result := &OpenAIForwardResult{
 		RequestID: relayResult.RequestID,
 		Usage: OpenAIUsage{
@@ -1399,6 +1412,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 		Stream:                        true,
 		OpenAIWSMode:                  true,
+		KongRequestFeatures:           usageMeta.kongFeatures.Load().Snapshot(), // [kong]
 		UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(relayResult.TerminalEventType),
 		ResponseHeaders:               cloneHeader(handshakeHeaders),
 		// 这是连接级的握手头，不是本轮响应头（见 CodexQuotaHeaders）。

@@ -178,10 +178,13 @@ type UsageLog struct {
 	Stream             bool
 	OpenAIWSMode       bool
 	NativeCompactionV2 bool
-	DurationMs         *int
-	FirstTokenMs       *int
-	UserAgent          *string
-	IPAddress          *string
+	// KongRequestFeatures 是这一轮发往上游与上游下发的 codex 票的长度与指纹（fork 专有，见
+	// kong_request_features.go 与 DESIGN-codex-ticket.md）。nil 表示没记到任何一项。
+	KongRequestFeatures *KongRequestFeatures
+	DurationMs          *int
+	FirstTokenMs        *int
+	UserAgent           *string
+	IPAddress           *string
 	// SessionID is the explicit client-provided request correlation identifier
 	// (e.g. the session_id / X-Session-Id headers). Nil when the client sent no
 	// valid session header. It is never derived from prompt_cache_key or content.
