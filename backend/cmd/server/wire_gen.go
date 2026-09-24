@@ -289,13 +289,19 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	upstreamBillingProbeService := service.ProvideUpstreamBillingProbeService(accountRepository, accountTestService, settingService, leaderLockCache, db)
 	openCodeGoUsageService := service.ProvideOpenCodeGoUsageService(accountRepository, httpUpstream, settingService, leaderLockCache, db)
 	adminHandlers := handler.ProvideAdminHandlers(dashboardHandler, adminUserHandler, groupHandler, accountHandler, adminAnnouncementHandler, dataManagementHandler, backupHandler, oAuthHandler, openAIOAuthHandler, geminiOAuthHandler, antigravityOAuthHandler, grokOAuthHandler, cnProviderHandler, proxyHandler, adminRedeemHandler, promoHandler, settingHandler, opsHandler, systemHandler, adminSubscriptionHandler, adminUsageHandler, userAttributeHandler, errorPassthroughHandler, tlsFingerprintProfileHandler, pluginHandler, adminAPIKeyHandler, scheduledTestHandler, channelHandler, channelMonitorHandler, channelMonitorRequestTemplateHandler, contentModerationHandler, promptAdminHandler, paymentHandler, affiliateHandler, complianceHandler, auditLogHandler, upstreamBillingProbeService, ollamaCloudUsageService, openCodeGoUsageService)
-	// [kong] codex 票的被动观测：装配手工写在这里，不经 wire。
-	// 用 setter 注入网关服务，是为了把改动收在这一个文件里；代价是 wire generate 生成不出这几行，
-	// 所以本仓库不跑 wire generate。
+	// [kong] codex 票的被动观测与账号指纹测试：装配手工写在这里，不经 wire。
+	// 直接给 AdminHandlers 赋字段、用 setter 注入网关服务，是为了把改动收在这一个文件里；代价是 wire generate
+	// 生成不出这几行，所以本仓库不跑 wire generate。
 	kongTicketRepository := repository.NewKongTicketRepository(db)
 	kongTicketCollector := service.NewKongTicketCollector(kongTicketRepository)
 	kongTicketCollector.Start()
 	openAIGatewayService.SetKongTicketObserver(service.NewKongTicketObserver(kongTicketCollector))
+	kongFingerprintTester, kongFingerprintErr := service.NewKongFingerprintTester(accountRepository, service.NewKongFingerprintUpstream(httpUpstream, proxyRepository, tlsFingerprintProfileService), kongTicketRepository)
+	if kongFingerprintErr != nil {
+		// 指纹库是内嵌数据，加载失败只让这个管理功能不可用，不阻止网关启动。
+		log.Printf("kong fingerprint: 指纹库加载失败，指纹测试不可用: %v", kongFingerprintErr)
+	}
+	adminHandlers.KongFingerprint = admin.NewKongFingerprintHandler(kongFingerprintTester)
 	usageRecordWorkerPool := service.NewUsageRecordWorkerPool(configConfig)
 	userMsgQueueCache := repository.NewUserMsgQueueCache(redisClient)
 	userMessageQueueService := service.ProvideUserMessageQueueService(userMsgQueueCache, rpmCache, configConfig)
