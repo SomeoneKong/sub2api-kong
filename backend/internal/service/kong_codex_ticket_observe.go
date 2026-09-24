@@ -42,7 +42,8 @@ type kongHTTPObservation struct {
 	o        *KongTicketObserver
 	account  *Account
 	recorder *KongFeatureRecorder
-	// getBody 在发送之前取下：发送路径可能就地替换请求体，收票时要从发送前的明文里读模型。
+	// getBody 在发送之前取下：发送时请求体可能被就地换成压缩后的字节（kong_openai_request_zstd.go），
+	// 收票时要从明文里读模型。
 	getBody func() (io.ReadCloser, error)
 }
 
