@@ -12,7 +12,8 @@ func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
 // （kong_codex_ticket_observe.go）。原生 WebSocket 的帧不经过这里，三条 WS 通路各自接入。
 func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
 	observation := s.kongTicketObserver.BeforeHTTP(request, account)
-	response, err := s.sendOpenAIUpstream(request, proxyURL, account)
+	// [kong] 发往官方 ChatGPT 后端的请求体按 zstd 压缩（见 kong_openai_request_zstd.go）。
+	response, err := s.kongSendOpenAIUpstreamCompressed(request, proxyURL, account)
 	if err == nil {
 		observation.AfterHTTP(response)
 	}
