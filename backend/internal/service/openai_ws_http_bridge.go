@@ -555,12 +555,15 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	turnStart := time.Now()
 	rejectedFieldRetryState := newOpenAIResponsesRejectedFieldRetryState(body)
 	var resp *http.Response
+	// [kong] 本次上送记下的请求特征，每次发送后取一次，最后留下的是实际服务的那一次。
+	var kongFeatures *KongRequestFeatures
 	for {
 		upstreamReq, buildErr := buildUpstreamRequest(body)
 		if buildErr != nil {
 			return nil, buildErr
 		}
 		resp, err = s.doOpenAIUpstream(upstreamReq, proxyURL, account)
+		kongFeatures = KongFeaturesFromRequest(upstreamReq) // [kong]
 		if err != nil {
 			if turn == 1 {
 				return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
@@ -683,6 +686,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			ResponseHeaders:               cloneHeader(resp.Header),
 			Duration:                      time.Since(turnStart),
 			FirstTokenMs:                  firstTokenMs,
+			KongRequestFeatures:           kongFeatures, // [kong]
 		}
 		if replayInput := replayCollector.Items(); len(replayInput) > 0 {
 			result.wsReplayInput = replayInput

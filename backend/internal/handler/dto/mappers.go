@@ -774,6 +774,7 @@ func UsageLogFromServiceAdmin(l *service.UsageLog) *AdminUsageLog {
 		ModelMappingChain:       l.ModelMappingChain,
 		UpstreamRequestID:       l.UpstreamRequestID,
 		BillingTier:             l.BillingTier,
+		KongRequestFeatures:     l.KongRequestFeatures,
 		AccountRateMultiplier:   l.AccountRateMultiplier,
 		AccountStatsCost:        l.AccountStatsCost,
 		IPAddress:               l.IPAddress,
