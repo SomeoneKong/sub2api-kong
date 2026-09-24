@@ -1324,6 +1324,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			OpenAIWSMode:                  false,
 			Duration:                      time.Since(startTime),
 			FirstTokenMs:                  firstTokenMs,
+			// [kong] 记录器挂在上送用的那个 request 对象上（见 doOpenAIUpstream）。
+			KongRequestFeatures: KongFeaturesFromRequest(upstreamReq),
 		}
 		if imageCount > 0 {
 			forwardResult.ImageCount = imageCount
