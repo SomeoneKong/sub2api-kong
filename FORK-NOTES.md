@@ -19,6 +19,7 @@
   藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会显示）
 - **OpenAI 账号会话数上限**（软上限，设计见 `DESIGN-openai-session-limit.md`）
 - **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）
+- **OpenAI 请求体快速路径**（跳过必然不改写的处理、复用顶层查找，设计见 `DESIGN-openai-request-body-fastpath.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
@@ -210,6 +211,30 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
   不必为错误分支另做清除。
 - **开关**：环境变量 `KONG_CODEX_REASONING_INCLUDED`，不设置为开，false 关闭，写错则关闭并记错误日志。
 
+### OpenAI 请求体快速路径
+
+- **接入点都是单行或函数头 3 行，门只判"跳过"**：handler 的 `Responses` 判空之后登记入站请求体，
+  `normalizeCodexCallOutputBootstrap` 函数头；`forwardOpenAIPassthrough` 在指纹收敛之后登记、开始转发响应前注
+  销（另有 `defer` 兜底）；service 里 `NormalizeCompactionTriggerInputOrder`、
+  `normalizeOpenAIResponsesLiteToolsPayload`、`sanitizeOpenAIResponsesInputItemIDs` 的函数头，
+  `aliasOpenAIOAuthReservedToolNamesBody` 原字面量检查之后，`needsOrphanCleanup` 赋值之后，schema 清洗两遍之
+  间，OAuth 兼容处理的逐项元数据循环之前，空图片预判的字面量检查之后，`parseString` 的普通字节分支；另有几处
+  `gjson.GetBytes(...)` 换成 `gjson.Get(kongBytesView(...))` 的同行替换。
+- **rebase 时复核三件事**：被门跳过的函数，改写条件与读取的字段有没有变（差分与守护测试能抓住大部分，抓不住的是上
+  游新增读取的字段）；两个登记点之间有没有新增改写请求体的处理（只影响命中率，不影响正确性）；流水线上有没有新
+  增原地修改请求体的写法（测试构建里注销时会校验并 panic）。rebase 之后先重录对照基准（见「本地验证的已知差
+  异」），再跑三方对照。
+- **gjson 用 `backend/third_party/gjson` 的副本，由 `go.mod` 的 `replace` 引用**。副本是 v1.18.0 原样加一组查询钩
+  子：`gjson.go` 里 `Get`、`Valid`、`ValidBytes` 三处标 `[kong]`，另有不经钩子的 `GetNative`、`ValidNative` 与
+  `kong_hooks.go`。`replace` 会盖过上游 `go.mod` 里 require 的版本，**上游升级 gjson 时不会自动生效**。所以 rebase
+  时要看 `go.mod` 里 `github.com/tidwall/gjson` 的 require 版本有没有变；变了就换副本：用
+  `go mod download -json github.com/tidwall/gjson@<新版本>` 找到源码目录，覆盖副本，重新打上这几处改动；然后在
+  副本目录跑 `go test -skip TestJSONString ./...`，再跑 `service` 的钩子差分测试
+  （`TestKongGjsonHookMatchesNative`、`TestKongOpenAIBodyFastpathMatchesOriginal`）。两个 Dockerfile 都在
+  `go mod download` 之前复制 `third_party/`：本地 `replace` 的模块在下载依赖时就要读得到。
+- **开关**：环境变量 `KONG_OPENAI_BODY_FASTPATH`（不设置为开，false 全关，写错则全关并记错误日志）与
+  `KONG_OPENAI_BODY_FASTPATH_OFF`（逗号分隔的项名，只关这几项）。
+
 ## 本地验证的已知差异
 
 ⚠️ **判断测试是否通过只看 `go test` 自己的退出码或完整的 FAIL 计数。** 上游测试会往 stderr 打
@@ -222,6 +247,17 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
 the CAS`）。**它在纯上游基线 tag 上同样失败**，与本 fork 的定制无关，CI（Linux）也是绿的——
 属平台或时序相关。遇到时不要顺着它排查，先在 `git worktree add <tmp> <base tag>` 的纯上游树上
 复现一次，确认是上游自带的再放过。
+
+gjson 副本的 `TestJSONString` 在 Go 1.27 下失败，原版 v1.18.0 同样失败，与副本的改动无关。跑副本的测试时用
+`go test -skip TestJSONString ./...`。副本是嵌套 module，父模块的 `go test ./...` 不会跑到它，要单独跑。
+
+请求体快速路径的对照基准 `backend/internal/handler/testdata/kong_openai_body_fastpath_golden.json`
+**必须在不含快速路径的代码上录制**，否则就失去了"原版本"的意义。步骤：
+`git worktree add <tmp> <功能后端提交>^`；把 `kong_openai_body_fastpath_e2e_test.go` 与 `internal/pkg/kongcorpus/`
+复制过去，再放一份测试构建的桩 `internal/service/kong_testhooks_unit.go`（`KongSwapOpenAIRequestZstdForTest` 照抄，
+`KongSetOpenAIBodyFastpathForTest` 写成空操作）；在那里用 `KONG_BODY_FASTPATH_GOLDEN=update` 跑
+`TestKongOpenAIBodyFastpathGolden`，把生成的基准拷回来；回到当前代码不带这个变量再跑一遍，快速路径关、开两个子测试
+都要通过。新增 e2e 用例之后也要这样重录。
 
 **`-race` 下上游测试套整体不干净**，这不是本 fork 的问题：每次都报十几个竞态、几十个连带失败的用例，
 并且每次不一样。竞态全在上游的测试写法上——测试桩不加锁、并行用例各自 `gin.SetMode`、改包级变量时上一个
