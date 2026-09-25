@@ -83,6 +83,9 @@ func ReadRequestBodyWithPrealloc(req *http.Request) ([]byte, error) {
 		}
 	}
 
+	if body, ok, err := kongReadZstdRequestBody(req, capHint); ok { // [kong] 见 DESIGN-openai-request-body-memory §2.3
+		return body, err
+	}
 	raw, err := readRequestBodyChunks(req.Body, capHint, req.ContentLength)
 	if err != nil {
 		return nil, err
@@ -206,6 +209,9 @@ func NormalizeLenientJSONRequestBody(body []byte, maxNormalizedBytes int64) ([]b
 	}
 	if int64(len(body)) > maxNormalizedBytes {
 		return nil, &http.MaxBytesError{Limit: maxNormalizedBytes}
+	}
+	if !kongContainsJSONControlByte(body) { // [kong] 状态机只改控制字节，一个都没有时必然原样返回
+		return body, nil
 	}
 
 	var out []byte

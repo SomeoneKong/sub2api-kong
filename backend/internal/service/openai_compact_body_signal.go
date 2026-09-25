@@ -28,6 +28,9 @@ func NormalizeCompactionTriggerInputOrder(body []byte) ([]byte, bool, error) {
 	if len(body) == 0 {
 		return body, false, nil
 	}
+	if kongCompactionTriggerSettled(body) { // [kong] 见 DESIGN §3.4
+		return body, false, nil
+	}
 	var payload map[string]any
 	if err := decodeOpenAIJSONUseNumber(body, &payload); err != nil {
 		return body, false, err
@@ -166,7 +169,7 @@ func HasCompactionTriggerInInput(body []byte) bool {
 	if len(body) == 0 {
 		return false
 	}
-	input := gjson.GetBytes(body, "input")
+	input := gjson.Get(kongBytesView(body), "input") // [kong] 不复制 input
 	if !input.IsArray() {
 		return false
 	}
