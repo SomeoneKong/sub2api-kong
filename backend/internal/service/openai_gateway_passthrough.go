@@ -1866,6 +1866,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		observer = beginUpstreamResponseModelObservation(c)
 	}
 	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	KongApplyCodexReasoningIncluded(c, resp.Header) // [kong]
 
 	// SSE headers
 	c.Header("Content-Type", "text/event-stream")
@@ -2341,6 +2342,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	logOpenAISuccessMissingUsage(ctx, c, account, resp, usage, "json", false)
 
 	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	KongApplyCodexReasoningIncluded(c, resp.Header) // [kong]
 
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {
@@ -2427,6 +2429,7 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 	}
 
 	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	KongApplyCodexReasoningIncluded(c, resp.Header) // [kong]
 	logOpenAISuccessMissingUsage(c.Request.Context(), c, account, resp, usage, terminalType, false)
 
 	contentType := "application/json; charset=utf-8"
