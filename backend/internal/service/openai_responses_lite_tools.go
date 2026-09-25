@@ -237,6 +237,9 @@ func openAIResponsesLiteToolIdentityForError(rawTool any) string {
 }
 
 func normalizeOpenAIResponsesLiteToolsPayload(body []byte) ([]byte, bool, error) {
+	if kongLiteToolsSettled(body) { // [kong] 见 DESIGN §3.2
+		return body, false, nil
+	}
 	var requestBody map[string]any
 	if err := decodeOpenAIJSONUseNumber(body, &requestBody); err != nil {
 		return body, false, fmt.Errorf("decode responses Lite request body: %w", err)
