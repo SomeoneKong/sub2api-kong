@@ -8,8 +8,9 @@
 
 ## 定制的边界
 
-只碰九类东西：**codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）、
+只碰十类东西：**codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）、
 **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）、
+**OpenAI 请求体快速路径**（跳过必然不改写的处理、复用顶层查找，设计见 `DESIGN-openai-request-body-fastpath.md`）、
 **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）、**OpenAI 账号消耗节奏**（旧版选号的重排，设计见
 `DESIGN-openai-account-pace.md`）、**OpenAI 账号会话数上限**（软上限，设计见
 `DESIGN-openai-session-limit.md`）、**Codex 模型目录的上下文窗口折算**、**发往官方 ChatGPT 后端的
@@ -61,6 +62,8 @@
 | **Codex 模型目录的上下文窗口折算挂在 `CodexModels` 的每个写出口** | 上游目录的 `max_context_window` 在 codex 里是「配置覆盖允许的上限」，网关按它 × 比例抬高 `context_window`（只往上调），客户端就不必各自配 `model_context_window` 或钉本地目录。handler 的固定账号、分组配置、调度三条分支各自写响应，每处写出前都调 `KongFinalizeCodexModelsManifest`；传给上游构建函数的 If-None-Match 一律为空串，304 由它按折算后的 ETag 判定——否则持有折算前 ETag 的客户端永远拿不到折算结果。rebase 时上游若新增写出分支，要一并接上。比例走环境变量 `KONG_CODEX_CONTEXT_WINDOW_RATIO`：不设置为 1（取 max），0 关闭，写错则关闭并记错误日志 |
 | **出站请求体的 zstd 压缩挂在 `doOpenAIUpstream` 的发送处** | 与票的观测同一个汇聚点，HTTP 调用点一并覆盖；原生 WS 不经过这里，它的帧由 permessage-deflate 压缩。条件只看最终出站请求：发往 `chatgpt.com`（含子域）的 JSON POST、正文不小于 1 KiB、没有 `Content-Encoding`、账号不走插件（插件自带传输层）。入站的 `Content-Encoding` 在读入时已解码并删除，也不在转发头白名单里，所以客户端自己压缩上来的请求不影响判断。票的观测在压缩之前记下明文请求体的读取入口：收票要读明文里的 `model`。插件判定只做一次：压缩了的请求（连同明文重发）直接交 `httpUpstream.Do`，不经 `sendOpenAIUpstream`，否则插件绑定在两次判定之间切换时，压缩正文会落进插件——rebase 时上游若在 `sendOpenAIUpstream` 里加了逻辑，要看压缩路径是否也需要。上游像是不接受压缩（415，或 400 / 422 且错误正文是专指正文解码失败的写法）时用明文重发一次；明文通过了，才把该端点改发明文 24 小时，明文同样被拒说明与压缩无关、端点照旧压缩。普通业务错误不重发，错误正文原样交给调用方。每 10 分钟一行 `kong zstd: 周期计数` 日志给出压缩前后字节数。开关走环境变量 `KONG_OPENAI_REQUEST_ZSTD`：不设置为开，false 关闭，写错则关闭并记错误日志 |
 | **codex 的 `x-reasoning-included` 分两步写：handler 先写，Responses 各成功出口再按上游重写** | 响应头可能在选定上游之前就提交——流式排队等槽的心跳、OpenAI 账号非透传流式在首输出前的 keepalive 都会先 Flush——所以 handler 的 `Responses` 在 `acquireResponsesUserSlot` 之前、`ResponsesWebSocket` 在 `coderws.Accept` 之前各一行 `KongApplyCodexReasoningIncluded(c, nil)`。之后透传三处、非透传四处各一行，上游带这个头时换成上游的值，并把白名单 `Add` 进来的那一份合成一份（接入点表见设计文档 §3）；HTTP→WS 与协议转换通路不转发上游的这个头，不用接。rebase 时要复核：第 1 步仍在所有可能提前写出的点之前；上游若新增会转发上游响应头的 Responses 成功出口，要接第 2 步，否则上游开始发这个头时会出现两份。易错点：OpenAI 账号的非透传流式要用 `kongApplyCodexReasoningIncludedUnstaged`，直接写 writer 并从暂存集合里删掉那一份，不能随暂存头提交——keepalive 之后暂存头全部作废。codex 只在成功响应上读这个头，错误响应带着无妨，不必为错误分支另做清除。开关走环境变量 `KONG_CODEX_REASONING_INCLUDED`：不设置为开，false 关闭，写错则关闭并记错误日志 |
+| **请求体快速路径的接入点都是单行或函数头 3 行，门只判"跳过"** | 接入点都带 `[kong]`：handler 的 `Responses` 判空之后登记入站请求体，`normalizeCodexCallOutputBootstrap` 函数头；`forwardOpenAIPassthrough` 在指纹收敛之后登记、开始转发响应前注销（另有 `defer` 兜底）；service 里 `NormalizeCompactionTriggerInputOrder`、`normalizeOpenAIResponsesLiteToolsPayload`、`sanitizeOpenAIResponsesInputItemIDs` 的函数头，`aliasOpenAIOAuthReservedToolNamesBody` 原字面量检查之后，`needsOrphanCleanup` 赋值之后，schema 清洗两遍之间，OAuth 兼容处理的逐项元数据循环之前，空图片预判的字面量检查之后，`parseString` 的普通字节分支；另有几处 `gjson.GetBytes(...)` 换成 `gjson.Get(kongBytesView(...))` 的同行替换。rebase 时复核三件事：被门跳过的函数，改写条件与读取的字段有没有变（差分与守护测试能抓住大部分，抓不住的是上游新增读取的字段）；两个登记点之间有没有新增改写请求体的处理（只影响命中率，不影响正确性）；流水线上有没有新增原地修改请求体的写法（测试构建里注销时会校验并 panic）。rebase 之后先重录对照基准（见「本地验证的已知差异」），再跑三方对照。开关走环境变量 `KONG_OPENAI_BODY_FASTPATH`（不设置为开，false 全关，写错则全关并记错误日志）与 `KONG_OPENAI_BODY_FASTPATH_OFF`（逗号分隔的项名，只关这几项） |
+| **gjson 用 `backend/third_party/gjson` 的副本，由 `go.mod` 的 `replace` 引用** | 副本是 v1.18.0 原样加一组查询钩子：`gjson.go` 里 `Get`、`Valid`、`ValidBytes` 三处标 `[kong]`，另有不经钩子的 `GetNative`、`ValidNative` 与 `kong_hooks.go`。`replace` 会盖过上游 `go.mod` 里 require 的版本，**上游升级 gjson 时不会自动生效**。所以 rebase 时要看 `go.mod` 里 `github.com/tidwall/gjson` 的 require 版本有没有变；变了就换副本：用 `go mod download -json github.com/tidwall/gjson@<新版本>` 找到源码目录，覆盖副本，重新打上这几处改动；然后在副本目录跑 `go test -skip TestJSONString ./...`，再跑 `service` 的钩子差分测试（`TestKongGjsonHookMatchesNative`、`TestKongOpenAIBodyFastpathMatchesOriginal`）。两个 Dockerfile 都在 `go mod download` 之前复制 `third_party/`：本地 `replace` 的模块在下载依赖时就要读得到 |
 | 接转发链路用「可选依赖 + setter」 | `OpenAIGatewayService` 的构造函数参数表很长且是上游高频改动面。加字段 + `SetKongTicketObserver` 能把改动收在一处，未注入时所有接入点退化为空操作 |
 | 前端定制放 `frontend/src/features/<主题>/`，上游文件只做单行追加或单处替换 | 用量明细的请求特征列（`features/request-features/`）碰上游的点全是**追加**：`UsageTable.vue` 一行 import 与一个 `#cell-request_features` 插槽、`types/index.ts` 里 `AdminUsageLog` 的 `kong_request_features` 字段、管理员 `views/admin/UsageView.vue` 的列定义一项（标签用中文字面量，不加 i18n 键）。账号指纹测试（`features/openai-fingerprint-test/`，文案在 feature 内）碰上游的只有两处各两行：`AccountActionMenu.vue`「测试连接」下方的菜单项组件与它的 import，`AccountsView.vue` 的弹窗宿主与它的 import——弹窗不能挂在菜单里，菜单关闭时菜单组件随之卸载。前端展示调整（`features/openai-usage-window/`、`features/usage-latency/`）碰上游的点分两类：**追加**——`AccountUsageCell.vue` 与 `UsageTable.vue` 各一行 import，`UsageTable.vue` 延迟列网格里的「速度」一行，`i18n/locales/{en,zh}/dashboard.ts` 的 `usage` 段各两个键；**替换**——`AccountUsageCell.vue` OpenAI OAuth 分支 5h 进度条的 `v-if` 条件、管理员 `views/admin/UsageView.vue` 的 `ALWAYS_VISIBLE` 去掉 `user`。会话数上限（`features/openai-session-limit/`）同样分两类：**追加**——`EditAccountModal.vue` 的两行 import、并发数网格里的输入框、`syncFormFromAccount` 里取值、提交前的 `applyOpenAISessionLimit`，`i18n/locales/{en,zh}/admin/accounts.ts` 的 `kongSessionLimit` 段；**替换**——`AccountCapacityCell.vue` 会话徽标的显示条件与满额提示。替换点在上游改到同一行时必然冲突，rebase 时先看这几处。定制的前端单测都要追加到根 `Makefile` 的 `FRONTEND_CRITICAL_VITEST`，CI 只跑这份清单 |
 | 后端响应结构要显式写 `json` tag | 本功能的 handler 直接序列化 service 层结构体。上游那些结构多数也没 tag，但我们的响应里混着 `gin.H` 的 snake_case 字段——不写 tag 会让同一个响应里两种命名风格并存，前端类型也跟着别扭 |
@@ -79,6 +82,17 @@
 the CAS`）。**它在纯上游基线 tag 上同样失败**，与本 fork 的定制无关，CI（Linux）也是绿的——
 属平台或时序相关。遇到时不要顺着它排查，先在 `git worktree add <tmp> <base tag>` 的纯上游树上
 复现一次，确认是上游自带的再放过。
+
+gjson 副本的 `TestJSONString` 在 Go 1.27 下失败，原版 v1.18.0 同样失败，与副本的改动无关。跑副本的测试时用
+`go test -skip TestJSONString ./...`。副本是嵌套 module，父模块的 `go test ./...` 不会跑到它，要单独跑。
+
+请求体快速路径的对照基准 `backend/internal/handler/testdata/kong_openai_body_fastpath_golden.json`
+**必须在不含快速路径的代码上录制**，否则就失去了"原版本"的意义。步骤：
+`git worktree add <tmp> <功能后端提交>^`；把 `kong_openai_body_fastpath_e2e_test.go` 与 `internal/pkg/kongcorpus/`
+复制过去，再放一份测试构建的桩 `internal/service/kong_testhooks_unit.go`（`KongSwapOpenAIRequestZstdForTest` 照抄，
+`KongSetOpenAIBodyFastpathForTest` 写成空操作）；在那里用 `KONG_BODY_FASTPATH_GOLDEN=update` 跑
+`TestKongOpenAIBodyFastpathGolden`，把生成的基准拷回来；回到当前代码不带这个变量再跑一遍，快速路径关、开两个子测试
+都要通过。新增 e2e 用例之后也要这样重录。
 
 **`-race` 下上游测试套整体不干净**，这不是本 fork 的问题。`kong-race.yml`（只手动触发，见下节）
 在 `./internal/service/` 上跑 `-race` 时**必然红**：2026-09-19 实测本分支 81 个用例失败、
