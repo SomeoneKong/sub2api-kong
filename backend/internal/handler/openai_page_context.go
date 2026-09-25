@@ -17,7 +17,7 @@ func normalizeCodexUntrustedContext(body []byte) ([]byte, bool) {
 	if !mayContainCodexCallOutputCandidate(body,
 		"codex_apps_open_page", "codex_apps_selected_page_part_",
 		"browser_info", "goal_objective", "untrusted_context", "untrusted_content", "ide_context", "proposed_plan",
-	) || !hasUniqueJSONMembers(body) {
+	) || !kongCodexUntrustedContextMayApply(body) || !hasUniqueJSONMembers(body) { // [kong] 上游预判之后、查重键之前用快速路径的判定，见 DESIGN §3.1
 		return body, false
 	}
 	var request map[string]json.RawMessage

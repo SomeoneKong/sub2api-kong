@@ -202,8 +202,8 @@ func TestKongZstdCompressRoundTripAndFrameHeader(t *testing.T) {
 	for _, size := range []int{2 << 10, 100 << 10, 3 << 20} {
 		plain := kongZstdTestBody(size)
 		req := newKongZstdTestRequest(t, http.MethodPost, kongZstdTestURL, plain)
-		gotPlain, endpoint, compressed := z.compress(req, false)
-		if !compressed || !bytes.Equal(gotPlain, plain) || endpoint != "POST chatgpt.com/backend-api/codex/responses" {
+		sent, endpoint, compressed := z.compress(req, false)
+		if !compressed || endpoint != "POST chatgpt.com/backend-api/codex/responses" {
 			t.Fatalf("size=%d: compressed=%v endpoint=%q", size, compressed, endpoint)
 		}
 		if req.Header.Get("Content-Encoding") != "zstd" {
@@ -230,6 +230,13 @@ func TestKongZstdCompressRoundTripAndFrameHeader(t *testing.T) {
 		replayed, _ := io.ReadAll(replay)
 		if !bytes.Equal(replayed, encoded) {
 			t.Fatalf("size=%d: GetBody 应重放压缩后的正文", size)
+		}
+		if err := sent.restore(req); err != nil {
+			t.Fatal(err)
+		}
+		restored, _ := io.ReadAll(req.Body)
+		if !bytes.Equal(restored, plain) || req.ContentLength != int64(len(plain)) || req.Header.Get("Content-Encoding") != "" {
+			t.Fatalf("size=%d: 换回明文后正文、长度或 Content-Encoding 不对", size)
 		}
 	}
 }

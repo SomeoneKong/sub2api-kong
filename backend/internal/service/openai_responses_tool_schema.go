@@ -53,6 +53,9 @@ func sanitizeOpenAIResponsesToolSchemasForPlatform(body []byte, platform string)
 			changed = true
 		}
 	}
+	if kongSkipToolSchemaPatternPass(platform, normalized, changed) { // [kong] 见 DESIGN §3.6
+		return normalized, changed, nil
+	}
 	if shouldSanitizeOpenAIResponsesToolSchemaPatterns(platform) {
 		next, sanitized, err := sanitizeOpenAIResponsesToolSchemaPatterns(normalized)
 		if err != nil {

@@ -114,10 +114,12 @@ func kongParseOpenAIRequestZstd(value string, present bool) (bool, error) {
 func (s *OpenAIGatewayService) kongSendOpenAIUpstreamCompressed(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
 	routedToPlugin := s.pluginManager != nil && s.pluginManager.ShouldRouteOpenAIOAuth(account)
 	z := kongOpenAIRequestZstdInstance()
-	plain, endpoint, compressed := z.compress(request, routedToPlugin)
+	sent, endpoint, compressed := z.compress(request, routedToPlugin)
 	if !compressed {
 		return s.sendOpenAIUpstream(request, proxyURL, account)
 	}
+	// 返回之后不会再有人要重放压缩正文：net/http 的连接级重试与重定向都在 Do 返回之前，明文重发在下面。
+	defer sent.release()
 	send := func() (*http.Response, error) {
 		return s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
 	}
@@ -129,7 +131,9 @@ func (s *OpenAIGatewayService) kongSendOpenAIUpstreamCompressed(request *http.Re
 	if response.Body != nil {
 		_ = response.Body.Close()
 	}
-	kongZstdRestorePlain(request, plain)
+	if err := sent.restore(request); err != nil {
+		return nil, err
+	}
 	z.record(func(st *kongZstdStats) { st.resent++ })
 	response, err = send()
 	if err != nil || response == nil {
@@ -144,25 +148,42 @@ func (s *OpenAIGatewayService) kongSendOpenAIUpstreamCompressed(request *http.Re
 	return response, nil
 }
 
-// compress 在满足条件时把请求体换成 zstd 压缩后的字节，返回原明文与端点键。
-func (z *kongOpenAIRequestZstd) compress(request *http.Request, routedToPlugin bool) ([]byte, string, bool) {
+// kongZstdOutbound 是一次压缩发送留下的两件事：怎样换回明文重发，以及压缩正文的持有者（旧读法没有持有者）。
+type kongZstdOutbound struct {
+	restore func(*http.Request) error
+	payload *kongZstdPayload
+}
+
+func (s kongZstdOutbound) release() {
+	if s.payload != nil {
+		s.payload.release()
+	}
+}
+
+// compress 在满足条件时把请求体换成 zstd 压缩后的字节，返回明文重发的办法与端点键。
+func (z *kongOpenAIRequestZstd) compress(request *http.Request, routedToPlugin bool) (kongZstdOutbound, string, bool) {
 	if z == nil || !z.enabled || routedToPlugin || !kongZstdEligible(request) {
-		return nil, "", false
+		return kongZstdOutbound{}, "", false
 	}
 	endpoint := request.Method + " " + strings.ToLower(request.URL.Hostname()) + request.URL.Path
 	if z.isOff(endpoint) {
 		z.record(func(st *kongZstdStats) { st.skippedOff++ })
-		return nil, "", false
+		return kongZstdOutbound{}, "", false
+	}
+	if kongFastpathOn(kongFastpathZstdOut) && request.ContentLength > 0 {
+		if sent, compressed, decided := z.compressStreaming(request, endpoint); decided {
+			return sent, endpoint, compressed
+		}
 	}
 	plain, err := kongZstdReadBody(request)
 	if err != nil || len(plain) < kongZstdMinBodyBytes || !kongZstdLooksLikeJSON(plain) {
-		return nil, "", false
+		return kongZstdOutbound{}, "", false
 	}
 	encoded, err := kongZstdEncode(plain)
 	if err != nil {
 		z.record(func(st *kongZstdStats) { st.failures++ })
 		slog.Warn("kong zstd: 压缩失败，按明文发送", "endpoint", endpoint, "bytes", len(plain), "error", err)
-		return nil, "", false
+		return kongZstdOutbound{}, "", false
 	}
 	if request.Body != nil {
 		_ = request.Body.Close()
@@ -176,7 +197,192 @@ func (z *kongOpenAIRequestZstd) compress(request *http.Request, routedToPlugin b
 		st.rawBytes += int64(len(plain))
 		st.zstdBytes += int64(len(encoded))
 	})
-	return plain, endpoint, true
+	restore := func(r *http.Request) error {
+		kongZstdRestorePlain(r, plain)
+		return nil
+	}
+	return kongZstdOutbound{restore: restore}, endpoint, true
+}
+
+// compressStreaming 是不复制明文的压缩（DESIGN-openai-request-body-memory §2.2）：长度看 ContentLength，从 GetBody
+// 的 reader 读出开头判断是不是 JSON，其余直接交给编码器；压缩正文由持有者提供，明文重发用压缩前的 GetBody。
+// decided 为假时交给原来的读法：读到的字节数与 ContentLength 不符，或编码器出错（原读法会照常记失败）。
+func (z *kongOpenAIRequestZstd) compressStreaming(request *http.Request, endpoint string) (sent kongZstdOutbound, compressed, decided bool) {
+	size := request.ContentLength
+	if size < kongZstdMinBodyBytes {
+		return kongZstdOutbound{}, false, true
+	}
+	body, err := request.GetBody()
+	if err != nil {
+		return kongZstdOutbound{}, false, true
+	}
+	defer func() { _ = body.Close() }()
+	counted := &kongCountingReader{r: body}
+	prefix, isJSON, err := kongZstdPeekJSON(counted)
+	if err != nil || !isJSON {
+		return kongZstdOutbound{}, false, true
+	}
+	encoded, err := kongZstdEncodeStream(io.MultiReader(bytes.NewReader(prefix), counted), size)
+	if counted.err != nil {
+		return kongZstdOutbound{}, false, true
+	}
+	if err != nil || counted.n != size {
+		return kongZstdOutbound{}, false, false
+	}
+
+	if request.Body != nil {
+		_ = request.Body.Close()
+	}
+	payload := &kongZstdPayload{data: encoded}
+	plainGetBody, plainLength := request.GetBody, request.ContentLength
+	request.Body = payload.reader()
+	request.GetBody = payload.getBody
+	request.ContentLength = int64(len(encoded))
+	request.Header.Set("Content-Encoding", "zstd")
+	z.record(func(st *kongZstdStats) {
+		st.compressed++
+		st.rawBytes += size
+		st.zstdBytes += int64(len(encoded))
+	})
+	restore := func(r *http.Request) error {
+		plain, err := plainGetBody()
+		if err != nil {
+			return err
+		}
+		r.Body = plain
+		r.GetBody = plainGetBody
+		r.ContentLength = plainLength
+		r.Header.Del("Content-Encoding")
+		return nil
+	}
+	return kongZstdOutbound{restore: restore, payload: payload}, true, true
+}
+
+// kongZstdPeekJSON 读到第一个非空白字节为止，判断请求体是不是 JSON（规则同 kongZstdLooksLikeJSON），返回已读的
+// 字节，调用方把它们接回正文前面。
+func kongZstdPeekJSON(r io.Reader) ([]byte, bool, error) {
+	buf := make([]byte, 0, 512)
+	for {
+		if len(buf) == cap(buf) {
+			buf = append(buf, 0)[:len(buf)]
+		}
+		n, err := r.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if trimmed := bytes.TrimLeft(buf, " \t\r\n"); len(trimmed) > 0 {
+			return buf, trimmed[0] == '{' || trimmed[0] == '[', nil
+		}
+		if err == io.EOF {
+			return buf, false, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+	}
+}
+
+// kongCountingReader 记下读到的字节数与读取错误：编码器出错时据此分辨是正文读不出来，还是编码本身失败。
+type kongCountingReader struct {
+	r   io.Reader
+	n   int64
+	err error
+}
+
+func (c *kongCountingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	if err != nil && err != io.EOF {
+		c.err = err
+	}
+	return n, err
+}
+
+// kongZstdOutputBound 是 size 字节明文压缩后的上界：不可压缩的数据按原样存进块里，每块（最大 128 KiB）多 3 字节
+// 块头，外加帧头与结尾的空块。按它一次分配，编码时不会扩容。
+func kongZstdOutputBound(size int64) int {
+	return int(size + size>>8 + 64)
+}
+
+// kongZstdEncodeStream 与 kongZstdEncode 的编码方式相同（同一个编码器池、先 Flush 再 Close），只是从 reader 读入，
+// 输出按上界一次分配。
+func kongZstdEncodeStream(r io.Reader, size int64) ([]byte, error) {
+	encoder, _ := kongZstdEncoderPool.Get().(*zstd.Encoder)
+	if encoder == nil {
+		return nil, errors.New("zstd encoder unavailable")
+	}
+	defer func() {
+		encoder.Reset(nil)
+		kongZstdEncoderPool.Put(encoder)
+	}()
+	out := bytes.NewBuffer(make([]byte, 0, kongZstdOutputBound(size)))
+	encoder.Reset(out)
+	if _, err := encoder.ReadFrom(r); err != nil {
+		return nil, err
+	}
+	if err := encoder.Flush(); err != nil {
+		return nil, err
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// errKongZstdPayloadReleased 是持有者释放之后再调 GetBody 得到的错误。
+var errKongZstdPayloadReleased = errors.New("kong zstd: 压缩正文已释放")
+
+// kongZstdPayload 提供压缩正文：Body 与每次 GetBody 返回的 reader 各自持有正文，读到 EOF 或被 Close 时放掉；
+// release 只是不再给出新的 reader，已经交给 transport 的照常读完。所以正文在上传完、且持有者释放之后就不再被引用，
+// 不会经 Response.Request 一直保活到流式结束。
+type kongZstdPayload struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (p *kongZstdPayload) reader() io.ReadCloser {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return &kongZstdPayloadReader{data: p.data}
+}
+
+func (p *kongZstdPayload) getBody() (io.ReadCloser, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.data == nil {
+		return nil, errKongZstdPayloadReleased
+	}
+	return &kongZstdPayloadReader{data: p.data}, nil
+}
+
+func (p *kongZstdPayload) release() {
+	p.mu.Lock()
+	p.data = nil
+	p.mu.Unlock()
+}
+
+// kongZstdPayloadReader 读完或被 Close 就丢掉正文引用。net/http 允许 Read 与 Close 来自不同协程，所以加锁。
+type kongZstdPayloadReader struct {
+	mu   sync.Mutex
+	data []byte
+	off  int
+}
+
+func (r *kongZstdPayloadReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.off >= len(r.data) {
+		r.data = nil
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	return n, nil
+}
+
+func (r *kongZstdPayloadReader) Close() error {
+	r.mu.Lock()
+	r.data = nil
+	r.mu.Unlock()
+	return nil
 }
 
 // kongZstdEligible 判断请求是否在压缩范围内：发往官方 ChatGPT 后端的 JSON POST。只看最终出站
