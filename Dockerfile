@@ -72,6 +72,8 @@ WORKDIR /app/backend
 
 # Copy go mod files first (better caching)
 COPY backend/go.mod backend/go.sum ./
+# [kong] go.mod 用 replace 指向本地的 gjson 副本，下载依赖前就要能读到它。
+COPY backend/third_party ./third_party
 # Cache mount keeps the module cache across builds so a transient CDN blip on
 # retry resumes instead of re-fetching every zip from scratch.
 RUN --mount=type=cache,id=sub2api-gomod,target=/go/pkg/mod \
