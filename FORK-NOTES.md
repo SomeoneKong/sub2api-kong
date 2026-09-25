@@ -13,8 +13,12 @@
 - **codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）
 - **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）
 - **OpenAI 账号消耗节奏**（旧版选号的重排，设计见 `DESIGN-openai-account-pace.md`）
+- **发往官方 ChatGPT 后端的请求体 zstd 压缩**（省出站流量，见下文挂点一节）
 - **OpenAI 账号会话数上限**（软上限，设计见 `DESIGN-openai-session-limit.md`）
 - **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）
+- **OpenAI 请求体快速路径**（跳过必然不改写的处理、复用顶层查找，设计见 `DESIGN-openai-request-body-fastpath.md`）
+- **OpenAI 请求体内存**（少留副本、少做复制：请求视图的字段不拖住请求体，出站 zstd 流式压缩并在上传完放掉正文，
+  入站 zstd 不拼接、复用解码器，item id 清洗与身份改写一次写出结果，设计见 `DESIGN-openai-request-body-memory.md`）
 - **账号计划执行端用到的管理端点**（按到期时间指定重置卡的用卡端点，设计见
   `DESIGN-openai-plan-reset-by-expiry.md`）
 - **请求存活续期**（并发槽与会话登记在请求进行中续期，设计见 `DESIGN-request-liveness.md`）
@@ -160,6 +164,25 @@ rebase 时丢掉，这一小节随之删除。
 - **装配**（`wire_gen.go`）：建节奏组件，`SetKongOpenAIAccountPace` 注入网关服务，接好计划组件之后 `Start`；
   cleanup 里 `StopKongOpenAIAccountPace`。
 
+### 发往官方 ChatGPT 后端的请求体 zstd 压缩
+
+- **挂在 `doOpenAIUpstream` 的发送处**。与票的观测同一个汇聚点，HTTP 调用点一并覆盖；原生 WS 不经过这里，它的帧由
+  permessage-deflate 压缩。条件只看最终出站请求：发往 `chatgpt.com`（含子域）的 JSON POST、正文不小于 1 KiB、
+  没有 `Content-Encoding`、账号不走插件（插件自带传输层）。入站的 `Content-Encoding` 在读入时已解码并删除，也
+  不在转发头白名单里，所以客户端自己压缩上来的请求不影响判断。票的观测在压缩之前记下明文请求体的读取入口：收票
+  要读明文里的 `model`。
+- **插件判定只做一次**：压缩了的请求（连同明文重发）直接交 `httpUpstream.Do`，不经 `sendOpenAIUpstream`，否则插件
+  绑定在两次判定之间切换时，压缩正文会落进插件——rebase 时上游若在 `sendOpenAIUpstream` 里加了逻辑，要看压缩路
+  径是否也需要。
+- **被拒时的回退**：上游像是不接受压缩（415，或 400 / 422 且错误正文是专指正文解码失败的写法）时用明文重发一次；明
+  文通过了，才把该端点改发明文 24 小时，明文同样被拒说明与压缩无关、端点照旧压缩。普通业务错误不重发，错误正文
+  原样交给调用方。每 10 分钟一行 `kong zstd: 周期计数` 日志给出压缩前后字节数。
+- **压缩正文由持有者提供**（快速路径开关里的 `zstd_out` 项，见 `DESIGN-openai-request-body-memory.md` §2.2）：不再
+  经 `GetBody` 复制一份明文；`Body` 与每次 `GetBody` 给出的 reader 读完或被 Close 就放掉正文，
+  `kongSendOpenAIUpstreamCompressed` 返回时释放持有者，此后 `GetBody` 报错，明文重发用压缩前的 `GetBody`。rebase 时
+  若 `HTTPUpstream` 或调用方开始在 `Do` 返回之后重读 `GetBody`（像 Grok 的回退那样），这条前提就不成立了。
+- **开关**：环境变量 `KONG_OPENAI_REQUEST_ZSTD`，不设置为开，false 关闭，写错则关闭并记错误日志。
+
 ### OpenAI 账号会话数上限
 
 - **挂在旧版选号的三层与 WS 每轮入口，只登记与分段，不删除登记**。`selectAccountWithLoadAwareness` 里：第 1 层抢到
@@ -196,6 +219,53 @@ rebase 时丢掉，这一小节随之删除。
   删掉那一份，不能随暂存头提交——keepalive 之后暂存头全部作废。codex 只在成功响应上读这个头，错误响应带着无妨，
   不必为错误分支另做清除。
 - **开关**：环境变量 `KONG_CODEX_REASONING_INCLUDED`，不设置为开，false 关闭，写错则关闭并记错误日志。
+
+### OpenAI 请求体快速路径
+
+- **接入点都是单行或函数头 3 行，门只判"跳过"**：handler 的 `Responses` 判空之后登记入站请求体，
+  `normalizeCodexCallOutputBootstrap` 函数头；`forwardOpenAIPassthrough` 在指纹收敛之后登记、开始转发响应前注
+  销（另有 `defer` 兜底）；service 里 `NormalizeCompactionTriggerInputOrder`、
+  `normalizeOpenAIResponsesLiteToolsPayload`、`sanitizeOpenAIResponsesInputItemIDs` 的函数头，
+  `aliasOpenAIOAuthReservedToolNamesBody` 原字面量检查之后，`needsOrphanCleanup` 赋值之后，schema 清洗两遍之
+  间，OAuth 兼容处理的逐项元数据循环之前，空图片预判的字面量检查之后，`parseString` 的普通字节分支；另有几处
+  `gjson.GetBytes(...)` 换成 `gjson.Get(kongBytesView(...))` 的同行替换。
+- **rebase 时复核三件事**：被门跳过的函数，改写条件与读取的字段有没有变（差分与守护测试能抓住大部分，抓不住的是上
+  游新增读取的字段）；两个登记点之间有没有新增改写请求体的处理（只影响命中率，不影响正确性）；流水线上有没有新
+  增原地修改请求体的写法（测试构建里注销时会校验并 panic）。rebase 之后先重录对照基准（见「本地验证的已知差
+  异」），再跑三方对照。
+- **gjson 用 `backend/third_party/gjson` 的副本，由 `go.mod` 的 `replace` 引用**。副本是 v1.18.0 原样加一组查询钩
+  子：`gjson.go` 里 `Get`、`Valid`、`ValidBytes` 三处标 `[kong]`，另有不经钩子的 `GetNative`、`ValidNative` 与
+  `kong_hooks.go`。`replace` 会盖过上游 `go.mod` 里 require 的版本，**上游升级 gjson 时不会自动生效**。所以 rebase
+  时要看 `go.mod` 里 `github.com/tidwall/gjson` 的 require 版本有没有变；变了就换副本：用
+  `go mod download -json github.com/tidwall/gjson@<新版本>` 找到源码目录，覆盖副本，重新打上这几处改动；然后在
+  副本目录跑 `go test -skip TestJSONString ./...`，再跑 `service` 的钩子差分测试
+  （`TestKongGjsonHookMatchesNative`、`TestKongOpenAIBodyFastpathMatchesOriginal`）。两个 Dockerfile 都在
+  `go mod download` 之前复制 `third_party/`：本地 `replace` 的模块在下载依赖时就要读得到。
+- **开关**：环境变量 `KONG_OPENAI_BODY_FASTPATH`（不设置为开，false 全关，写错则全关并记错误日志）与
+  `KONG_OPENAI_BODY_FASTPATH_OFF`（逗号分隔的项名，只关这几项）。
+
+### OpenAI 请求体内存
+
+- **接入点都是单行或函数头 3 行**：`newOpenAIRequestView` 返回前；`sanitizeOpenAIResponsesInputItemIDs` 的判否门之
+  后；`applyCodexAccountIdentityClientMetadataRaw` 两处 sjson 调用的同行替换（原来的 sjson 函数作为回落传进去，
+  import 不动）；`httputil.ReadRequestBodyWithPrealloc` 里 `capHint` 算完之后。出站 zstd 的改动全在 fork 自己的文件里。
+- **rebase 时复核**：
+  - 请求视图新增了字符串字段，要加进 `kongDetachOpenAIRequestView`，否则改写后的中间版本又会被子串拖住；
+  - item id 清洗的快路径照抄原函数的遍历与取值、`replaceOpenAIRawInput` 的拼法，判定调用上游的两个函数。上游改了
+    删除的字段、拼法或遍历方式要同步，`TestKongSpliceInputItemIDs*` 会对照原函数报错；
+  - 身份改写：第二处原地写回的前提是 `changed` 为真时 `next` 是本函数刚分配的副本。两处调用的顺序或 `changed` 的
+    含义变了，要重新确认；
+  - `httputil`：`kongReadRequestBodyChunkList` 照抄 `readRequestBodyChunks`，`kongReadZstdRequestBody` 照抄解压之后
+    的请求头处理。上游改了这几处或 `decompressRequestBody` 要同步，`TestKongReadZstdRequestBodyMatchesOriginal`
+    对照原读法；
+  - 依赖升级：`kongSJSONDeleteTailItem`、`kongSJSONMustMarshalString` 照抄 sjson v1.2.5，`go.mod` 里 sjson 的版本变了
+    要重新对照源码（`TestKongSJSONDeleteRangeMatchesSJSON`、`TestKongSetIdentity*` 守着）；klauspost 升级后跑
+    `TestKongZstdStreamingMatchesOriginal`（`ReadFrom` 与整份 `Write` 的切块必须相同）与 `TestKongReadZstd*`。
+- **开关**：快速路径的 `KONG_OPENAI_BODY_FASTPATH_OFF` 新增五个名字：`view_strings`、`zstd_out`、`zstd_in`、
+  `item_ids_splice`、`identity_splice`。`httputil` 不能引用 `service`，它的开关由 `service` 包初始化时注入。端到端
+  对照除全关、全开之外，还把这五项逐项关掉各跑一遍。
+- **内存量法**：`handler` 包的 `TestKongOpenAIBodyMemory` 断言请求持有的存活与预热后的分配，池子的保留只打印，
+  量法见设计 §4。
 
 ### 按到期时间指定重置卡的用卡端点
 
@@ -277,6 +347,17 @@ handler / routes 下的同名文件，另有几处在节奏与会话组件里（
 the CAS`）。**它在纯上游基线 tag 上同样失败**，与本 fork 的定制无关，CI（Linux）也是绿的——
 属平台或时序相关。遇到时不要顺着它排查，先在 `git worktree add <tmp> <base tag>` 的纯上游树上
 复现一次，确认是上游自带的再放过。
+
+gjson 副本的 `TestJSONString` 在 Go 1.27 下失败，原版 v1.18.0 同样失败，与副本的改动无关。跑副本的测试时用
+`go test -skip TestJSONString ./...`。副本是嵌套 module，父模块的 `go test ./...` 不会跑到它，要单独跑。
+
+请求体快速路径的对照基准 `backend/internal/handler/testdata/kong_openai_body_fastpath_golden.json`
+**必须在不含快速路径的代码上录制**，否则就失去了"原版本"的意义。步骤：
+`git worktree add <tmp> <功能后端提交>^`；把 `kong_openai_body_fastpath_e2e_test.go` 与 `internal/pkg/kongcorpus/`
+复制过去，再放一份测试构建的桩 `internal/service/kong_testhooks_unit.go`（`KongSwapOpenAIRequestZstdForTest` 照抄，
+`KongSetOpenAIBodyFastpathForTest` 与 `KongSetOpenAIBodyFastpathItemsOffForTest` 写成空操作）；在那里用
+`KONG_BODY_FASTPATH_GOLDEN=update` 跑 `TestKongOpenAIBodyFastpathGolden`，把生成的基准拷回来；回到当前代码不带这个
+变量再跑一遍，全关、全开与五项逐项关闭这七个子测试都要通过。新增 e2e 用例之后也要这样重录。
 
 **`-race` 下上游测试套整体不干净**，这不是本 fork 的问题：每次都报十几个竞态、几十个连带失败的用例，
 并且每次不一样。竞态全在上游的测试写法上——测试桩不加锁、并行用例各自 `gin.SetMode`、改包级变量时上一个
