@@ -7,6 +7,8 @@ RUN apk add --no-cache git
 
 # 复制go.mod和go.sum
 COPY go.mod go.sum ./
+# [kong] go.mod 用 replace 指向本地的 gjson 副本，下载依赖前就要能读到它。
+COPY third_party ./third_party
 
 # 下载依赖
 RUN go mod download
