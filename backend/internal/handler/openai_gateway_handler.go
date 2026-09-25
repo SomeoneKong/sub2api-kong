@@ -426,6 +426,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	defer service.KongRegisterRequestBody(body)() // [kong] 登记入站请求体，见 DESIGN §3.7
 
 	setOpsRequestContext(c, "", false)
 	sessionHashBody := body
@@ -642,6 +643,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// token 计费部分仍受利润门保护，独立图片/视频端点才在门外。
 	pricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
 	c.Request = c.Request.WithContext(pricingCtx)
+	requestPayloadHash := service.HashUsageRequestPayload(body) // [kong] 各次尝试与结束时的用量共用，body 在循环里不再改
 
 	for {
 		// Streaming Forward intentionally detaches the upstream request so usage can
@@ -780,7 +782,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyHTTP = sessionHashBody
 		}
-		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockBodyHTTP, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
+		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockBodyHTTP, clientRequestedUsageFields(c, channelMapping, reqModel, ""), requestPayloadHash) // [kong]
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)
 		responseLatencyMs := forwardDurationMs
@@ -800,7 +802,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			stampOpenAIRequestedReasoningEffort(res, c)
 			userAgent := c.GetHeader("User-Agent")
 			clientIP := ip.GetClientIP(c)
-			requestPayloadHash := service.HashUsageRequestPayload(body)
 			inboundEndpoint := GetInboundEndpoint(c)
 			upstreamEndpoint := resolveOpenAIUpstreamEndpoint(c, account, res)
 			quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)
@@ -1655,6 +1656,9 @@ func normalizeCodexAutomationBootstrap(body []byte) ([]byte, bool) {
 }
 
 func normalizeCodexCallOutputBootstrap(body []byte, isCandidate func(map[string]any) bool, allowHistoricalContext bool) ([]byte, bool) {
+	if !service.KongCodexCallOutputBootstrapMayApply(body, isCandidate) { // [kong] 没有候选项时必然不改写，见 DESIGN §3.1
+		return body, false
+	}
 	if !hasUniqueJSONMembers(body) {
 		return body, false
 	}
