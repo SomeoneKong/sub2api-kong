@@ -1314,8 +1314,11 @@ func normalizeOpenAIOAuthResponsesCompatibilityBody(body []byte) ([]byte, bool, 
 		changed = true
 	}
 	// Only remove the input-item field, never same-named user content.
-	input := gjson.GetBytes(normalized, "input")
+	input := gjson.Get(kongBytesView(normalized), "input") // [kong] 不复制 input
 	if !input.IsArray() {
+		return normalized, changed, nil
+	}
+	if kongNoInputItemMetadataPassthrough(normalized, input) { // [kong] 见 DESIGN §3.9
 		return normalized, changed, nil
 	}
 	for i, item := range input.Array() {
@@ -1496,7 +1499,8 @@ func normalizeOpenAIResponsesWebSocketCompatibilityBody(body []byte, account *Ac
 		}
 	}
 	needsOrphanCleanup := account != nil && account.IsOpenAIOAuthLike() &&
-		gjson.GetBytes(normalized, "input").IsArray()
+		gjson.Get(kongBytesView(normalized), "input").IsArray() // [kong] 不复制 input
+	needsOrphanCleanup = needsOrphanCleanup && kongOrphanCleanupMayApply(normalized) // [kong] 见 DESIGN §3.3
 	if needsOrphanCleanup || openAIResponsesInputMayNeedTruncation(normalized) {
 		var reqBody map[string]any
 		if err := decodeOpenAIJSONUseNumber(normalized, &reqBody); err != nil {
@@ -1600,7 +1604,7 @@ func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, boo
 		changed = true
 	}
 
-	if inputResult := gjson.GetBytes(normalized, "input"); inputResult.Exists() {
+	if inputResult := gjson.Get(kongBytesView(normalized), "input"); inputResult.Exists() { // [kong] 不复制 input
 		switch {
 		case inputResult.Type == gjson.String:
 			text := inputResult.String()
@@ -2318,7 +2322,7 @@ func openAIRequestBodyMayContainEmptyBase64InputImage(body []byte) bool {
 	if len(body) == 0 || !openAIRequestBodyMayContainInputImageToken(body) {
 		return false
 	}
-	input := gjson.GetBytes(body, "input")
+	input := gjson.Get(kongBytesView(body), "input") // [kong] 不复制 input
 	if !input.Exists() {
 		return false
 	}
@@ -2328,6 +2332,9 @@ func openAIRequestBodyMayContainEmptyBase64InputImage(body []byte) bool {
 func openAIRequestBodyMayContainInputImageToken(body []byte) bool {
 	if bytes.Contains(body, []byte("input_image")) {
 		return true
+	}
+	if kongFastpathOn(kongFastpathImage) { // [kong] 只有字母或下划线写成 Unicode 转义时才可能拼出 input_image，见 DESIGN §3.11
+		return kongMayContainEscapedWordChar(body)
 	}
 	// JSON 字符串任意字符都可能被 unicode escape，遇到 \u 时交给 gjson 解码后的结构扫描兜底。
 	return bytes.Contains(body, []byte("\\u"))
