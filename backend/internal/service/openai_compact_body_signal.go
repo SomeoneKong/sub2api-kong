@@ -29,7 +29,7 @@ func NormalizeCompactionTriggerInputOrder(body []byte) ([]byte, bool, error) {
 	if len(body) == 0 {
 		return body, false, nil
 	}
-	if !compactionTriggerNeedsDecode(body) {
+	if !compactionTriggerNeedsDecode(body) || kongCompactionTriggerSettled(body) { // [kong] 上游预判判不出时再用快速路径的判定，见 DESIGN §3.4
 		return body, false, nil
 	}
 	var payload map[string]any
