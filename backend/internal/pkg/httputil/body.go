@@ -124,7 +124,7 @@ func readRequestBodyWithBudget(req *http.Request) (requestBodyBuffer, error) {
 	}
 
 	defer raw.release(req.Context())
-	decoded, err := decompressRequestBodyWithBudget(req.Context(), enc, raw.data)
+	decoded, err := kongDecompressRequestBody(req.Context(), enc, raw.data) // [kong] zstd 复用解码器、按帧头预分配，见 DESIGN-openai-request-body-memory §2.3
 	if err != nil {
 		return requestBodyBuffer{}, fmt.Errorf("decode Content-Encoding %q: %w", enc, err)
 	}
@@ -296,6 +296,9 @@ func normalizeLenientJSONRequestBody(ctx context.Context, body []byte, maxNormal
 	}
 	if int64(len(body)) > maxNormalizedBytes {
 		return requestBodyBuffer{}, &http.MaxBytesError{Limit: maxNormalizedBytes}
+	}
+	if !kongContainsJSONControlByte(body) { // [kong] 状态机只改控制字节，一个都没有时必然原样返回
+		return kongLenientBodyUnchanged(ctx, body)
 	}
 
 	normalizedSize := int64(len(body))

@@ -14,6 +14,9 @@ var codexSelectedPageName = regexp.MustCompile(`^codex_apps_selected_page_part_(
 // Desktop injects page snapshots as standalone outputs, without a model tool call.
 // Keep them as untrusted user text, including on history replay and mixed bootstrap turns.
 func normalizeCodexPageContext(body []byte) ([]byte, bool) {
+	if !kongCodexPageContextMayApply(body) { // [kong] input 里没有 agent 命名空间的 output 项时必然不改写，见 DESIGN §3.1
+		return body, false
+	}
 	if !mayContainCodexCallOutputCandidate(body, "codex_apps_open_page", "codex_apps_selected_page_part_") || !hasUniqueJSONMembers(body) {
 		return body, false
 	}
