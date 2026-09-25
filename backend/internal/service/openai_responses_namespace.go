@@ -196,7 +196,7 @@ func stripOpenAIResponsesInputNamespaces(body []byte, keepToolCallNamespaces boo
 	if !bytes.Contains(body, []byte(`"namespace"`)) {
 		return body, nil
 	}
-	input := gjson.GetBytes(body, "input")
+	input := gjson.Get(kongBytesView(body), "input") // [kong] 不复制 input
 	if !input.IsArray() {
 		return body, nil
 	}
