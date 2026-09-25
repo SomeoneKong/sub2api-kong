@@ -211,3 +211,6 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+// [kong] 自带一份 gjson，加了查询钩子，见 third_party/gjson/kong_hooks.go。
+replace github.com/tidwall/gjson => ./third_party/gjson
