@@ -211,6 +211,8 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			stageCodexFingerprintIDs(c, fpIDs)
 		}
 	}
+	kongReleaseBody := KongRegisterRequestBody(body) // [kong] 登记出站前的版本，见 DESIGN §3.7
+	defer kongReleaseBody()                          // [kong]
 	if account != nil && account.IsOpenAI() {
 		responsesLite := isOpenAIResponsesLiteHeader(c.GetHeader(responsesLiteHeader)) || isOpenAIResponsesLiteWebSocketPayload(body)
 		normalizedBody, normalized, normalizeErr := normalizeOpenAIResponsesCompatibilityBodyWithOptions(body, account, openAIResponsesCompatibilityOptions{
@@ -450,6 +452,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			s.noteOpenAICodexTurnStateProvenance(c, account, state)
 		}
 
+		kongReleaseBody() // [kong] 开始转发响应之前注销
 		if reqStream {
 			result, handleErr := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
 			if handleErr != nil {
