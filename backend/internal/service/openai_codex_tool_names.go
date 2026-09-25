@@ -150,6 +150,9 @@ func aliasOpenAIOAuthReservedToolNamesBody(body []byte) ([]byte, map[string]stri
 	if len(body) == 0 || !containsASCIIFold(body, []byte(codexReservedPythonToolName)) {
 		return body, nil, false, nil
 	}
+	if kongNoReservedToolName(body) { // [kong] 见 DESIGN §3.5
+		return body, nil, false, nil
+	}
 	var reqBody map[string]any
 	if err := decodeOpenAIJSONUseNumber(body, &reqBody); err != nil {
 		return body, nil, false, fmt.Errorf("decode OAuth reserved tool names: %w", err)

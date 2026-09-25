@@ -52,6 +52,9 @@ func sanitizeOpenAIResponsesToolSchemasForPlatform(body []byte, platform string)
 			changed = true
 		}
 	}
+	if kongSkipToolSchemaLookaroundPass(platform, normalized, changed) { // [kong] 见 DESIGN §3.6
+		return normalized, changed, nil
+	}
 	if shouldSanitizeOpenAIResponsesToolSchemaPatterns(platform) {
 		next, sanitized, err := sanitizeOpenAIResponsesToolSchemaPatterns(normalized)
 		if err != nil {
@@ -543,7 +546,7 @@ func (p *openAIResponsesToolSchemaParser) parseString() (int, int, error) {
 			if p.body[p.pos] < 0x20 {
 				return 0, 0, p.syntaxError("control character in string")
 			}
-			p.pos++
+			p.pos = kongSkipPlainJSONStringBytes(p.body, p.pos+1) // [kong] 成块跳过普通字节，停下的那个字节照原样处理
 		}
 	}
 	return 0, 0, p.syntaxError("unterminated string")

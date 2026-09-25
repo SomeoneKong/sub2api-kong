@@ -63,6 +63,9 @@ func shouldStripOpenAIResponsesNonPairCallID(itemType string) bool {
 }
 
 func sanitizeOpenAIResponsesInputItemIDs(body []byte) ([]byte, bool, error) {
+	if kongInputItemIDsClean(body) { // [kong] 见 DESIGN §3.10
+		return body, false, nil
+	}
 	input := parseRawJSONView(body).Get("input")
 	if !input.IsArray() {
 		return body, false, nil
