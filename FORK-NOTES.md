@@ -12,6 +12,7 @@
 
 - **codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）
 - **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）
+- **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有四个可提给上游的修复，排在定制清单最前面（见下文挂点一节的前两小节），上游合并后在 rebase 时丢掉。
@@ -135,6 +136,21 @@ rebase 时丢掉，这一小节随之删除。
 - **前端**（`features/openai-fingerprint-test/`，文案在 feature 内）碰上游的只有两处各两行：
   `AccountActionMenu.vue`「测试连接」下方的菜单项组件与它的 import，`AccountsView.vue` 的弹窗宿主与它的
   import——弹窗不能挂在菜单里，菜单关闭时菜单组件随之卸载。
+
+### codex 响应的 `x-reasoning-included`
+
+- **分两步写：handler 先写，Responses 各成功出口再按上游重写**。响应头可能在选定上游之前就提交——流式排队等槽的心
+  跳、OpenAI 账号非透传流式在首输出前的 keepalive 都会先 Flush——所以 handler 的 `Responses` 在
+  `acquireResponsesUserSlot` 之前、`ResponsesWebSocket` 在 `coderws.Accept` 之前各一行
+  `KongApplyCodexReasoningIncluded(c, nil)`。之后透传三处、非透传四处各一行，上游带这个头时换成上游的值，并把
+  白名单 `Add` 进来的那一份合成一份（接入点表见设计文档 §3）；HTTP→WS 与协议转换通路不转发上游的这个头，不用
+  接。
+- **rebase 时复核**：第 1 步仍在所有可能提前写出的点之前；上游若新增会转发上游响应头的 Responses 成功出口，要接第
+  2 步，否则上游开始发这个头时会出现两份。
+- **易错点**：OpenAI 账号的非透传流式要用 `kongApplyCodexReasoningIncludedUnstaged`，直接写 writer 并从暂存集合里
+  删掉那一份，不能随暂存头提交——keepalive 之后暂存头全部作废。codex 只在成功响应上读这个头，错误响应带着无妨，
+  不必为错误分支另做清除。
+- **开关**：环境变量 `KONG_CODEX_REASONING_INCLUDED`，不设置为开，false 关闭，写错则关闭并记错误日志。
 
 ## 本地验证的已知差异
 
