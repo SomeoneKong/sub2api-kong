@@ -20,6 +20,8 @@
 - **OpenAI 账号会话数上限**（软上限，设计见 `DESIGN-openai-session-limit.md`）
 - **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）
 - **OpenAI 请求体快速路径**（跳过必然不改写的处理、复用顶层查找，设计见 `DESIGN-openai-request-body-fastpath.md`）
+- **账号计划执行端用到的管理端点**（按到期时间指定重置卡的用卡端点，设计见
+  `DESIGN-openai-plan-reset-by-expiry.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
@@ -234,6 +236,12 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
   `go mod download` 之前复制 `third_party/`：本地 `replace` 的模块在下载依赖时就要读得到。
 - **开关**：环境变量 `KONG_OPENAI_BODY_FASTPATH`（不设置为开，false 全关，写错则全关并记错误日志）与
   `KONG_OPENAI_BODY_FASTPATH_OFF`（逗号分隔的项名，只关这几项）。
+
+### 按到期时间指定重置卡的用卡端点
+
+- **只加文件，不改上游接口**。`kong-reset-quota` 的 handler 通过接口断言取服务层的 `KongResetCreditByExpiry`，不往
+  上游的 `openAIQuotaService` 接口里加方法（那会连带改上游测试桩）。到期时间在服务层现查卡明细换成卡 ID，卡 ID
+  仍不出服务层；`redeem_request_id` 由调用方稳定生成、原样交上游做幂等。碰上游的只有 `routes/admin.go` 一行。
 
 ## 本地验证的已知差异
 
