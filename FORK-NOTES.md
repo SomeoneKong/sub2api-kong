@@ -8,7 +8,7 @@
 
 ## 定制的边界
 
-只碰十类东西：**codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）、
+只碰十一类东西：**codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）、
 **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）、
 **OpenAI 请求体快速路径**（跳过必然不改写的处理、复用顶层查找，设计见 `DESIGN-openai-request-body-fastpath.md`）、
 **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）、**OpenAI 账号消耗节奏**（旧版选号的重排，设计见
@@ -17,7 +17,8 @@
 请求体 zstd 压缩**（省出站流量；这两项见下文维护约定）、
 **前端展示调整**（账号页：OpenAI Pro 20x / Pro 5x 只有 7d 主窗口，不显示 5h；管理员用量页：用户列
 可在列设置里隐藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会
-显示），以及
+显示）、**账号计划执行端用到的管理端点**（按到期时间指定重置卡的用卡端点，设计见
+`DESIGN-openai-plan-reset-by-expiry.md`），以及
 **fork 自身必须适配的部分**（版本检查、发布标识）。
 上游其余部分一律不动——定制面越窄，越能持续跟上上游的 bug 修复。
 
@@ -64,6 +65,7 @@
 | **codex 的 `x-reasoning-included` 分两步写：handler 先写，Responses 各成功出口再按上游重写** | 响应头可能在选定上游之前就提交——流式排队等槽的心跳、OpenAI 账号非透传流式在首输出前的 keepalive 都会先 Flush——所以 handler 的 `Responses` 在 `acquireResponsesUserSlot` 之前、`ResponsesWebSocket` 在 `coderws.Accept` 之前各一行 `KongApplyCodexReasoningIncluded(c, nil)`。之后透传三处、非透传四处各一行，上游带这个头时换成上游的值，并把白名单 `Add` 进来的那一份合成一份（接入点表见设计文档 §3）；HTTP→WS 与协议转换通路不转发上游的这个头，不用接。rebase 时要复核：第 1 步仍在所有可能提前写出的点之前；上游若新增会转发上游响应头的 Responses 成功出口，要接第 2 步，否则上游开始发这个头时会出现两份。易错点：OpenAI 账号的非透传流式要用 `kongApplyCodexReasoningIncludedUnstaged`，直接写 writer 并从暂存集合里删掉那一份，不能随暂存头提交——keepalive 之后暂存头全部作废。codex 只在成功响应上读这个头，错误响应带着无妨，不必为错误分支另做清除。开关走环境变量 `KONG_CODEX_REASONING_INCLUDED`：不设置为开，false 关闭，写错则关闭并记错误日志 |
 | **请求体快速路径的接入点都是单行或函数头 3 行，门只判"跳过"** | 接入点都带 `[kong]`：handler 的 `Responses` 判空之后登记入站请求体，`normalizeCodexCallOutputBootstrap` 函数头；`forwardOpenAIPassthrough` 在指纹收敛之后登记、开始转发响应前注销（另有 `defer` 兜底）；service 里 `NormalizeCompactionTriggerInputOrder`、`normalizeOpenAIResponsesLiteToolsPayload`、`sanitizeOpenAIResponsesInputItemIDs` 的函数头，`aliasOpenAIOAuthReservedToolNamesBody` 原字面量检查之后，`needsOrphanCleanup` 赋值之后，schema 清洗两遍之间，OAuth 兼容处理的逐项元数据循环之前，空图片预判的字面量检查之后，`parseString` 的普通字节分支；另有几处 `gjson.GetBytes(...)` 换成 `gjson.Get(kongBytesView(...))` 的同行替换。rebase 时复核三件事：被门跳过的函数，改写条件与读取的字段有没有变（差分与守护测试能抓住大部分，抓不住的是上游新增读取的字段）；两个登记点之间有没有新增改写请求体的处理（只影响命中率，不影响正确性）；流水线上有没有新增原地修改请求体的写法（测试构建里注销时会校验并 panic）。rebase 之后先重录对照基准（见「本地验证的已知差异」），再跑三方对照。开关走环境变量 `KONG_OPENAI_BODY_FASTPATH`（不设置为开，false 全关，写错则全关并记错误日志）与 `KONG_OPENAI_BODY_FASTPATH_OFF`（逗号分隔的项名，只关这几项） |
 | **gjson 用 `backend/third_party/gjson` 的副本，由 `go.mod` 的 `replace` 引用** | 副本是 v1.18.0 原样加一组查询钩子：`gjson.go` 里 `Get`、`Valid`、`ValidBytes` 三处标 `[kong]`，另有不经钩子的 `GetNative`、`ValidNative` 与 `kong_hooks.go`。`replace` 会盖过上游 `go.mod` 里 require 的版本，**上游升级 gjson 时不会自动生效**。所以 rebase 时要看 `go.mod` 里 `github.com/tidwall/gjson` 的 require 版本有没有变；变了就换副本：用 `go mod download -json github.com/tidwall/gjson@<新版本>` 找到源码目录，覆盖副本，重新打上这几处改动；然后在副本目录跑 `go test -skip TestJSONString ./...`，再跑 `service` 的钩子差分测试（`TestKongGjsonHookMatchesNative`、`TestKongOpenAIBodyFastpathMatchesOriginal`）。两个 Dockerfile 都在 `go mod download` 之前复制 `third_party/`：本地 `replace` 的模块在下载依赖时就要读得到 |
+| **按到期时间指定重置卡的用卡端点只加文件，不改上游接口** | `kong-reset-quota` 的 handler 通过接口断言取服务层的 `KongResetCreditByExpiry`，不往上游的 `openAIQuotaService` 接口里加方法（那会连带改上游测试桩）。到期时间在服务层现查卡明细换成卡 ID，卡 ID 仍不出服务层；`redeem_request_id` 由调用方稳定生成、原样交上游做幂等。碰上游的只有 `routes/admin.go` 一行。设计见 `DESIGN-openai-plan-reset-by-expiry.md` |
 | 接转发链路用「可选依赖 + setter」 | `OpenAIGatewayService` 的构造函数参数表很长且是上游高频改动面。加字段 + `SetKongTicketObserver` 能把改动收在一处，未注入时所有接入点退化为空操作 |
 | 前端定制放 `frontend/src/features/<主题>/`，上游文件只做单行追加或单处替换 | 用量明细的请求特征列（`features/request-features/`）碰上游的点全是**追加**：`UsageTable.vue` 一行 import 与一个 `#cell-request_features` 插槽、`types/index.ts` 里 `AdminUsageLog` 的 `kong_request_features` 字段、管理员 `views/admin/UsageView.vue` 的列定义一项（标签用中文字面量，不加 i18n 键）。账号指纹测试（`features/openai-fingerprint-test/`，文案在 feature 内）碰上游的只有两处各两行：`AccountActionMenu.vue`「测试连接」下方的菜单项组件与它的 import，`AccountsView.vue` 的弹窗宿主与它的 import——弹窗不能挂在菜单里，菜单关闭时菜单组件随之卸载。前端展示调整（`features/openai-usage-window/`、`features/usage-latency/`）碰上游的点分两类：**追加**——`AccountUsageCell.vue` 与 `UsageTable.vue` 各一行 import，`UsageTable.vue` 延迟列网格里的「速度」一行（接在上游的「输出 TPS」之后：上游是输出 token ÷ 总耗时，含排队与首字等待；这里除以去掉首字的生成时长，口径不同，两行并存），`i18n/locales/{en,zh}/dashboard.ts` 的 `usage` 段各两个键；**替换**——`AccountUsageCell.vue` OpenAI OAuth 分支 5h 进度条的 `v-if` 条件、管理员 `views/admin/UsageView.vue` 的 `ALWAYS_VISIBLE` 去掉 `user`。会话数上限（`features/openai-session-limit/`）同样分两类：**追加**——`EditAccountModal.vue` 的两行 import、并发数网格里的输入框、`syncFormFromAccount` 里取值、提交前的 `applyOpenAISessionLimit`，`i18n/locales/{en,zh}/admin/accounts.ts` 的 `kongSessionLimit` 段；**替换**——`AccountCapacityCell.vue` 会话徽标的显示条件与满额提示。替换点在上游改到同一行时必然冲突，rebase 时先看这几处。定制的前端单测都要追加到根 `Makefile` 的 `FRONTEND_CRITICAL_VITEST`，CI 只跑这份清单 |
 | 后端响应结构要显式写 `json` tag | 本功能的 handler 直接序列化 service 层结构体。上游那些结构多数也没 tag，但我们的响应里混着 `gin.H` 的 snake_case 字段——不写 tag 会让同一个响应里两种命名风格并存，前端类型也跟着别扭 |
