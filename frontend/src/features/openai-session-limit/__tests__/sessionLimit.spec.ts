@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import {
-  OPENAI_SESSION_IDLE_TIMEOUT_MINUTES,
   applyOpenAISessionLimit,
   isOpenAIOAuthAccount,
   normalizeMaxSessions
@@ -30,14 +29,10 @@ describe('normalizeMaxSessions', () => {
 })
 
 describe('applyOpenAISessionLimit', () => {
-  it('设置上限时写入上限与空闲超时，保留其他键', () => {
+  it('设置上限时只写入上限，不写空闲超时，保留其他键', () => {
     const payload: Record<string, unknown> = {}
     applyOpenAISessionLimit(payload, oauth({ codex_7d_used_percent: 12 }), 3)
-    expect(payload.extra).toEqual({
-      codex_7d_used_percent: 12,
-      max_sessions: 3,
-      session_idle_timeout_minutes: OPENAI_SESSION_IDLE_TIMEOUT_MINUTES
-    })
+    expect(payload.extra).toEqual({ codex_7d_used_percent: 12, max_sessions: 3 })
   })
 
   it('已有空闲超时时不覆盖', () => {
@@ -63,11 +58,7 @@ describe('applyOpenAISessionLimit', () => {
   it('以已组装的 extra 为底', () => {
     const payload: Record<string, unknown> = { extra: { upstream_request_id_header: 'x-req' } }
     applyOpenAISessionLimit(payload, oauth({ stale: true }), 1)
-    expect(payload.extra).toEqual({
-      upstream_request_id_header: 'x-req',
-      max_sessions: 1,
-      session_idle_timeout_minutes: OPENAI_SESSION_IDLE_TIMEOUT_MINUTES
-    })
+    expect(payload.extra).toEqual({ upstream_request_id_header: 'x-req', max_sessions: 1 })
   })
 
   it('非 OpenAI OAuth 账号不处理', () => {
