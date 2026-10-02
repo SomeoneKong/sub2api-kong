@@ -3,7 +3,8 @@
 **状态**：已实现；账号未设置会话上限时不生效。仓库组织与发布流程见 `FORK-NOTES.md`。
 
 本文只涉及 OpenAI OAuth（ChatGPT 订阅）账号，是通用设计说明。各账号的上限与并发取值属于部署参数，
-不在本文。旧版选号的整体流程见 `DESIGN-openai-account-pace.md` §0。
+不在本文。旧版选号的整体流程见 `DESIGN-openai-account-pace.md` §0。账号选择与 credits 生效时，会话上限可被计划条目
+覆盖，分段与登记见 `DESIGN-openai-plan-dispatch.md` 第 4、5 节。
 
 ## 0. 背景：并发数管不住"一个账号服务多少会话"
 
