@@ -21,8 +21,9 @@ type kongFakeSessionCache struct {
 	SessionLimitCache
 	now      func() time.Time
 	sessions map[int64]map[string]time.Time
-	// stealOnRegister 模拟另一个新会话抢在本次登记之前占掉账号的名额。
+	// stealOnRegister 模拟另一个新会话抢在本次登记之前占掉账号的名额；stealQueue 依次在每次登记前各抢一个。
 	stealOnRegister map[int64]string
+	stealQueue      map[int64][]string
 	batchErr        error
 	// dropFromBatch 模拟批量查询里个别账号失败：结果里没有它，整体仍返回 nil 错误（与 Redis 实现一致）。
 	dropFromBatch map[int64]bool
@@ -67,6 +68,10 @@ func (f *kongFakeSessionCache) RegisterSession(_ context.Context, accountID int6
 	if thief, ok := f.stealOnRegister[accountID]; ok {
 		delete(f.stealOnRegister, accountID)
 		f.put(accountID, thief)
+	}
+	if q := f.stealQueue[accountID]; len(q) > 0 {
+		f.put(accountID, q[0])
+		f.stealQueue[accountID] = q[1:]
 	}
 	f.expire(accountID, idle)
 	if f.has(accountID, hash) || len(f.sessions[accountID]) < maxSessions {
