@@ -306,9 +306,20 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	}
 	adminHandlers.KongFingerprint = admin.NewKongFingerprintHandler(kongFingerprintTester)
 	// [kong] 账号消耗节奏：同样手工装配。协程总是启动——配置文件（数据目录下的
-	// openai-account-pace.yaml）可以之后再放，放进去一分钟内生效；文件不存在时每拍只检查一次文件。
+	// openai-account-pace.yaml）可以之后再放，放进去一分钟内生效；文件不存在时不重排，但下面接上的计划组件记账照常推进。
 	kongPace := service.NewKongOpenAIAccountPace(repository.NewKongPaceRepository(db), repository.NewKongPaceStore(redisClient), concurrencyService, service.KongPaceConfigPath(setup.GetDataDir()))
 	openAIGatewayService.SetKongOpenAIAccountPace(kongPace)
+	// [kong] 账号选择与 credits：发布、人工约束与调用方声明的存储，余额记账接在节奏组件的刷新协程上，同样手工装配。
+	// 决策记录每分钟尝试写库，不进清理步骤：停机时丢掉还没写进库的计数（正常时最多一分钟，写库持续失败时是积压的全部）。
+	kongPlanStore := service.NewKongPlanStore(repository.NewKongPlanRepository(db))
+	kongPlanStore.Start(context.Background())
+	kongPlanStats := service.NewKongPlanStats(repository.NewKongPlanStatsRepository(db))
+	kongPlanStats.Start()
+	adminHandlers.KongPlan = admin.NewKongPlanHandler(kongPlanStore, accountRepository, kongPlanStats, openAIGatewayService)
+	kongPlanLedger := service.NewKongPlanLedger(repository.NewKongPlanLedgerStore(redisClient), kongPlanStore)
+	kongPace.SetKongPlanLedger(kongPlanLedger)
+	openAIQuotaService.SetKongPlanLedger(kongPlanLedger)
+	service.SetKongPlanRuntime(kongPlanStore, kongPlanLedger, kongPace, repository.NewKongPlanBindingStore(redisClient), settingService.GetAccountSchedulingThresholds, settingService.GetOpenAIQuotaAutoPauseSettings, kongPlanStats)
 	kongPace.Start()
 	// [kong] 会话数上限：复用上游 Anthropic 会话限制的那份计数缓存。
 	openAIGatewayService.SetKongSessionLimitCache(sessionLimitCache)

@@ -37,7 +37,8 @@ func (r *kongPaceRepository) ListOpenAIOAuthAccounts(ctx context.Context) ([]ser
 		       COALESCE(a.extra->>'codex_7d_reset_at', ''),
 		       COALESCE(a.extra->>'codex_7d_window_minutes', ''),
 		       COALESCE(a.extra->>'codex_usage_updated_at', ''),
-		       a.last_used_at
+		       a.last_used_at,
+		       a.parent_account_id
 		  FROM accounts a
 		 WHERE a.platform = $1 AND a.type = $2 AND a.deleted_at IS NULL
 		 ORDER BY a.id`, service.PlatformOpenAI, service.AccountTypeOAuth)
@@ -52,9 +53,14 @@ func (r *kongPaceRepository) ListOpenAIOAuthAccounts(ctx context.Context) ([]ser
 			row                                     service.KongPaceAccountRow
 			expires, used, resetAt, window, updated string
 			lastUsed                                sql.NullTime
+			parent                                  sql.NullInt64
 		)
-		if err := rows.Scan(&row.ID, &row.Plan, &row.Concurrency, &expires, &used, &resetAt, &window, &updated, &lastUsed); err != nil {
+		if err := rows.Scan(&row.ID, &row.Plan, &row.Concurrency, &expires, &used, &resetAt, &window, &updated, &lastUsed, &parent); err != nil {
 			return nil, err
+		}
+		if parent.Valid {
+			v := parent.Int64
+			row.ParentAccountID = &v
 		}
 		if lastUsed.Valid {
 			t := lastUsed.Time
@@ -220,14 +226,22 @@ func (s *kongPaceStore) LoadAccountStates(ctx context.Context) (map[int64][]byte
 	return out, nil
 }
 
-// SaveAccountStates 整体改写各账号的状态，并删掉已不存在的账号。
-func (s *kongPaceStore) SaveAccountStates(ctx context.Context, states map[int64][]byte, deleted []int64) error {
-	_, err := s.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+// SaveAccountStates 在一个事务（MULTI）里整体改写各账号的状态、删掉已不存在的账号，并提交计划组件的部分：
+// 按原值删除已处理的余额观测，写结算标记、移出未结算集合（键见 kong_plan_ledger_store.go）。
+func (s *kongPaceStore) SaveAccountStates(ctx context.Context, states map[int64][]byte, deleted []int64, extra service.KongPaceCommitExtra) error {
+	_, err := s.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
 		for id, data := range states {
 			p.Set(ctx, kongPaceAccountKeyPrefix+strconv.FormatInt(id, 10), data, 0)
 		}
 		for _, id := range deleted {
 			p.Del(ctx, kongPaceAccountKeyPrefix+strconv.FormatInt(id, 10))
+		}
+		for _, raw := range extra.DoneObservations {
+			p.LRem(ctx, kongPlanObservationsKey, 1, raw)
+		}
+		for _, st := range extra.Settlements {
+			p.Set(ctx, kongPlanTierKey(st.AccountID, st.Seq, "settled"), st.At.UTC().Format(time.RFC3339Nano), kongPlanMarkerTTL)
+			p.SRem(ctx, kongPlanOpenKey(st.AccountID), strconv.FormatInt(st.Seq, 10))
 		}
 		return nil
 	})

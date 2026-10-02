@@ -169,6 +169,7 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 	lease.MarkPrewarmed()
 	if prewarmResponseID != "" && stateStore != nil {
 		ttl := s.openAIWSResponseStickyTTL()
+		s.kongPlanMarkResponse(ctx, groupID, prewarmResponseID, account, ttl) // [kong] 续接标记先于响应绑定
 		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, prewarmResponseID, stateStore.BindResponseAccount(ctx, groupID, prewarmResponseID, account.ID, ttl))
 		stateStore.BindResponseConn(prewarmResponseID, lease.ConnID(), ttl)
 	}
@@ -480,8 +481,9 @@ func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapability(
 		return nil, nil
 	}
 
-	result, acquireErr := s.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
+	result, acquireErr := s.tryAcquireAccountSlot(ctx, accountID, KongEffectiveConcurrency(account)) // [kong] 生效上限
 	if acquireErr == nil && result.Acquired {
+		s.kongPlanMarkResponse(ctx, derefGroupID(groupID), responseID, account, s.openAIWSResponseStickyTTL()) // [kong] 续接标记先于响应绑定
 		logOpenAIWSBindResponseAccountWarn(
 			derefGroupID(groupID),
 			accountID,
@@ -501,7 +503,7 @@ func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapability(
 			Account: account,
 			WaitPlan: &AccountWaitPlan{
 				AccountID:      accountID,
-				MaxConcurrency: account.Concurrency,
+				MaxConcurrency: KongEffectiveConcurrency(account), // [kong] 生效上限
 				Timeout:        cfg.StickySessionWaitTimeout,
 				MaxWaiting:     cfg.StickySessionMaxWaiting,
 			},
@@ -543,6 +545,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	if store == nil {
 		return 0, nil, "", nil
 	}
+	store = kongPlanKeepResponseBindings(store) // [kong] 计划输入生效时暂停的账号只跳过、不删除续接绑定
 
 	accountID, err := store.GetResponseAccount(ctx, derefGroupID(groupID), responseID)
 	if err != nil || accountID <= 0 {
@@ -634,6 +637,9 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	}
 	if requireCompact && openAICompactSupportTier(account) == 0 {
 		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+		return 0, nil, "", nil
+	}
+	if !s.kongPlanReuseResponse(ctx, derefGroupID(groupID), responseID, account) { // [kong] 暂停或入层之前的续接：跳过，不删也不替换
 		return 0, nil, "", nil
 	}
 	return accountID, account, responseID, store

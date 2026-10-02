@@ -537,6 +537,7 @@ func shouldAutoPauseOpenAIAccountByQuota(ctx context.Context, account *Account) 
 		now := time.Now()
 		utilization5h, has5h := resolveOpenAIQuotaUtilization(account.Extra, "5h", now)
 		utilization7d, has7d := resolveOpenAIQuotaUtilization(account.Extra, "7d", now)
+		has7d = has7d && !kongPlanSkip7d(ctx, account) // [kong] credits 层的账号不按 7d 暂停
 		if has5h && utilization5h >= config.Threshold5h {
 			notifyOpenAIAutoResetFromScheduler(account.ID)
 			return true, openAIQuotaAutoPauseDecision{window: "5h", threshold: config.Threshold5h, utilization: utilization5h, reason: "quota_auto_reset_pending_5h"}
@@ -569,7 +570,7 @@ func shouldAutoPauseOpenAIAccountByQuota(ctx context.Context, account *Account) 
 	// default exists. The disable flag is per-window so an account can opt out of
 	// only 5h or only 7d auto-pause.
 	disabled5h := resolveAccountExtraBool(account.Extra, "auto_pause_5h_disabled")
-	disabled7d := resolveAccountExtraBool(account.Extra, "auto_pause_7d_disabled")
+	disabled7d := resolveAccountExtraBool(account.Extra, "auto_pause_7d_disabled") || kongPlanSkip7d(ctx, account) // [kong] credits 层的账号不按 7d 暂停
 	threshold5h, threshold7d := resolveOpenAIQuotaAutoPauseThresholds(ctx, account)
 	now := time.Now()
 	if !disabled5h && threshold5h > 0 {
@@ -940,7 +941,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx 
 	// 4. 设置粘性会话绑定（利润门下推迟到 handler 终检通过后再绑定，
 	// 终检否决的账号不得成为新的粘性目标；无门保持既有 eager 绑定与 TTL）
 	// Set sticky session binding (deferred until terminal admission under a profit gate)
-	if sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
+	if sessionHash != "" && !gatewayProfitControlGateActive(ctx) && !kongPlanInEffect() { // [kong] 计划生效时这里选出的账号没经两轮排序，只复用、不新绑
 		_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, selected.ID, openaiStickySessionTTL)
 	}
 
@@ -1004,6 +1005,9 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 	if groupID != nil && s.needsUpstreamChannelRestrictionCheck(ctx, groupID) &&
 		s.isUpstreamModelRestrictedByChannel(ctx, *groupID, account, requestedModel, requireCompact) {
 		_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+		return nil
+	}
+	if !s.kongPlanReuseSticky(ctx, groupID, sessionHash, account, true) { // [kong] 暂停或入层之前的绑定：不删绑定
 		return nil
 	}
 
@@ -1153,12 +1157,12 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			stickyAccountID = accountID
 		}
 	}
-	if s.concurrencyService == nil || !cfg.LoadBatchEnabled {
+	if (s.concurrencyService == nil || !cfg.LoadBatchEnabled) && !kongPlanInEffect() { // [kong] 计划输入生效时走完整的尝试循环
 		account, stickyHit, err := s.selectAccountForModelWithExclusionsStickyHit(ctx, groupID, platform, sessionHash, requestedModel, excludedIDs, requireCompact, stickyAccountID, requiredCapability, preferLowUpstreamRate)
 		if err != nil {
 			return nil, err
 		}
-		result, err := s.tryAcquireAccountSlot(ctx, account.ID, account.Concurrency)
+		result, err := s.tryAcquireAccountSlot(ctx, account.ID, KongEffectiveConcurrency(account)) // [kong] 生效上限
 		if err == nil && result != nil && result.Acquired {
 			selection, selectErr := s.newAcquiredSelectionResult(ctx, account, result.ReleaseFunc)
 			return markStickySessionHit(selection, stickyHit), selectErr
@@ -1168,7 +1172,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if waitingCount < cfg.StickySessionMaxWaiting {
 				selection, selectErr := s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
 					AccountID:      account.ID,
-					MaxConcurrency: account.Concurrency,
+					MaxConcurrency: KongEffectiveConcurrency(account), // [kong] 生效上限
 					Timeout:        cfg.StickySessionWaitTimeout,
 					MaxWaiting:     cfg.StickySessionMaxWaiting,
 				})
@@ -1177,7 +1181,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		}
 		selection, selectErr := s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
 			AccountID:      account.ID,
-			MaxConcurrency: account.Concurrency,
+			MaxConcurrency: KongEffectiveConcurrency(account), // [kong] 生效上限
 			Timeout:        cfg.FallbackWaitTimeout,
 			MaxWaiting:     cfg.FallbackMaxWaiting,
 		})
@@ -1227,8 +1231,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
 					} else if !parentHealthyForShadow(account, s.parentAccountLookup(ctx)) {
 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+					} else if !s.kongPlanReuseSticky(ctx, groupID, sessionHash, account, true) { // [kong] 暂停或入层之前的绑定：不删绑定，落到第 2 层
 					} else {
-						result, err := s.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
+						result, err := s.tryAcquireAccountSlot(ctx, accountID, KongEffectiveConcurrency(account)) // [kong] 生效上限
 						if err == nil && result != nil && result.Acquired {
 							s.kongSessionTouch(ctx, account, sessionHash) // [kong] 会话上限：已有会话放行登记
 							selection, selectErr := s.newAcquiredSelectionResult(ctx, account, result.ReleaseFunc)
@@ -1244,7 +1249,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 							s.kongSessionTouch(ctx, account, sessionHash) // [kong] 会话上限：已有会话放行登记
 							selection, selectErr := s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
 								AccountID:      accountID,
-								MaxConcurrency: account.Concurrency,
+								MaxConcurrency: KongEffectiveConcurrency(account), // [kong] 生效上限
 								Timeout:        cfg.StickySessionWaitTimeout,
 								MaxWaiting:     cfg.StickySessionMaxWaiting,
 							})
@@ -1313,6 +1318,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	}
 	// [kong] 会话数上限：候选分成有余量段与满额段，第 2、3 层共用（kong_openai_session_limit.go）。
 	kongSess := s.kongSessionGateBegin(ctx, sessionHash, candidates, kongPace)
+	kongPlan := s.kongPlanBegin(ctx, candidates, kongSess, kongPace) // [kong] 计划输入生效时的两轮排序（kong_plan_order.go）
 	rateOrder := openAILegacyUpstreamRateOrder{}
 	if preferLowUpstreamRate {
 		rateOrder = newOpenAILegacyUpstreamRateOrder(candidates, time.Now(), s.openAIOAuthSchedulingRateMultiplier(ctx))
@@ -1322,11 +1328,12 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	for _, acc := range candidates {
 		accountLoads = append(accountLoads, AccountWithConcurrency{
 			ID:             acc.ID,
-			MaxConcurrency: acc.EffectiveLoadFactor(),
+			MaxConcurrency: kongEffectiveLoadFactor(acc), // [kong] 生效上限
 		})
 	}
 
 	tryAcquireFromLoadMap := func(loadMap map[int64]*AccountLoadInfo) (*AccountSelectionResult, bool, error) {
+		kongPlan.keepLoads(candidates, loadMap) // [kong] 决策记录：过滤满并发之前的全部候选
 		var available []accountWithLoad
 		for _, acc := range candidates {
 			loadInfo := loadMap[acc.ID]
@@ -1340,7 +1347,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 				})
 			}
 		}
-		available = kongSess.preferRoomLoads(available) // [kong] 有余量段非空时只在段内选
+		available = kongPlan.preferRoomLoads(kongSess, available) // [kong] 有余量段非空时只在段内选；计划生效时不过滤、按桶分组
 
 		if len(available) == 0 {
 			return nil, false, nil
@@ -1391,9 +1398,13 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		} else {
 			selectionOrder = append(selectionOrder, available...)
 		}
-		kongPace.finalOrder(selectionOrder) // [kong]
+		selectionOrder = kongPlan.sequenceLoads(selectionOrder) // [kong] 计划生效时按桶重排为尝试序列
+		kongPace.finalOrder(selectionOrder)                     // [kong]
 
 		for _, item := range selectionOrder {
+			if !kongPlan.next(item.account.ID) { // [kong] 未降到这一段的重试位置跳过
+				continue
+			}
 			fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, item.account, platform, requestedModel, false, requiredCapability)
 			if fresh == nil {
 				continue
@@ -1405,9 +1416,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
 				continue
 			}
-			result, err := s.tryAcquireAccountSlot(ctx, fresh.ID, fresh.Concurrency)
+			result, err := s.tryAcquireAccountSlot(ctx, fresh.ID, KongEffectiveConcurrency(fresh)) // [kong] 生效上限
 			if err == nil && result != nil && result.Acquired {
-				if !kongSess.confirm(ctx, fresh) { // [kong] 名额被别的新会话先占：放槽，换下一个
+				if !kongPlan.confirm(ctx, kongSess, fresh) { // [kong] 名额被别的新会话先占：放槽，换下一个
 					result.ReleaseFunc()
 					continue
 				}
@@ -1425,7 +1436,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		return nil, true, nil
 	}
 
-	loadMap, err := s.concurrencyService.GetAccountsLoadBatch(ctx, accountLoads)
+	loadMap, err := s.kongPlanLoadBatch(ctx, cfg.LoadBatchEnabled, accountLoads) // [kong] 计划生效、本该走非批量分支时按负载读取失败处理
 	if err != nil {
 		kongPace.loadFailed() // [kong]
 		ordered := append([]*Account(nil), candidates...)
@@ -1438,8 +1449,11 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if requireCompact {
 			ordered = prioritizeOpenAICompactAccounts(ordered)
 		}
-		ordered = kongSess.preferRoomAccounts(ordered) // [kong]
+		ordered = kongPlan.preferRoomAccounts(kongSess, ordered) // [kong]
 		for _, acc := range ordered {
+			if !kongPlan.next(acc.ID) { // [kong]
+				continue
+			}
 			fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, acc, platform, requestedModel, false, requiredCapability)
 			if fresh == nil {
 				continue
@@ -1451,9 +1465,9 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
 				continue
 			}
-			result, err := s.tryAcquireAccountSlot(ctx, fresh.ID, fresh.Concurrency)
+			result, err := s.tryAcquireAccountSlot(ctx, fresh.ID, KongEffectiveConcurrency(fresh)) // [kong] 生效上限
 			if err == nil && result != nil && result.Acquired {
-				if !kongSess.confirm(ctx, fresh) { // [kong]
+				if !kongPlan.confirm(ctx, kongSess, fresh) { // [kong]
 					result.ReleaseFunc()
 					continue
 				}
@@ -1494,8 +1508,11 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 	if requireCompact {
 		candidates = prioritizeOpenAICompactAccounts(candidates)
 	}
-	candidates = kongSess.roomFirst(candidates) // [kong] 有余量的在前，满额的兜底（溢出）
+	candidates = kongPlan.roomFirst(kongSess, candidates) // [kong] 有余量的在前，满额的兜底（溢出）；计划生效时按尝试序列
 	for _, acc := range candidates {
+		if !kongPlan.next(acc.ID) { // [kong]
+			continue
+		}
 		fresh := s.resolveFreshSchedulableOpenAIAccount(ctx, acc, platform, requestedModel, false, requiredCapability)
 		if fresh == nil {
 			continue
@@ -1507,12 +1524,12 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, fresh, requestedModel, requireCompact) {
 			continue
 		}
-		if !kongSess.confirm(ctx, fresh) { // [kong]
+		if !kongPlan.confirm(ctx, kongSess, fresh) { // [kong]
 			continue
 		}
 		return s.newSelectionResult(ctx, fresh, false, nil, &AccountWaitPlan{
 			AccountID:      fresh.ID,
-			MaxConcurrency: fresh.Concurrency,
+			MaxConcurrency: KongEffectiveConcurrency(fresh), // [kong] 生效上限
 			Timeout:        cfg.FallbackWaitTimeout,
 			MaxWaiting:     cfg.FallbackMaxWaiting,
 		})
