@@ -40,7 +40,8 @@ type KongPaceRepository interface {
 // KongPaceStore 是节奏组件的 Redis 访问。账号状态以 JSON 原样存取，编码由本组件负责。
 type KongPaceStore interface {
 	LoadAccountStates(ctx context.Context) (map[int64][]byte, error)
-	SaveAccountStates(ctx context.Context, states map[int64][]byte, deleted []int64) error
+	// SaveAccountStates 在一个 Redis 事务里写各账号状态、删掉已不存在的账号，并提交计划组件的部分（extra）。
+	SaveAccountStates(ctx context.Context, states map[int64][]byte, deleted []int64, extra KongPaceCommitExtra) error
 	PublishState(ctx context.Context, accounts map[int64][]byte, meta []byte, ttl time.Duration) error
 }
 
@@ -112,6 +113,9 @@ type KongOpenAIAccountPace struct {
 	decisions chan KongPaceDecisionRecord
 	counters  kongPaceCounters
 
+	// ledger 是计划组件的余额记账；设置后即使没有节奏配置，刷新协程也照常推进窗口序号与记账（不做重排）。
+	ledger *KongPlanLedger
+
 	stopOnce sync.Once
 	stop     chan struct{}
 	wg       sync.WaitGroup
@@ -139,6 +143,13 @@ func NewKongOpenAIAccountPace(repo KongPaceRepository, store KongPaceStore, load
 		pendingDeletes: map[int64]struct{}{},
 		decisions:      make(chan KongPaceDecisionRecord, kongPaceDecisionQueueCap),
 		stop:           make(chan struct{}),
+	}
+}
+
+// SetKongPlanLedger 接上计划组件的余额记账，必须在 Start 之前调用。
+func (p *KongOpenAIAccountPace) SetKongPlanLedger(l *KongPlanLedger) {
+	if p != nil {
+		p.ledger = l
 	}
 }
 
@@ -197,7 +208,7 @@ func (p *KongOpenAIAccountPace) factsTick() {
 		}
 	}
 	p.active.Store(loaded)
-	if loaded == nil {
+	if loaded == nil && p.ledger == nil {
 		p.snapshot.Store(nil)
 		return
 	}
@@ -213,10 +224,11 @@ func (p *KongOpenAIAccountPace) factsTick() {
 		return
 	}
 
-	snap := &kongPaceSnapshot{at: now, accounts: make(map[int64]kongPaceFacts, len(rows))}
 	seen := make(map[int64]bool, len(rows))
+	tracked := make(map[int64]bool, len(rows))
 	for _, row := range rows {
 		seen[row.ID] = true
+		tracked[row.ID] = row.ParentAccountID == nil
 		st, obs := kongPaceObserve(p.states[row.ID], row, now)
 		p.states[row.ID] = st
 		switch obs {
@@ -226,8 +238,26 @@ func (p *KongOpenAIAccountPace) factsTick() {
 		case kongPaceObsPlanChange:
 			slog.Info("kong pace: 套餐变化，短时消耗重新统计", "account_id", row.ID, "plan", row.Plan)
 		}
+	}
+	var (
+		extra       KongPaceCommitExtra
+		afterCommit func()
+	)
+	if p.ledger != nil {
+		if extra, afterCommit, err = p.ledger.advance(ctx, p.states, tracked, now); err != nil {
+			slog.Warn("kong plan: 读取待处理的余额观测失败，本拍不记账", "error", err)
+			extra, afterCommit = KongPaceCommitExtra{}, nil
+		}
+	}
+	snap := &kongPaceSnapshot{at: now, accounts: make(map[int64]kongPaceFacts, len(rows))}
+	for _, row := range rows {
+		st := p.states[row.ID]
 		facts := kongPaceFacts{Plan: row.Plan, Concurrency: row.Concurrency, SubscriptionExpiresAt: row.SubscriptionExpiresAt, LastUsedAt: row.LastUsedAt, State: *st}
 		facts.State.Rises = append([]kongPaceRise(nil), st.Rises...)
+		if st.Balance != nil {
+			b := *st.Balance
+			facts.State.Balance = &b
+		}
 		snap.accounts[row.ID] = facts
 	}
 	var deleted []int64
@@ -245,23 +275,42 @@ func (p *KongOpenAIAccountPace) factsTick() {
 		}
 	}
 	p.peaks.forget(deleted)
-	p.snapshot.Store(snap)
 
-	p.persist(ctx)
+	// 先写 Redis，写成功才换上新快照（计划组件的提交协议，DESIGN-account-selection.md 第 4.2 节第 5 步）。写返回
+	// 错误时结果可能已经提交：丢掉内存里的这份状态，下一拍从 Redis 重新读出再继续，不按旧状态重算写回。
+	if !p.persist(ctx, extra) {
+		p.statesReady = false
+		return
+	}
+	p.snapshot.Store(snap)
+	if afterCommit != nil {
+		afterCommit()
+	}
+	if loaded == nil {
+		return
+	}
 	p.publish(ctx, loaded, snap, now)
 	p.maybeSweepDecisions(loaded, now)
 	p.maybeLogSummary(loaded, snap, now)
 }
 
-// restoreStates 在第一拍从 Redis 载入各账号状态，成功才返回 true。读取失败时这一拍不推进状态、
-// 下一拍重试：从空开始会用新起点覆盖 Redis 里仍在的历史。读到了但某个账号没有状态时，该账号从空开始。
+// restoreStates 在第一拍、以及写入结果不确定之后，从 Redis 载入各账号状态，成功才返回 true。读取失败时这一拍
+// 不推进状态、下一拍重试：从空开始会用新起点覆盖 Redis 里仍在的历史。读到了但某个账号没有状态时，该账号从空开始。
+// 计划组件的入层镜像与待处理观测同时读回。
 func (p *KongOpenAIAccountPace) restoreStates(ctx context.Context) bool {
 	raw, err := p.store.LoadAccountStates(ctx)
 	if err != nil {
 		slog.Warn("kong pace: 载入账号状态失败，下一拍重试", "error", err)
 		return false
 	}
+	if p.ledger != nil {
+		if err := p.ledger.reload(ctx); err != nil {
+			slog.Warn("kong plan: 载入入层记录失败，下一拍重试", "error", err)
+			return false
+		}
+	}
 	p.statesReady = true
+	p.states = make(map[int64]*kongPaceAccountState, len(raw))
 	for id, data := range raw {
 		var st kongPaceAccountState
 		if err := json.Unmarshal(data, &st); err != nil {
@@ -273,13 +322,14 @@ func (p *KongOpenAIAccountPace) restoreStates(ctx context.Context) bool {
 	return true
 }
 
-func (p *KongOpenAIAccountPace) persist(ctx context.Context) {
+func (p *KongOpenAIAccountPace) persist(ctx context.Context, extra KongPaceCommitExtra) bool {
 	out := make(map[int64][]byte, len(p.states))
 	for id, st := range p.states {
 		data, err := json.Marshal(st)
 		if err != nil {
-			slog.Warn("kong pace: 账号状态无法编码", "account_id", id, "error", err)
-			continue
+			// 整拍不提交：观测删除与结算要和全部账号的状态一起落下，否则会丢掉这一拍的补记。
+			slog.Warn("kong pace: 账号状态无法编码，这一拍不提交", "account_id", id, "error", err)
+			return false
 		}
 		out[id] = data
 	}
@@ -288,11 +338,12 @@ func (p *KongOpenAIAccountPace) persist(ctx context.Context) {
 		deleted = append(deleted, id)
 	}
 	// 每拍整体写一遍：上一拍写失败的内容（包括没删成的键）这一拍一并补上。
-	if err := p.store.SaveAccountStates(ctx, out, deleted); err != nil {
-		slog.Warn("kong pace: 写入账号状态失败", "error", err)
-		return
+	if err := p.store.SaveAccountStates(ctx, out, deleted, extra); err != nil {
+		slog.Warn("kong pace: 写入账号状态失败，下一拍从 Redis 重新载入", "error", err)
+		return false
 	}
 	clear(p.pendingDeletes)
+	return true
 }
 
 // sampleTick 每 5 秒读一次全部账号的"在途 + 排队"，覆盖不经过第 2 层的粘性会话请求。
@@ -306,7 +357,7 @@ func (p *KongOpenAIAccountPace) sampleTick() {
 	}
 	req := make([]AccountWithConcurrency, 0, len(snap.accounts))
 	for id, f := range snap.accounts {
-		req = append(req, AccountWithConcurrency{ID: id, MaxConcurrency: max(f.Concurrency, 1)})
+		req = append(req, AccountWithConcurrency{ID: id, MaxConcurrency: max(kongEffectiveConcurrencyByID(id, f.Concurrency), 1)})
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), kongPaceSampleInterval)
 	defer cancel()
@@ -409,7 +460,7 @@ func (p *KongOpenAIAccountPace) publish(ctx context.Context, loaded *kongPaceLoa
 	accounts := make(map[int64][]byte, len(snap.accounts))
 	for id, f := range snap.accounts {
 		f := f
-		v := p.view(cfg, id, f.Plan, f.Concurrency, &f, 0, f.LastUsedAt, nil, now)
+		v := p.view(cfg, id, f.Plan, kongEffectiveConcurrencyByID(id, f.Concurrency), &f, 0, f.LastUsedAt, nil, now)
 		data, err := json.Marshal(struct {
 			kongPaceAccountView
 			UpdatedAt time.Time `json:"updated_at"`
@@ -452,7 +503,7 @@ func (p *KongOpenAIAccountPace) maybeLogSummary(loaded *kongPaceLoadedConfig, sn
 	cfg := &loaded.cfg
 	for _, id := range ids {
 		f := snap.accounts[id]
-		v := p.view(cfg, id, f.Plan, f.Concurrency, &f, 0, f.LastUsedAt, nil, now)
+		v := p.view(cfg, id, f.Plan, kongEffectiveConcurrencyByID(id, f.Concurrency), &f, 0, f.LastUsedAt, nil, now)
 		slog.Info("kong pace: 账号状态", "account_id", id, "plan", v.Plan, "used", v.Used, "gap", v.Gap,
 			"deadline_source", v.DeadlineSource, "inc6", v.Inc6, "inc24", v.Inc24, "q", v.Q, "at_line", v.AtLine,
 			"peak", v.Peak, "limit", v.Limit, "c", v.C, "w", v.Weight)
