@@ -235,6 +235,8 @@ type ConcurrencyService struct {
 	accountLoadCacheMu  sync.RWMutex
 	accountLoadCache    map[string]cachedAccountLoadBatch
 	accountLoadGroup    singleflight.Group
+
+	kongLiveness *KongRequestLiveness // [kong] 请求存活续期（可选依赖，见 kong_request_liveness.go）
 }
 
 type cachedAccountLoadBatch struct {
@@ -344,7 +346,7 @@ func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID i
 	if maxConcurrency <= 0 {
 		return &AcquireResult{
 			Acquired:    true,
-			ReleaseFunc: func() {}, // no-op
+			ReleaseFunc: s.kongTrack(ctx, KongSlotAccount, accountID, "", func() {}), // [kong] 不限并发时只续会话
 		}, nil
 	}
 
@@ -359,13 +361,13 @@ func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID i
 	if acquired {
 		return &AcquireResult{
 			Acquired: true,
-			ReleaseFunc: func() {
+			ReleaseFunc: s.kongTrack(ctx, KongSlotAccount, accountID, requestID, func() { // [kong] 请求存活续期
 				bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				if err := s.cache.ReleaseAccountSlot(bgCtx, accountID, requestID); err != nil {
 					logger.LegacyPrintf("service.concurrency", "Warning: failed to release account slot for %d (req=%s): %v", accountID, requestID, err)
 				}
-			},
+			}),
 		}, nil
 	}
 
@@ -398,13 +400,13 @@ func (s *ConcurrencyService) AcquireUserSlot(ctx context.Context, userID int64, 
 	if acquired {
 		return &AcquireResult{
 			Acquired: true,
-			ReleaseFunc: func() {
+			ReleaseFunc: s.kongTrack(ctx, KongSlotUser, userID, requestID, func() { // [kong] 请求存活续期
 				bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				if err := s.cache.ReleaseUserSlot(bgCtx, userID, requestID); err != nil {
 					logger.LegacyPrintf("service.concurrency", "Warning: failed to release user slot for %d (req=%s): %v", userID, requestID, err)
 				}
-			},
+			}),
 		}, nil
 	}
 
@@ -439,13 +441,13 @@ func (s *ConcurrencyService) TrackAPIKeySlot(ctx context.Context, apiKeyID int64
 		return func() {}
 	}
 
-	return func() {
+	return s.kongTrack(ctx, KongSlotAPIKey, apiKeyID, requestID, func() { // [kong] 请求存活续期
 		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := cache.ReleaseAPIKeySlot(bgCtx, apiKeyID, requestID); err != nil {
 			logger.LegacyPrintf("service.concurrency", "Warning: failed to release api key slot for %d (req=%s): %v", apiKeyID, requestID, err)
 		}
-	}
+	})
 }
 
 // GetAPIKeyConcurrencyBatch gets real-time active request counts for API keys.
