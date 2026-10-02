@@ -527,6 +527,8 @@ type OpenAIGatewayService struct {
 	kongPace *KongOpenAIAccountPace
 	// [kong] 会话数上限（可选依赖，setter 在 kong_openai_session_limit.go）。nil 即不启用。
 	kongSessionLimit *kongSessionLimit
+	// [kong] 请求存活续期（持有以便退出时停止，setter 在 kong_request_liveness.go）。nil 即不启用。
+	kongLiveness *KongRequestLiveness
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

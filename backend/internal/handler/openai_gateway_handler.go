@@ -639,6 +639,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	c.Request = c.Request.WithContext(service.WithOpenAIGuardianParentAffinity(
 		c.Request.Context(), c, sessionHashBody, reqModel,
 	))
+	c.Request = c.Request.WithContext(service.KongWithSessionCountHash(c.Request.Context(), sessionHash)) // [kong] 账号槽连带续期会话
 	requireCompact := legacyCompact
 
 	maxAccountSwitches := h.maxAccountSwitches
@@ -1282,6 +1283,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
 	promptCacheKey := h.gatewayService.ExtractSessionID(c, body)
 	sessionHash, promptCacheKey = resolveOpenAIMessagesMetadataSession(c, sessionHash, promptCacheKey, reqModel, body)
+	c.Request = c.Request.WithContext(service.KongWithSessionCountHash(c.Request.Context(), sessionHash)) // [kong] 账号槽连带续期会话
 	if h.rejectIfCyberSessionBlocked(c, apiKey, body, reqModel, cyberBlockFormatAnthropic) {
 		return
 	}
@@ -2707,6 +2709,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		openAIWSIngressFallbackSessionSeed(subject.UserID, apiKey.ID, apiKey.GroupID),
 	)
 	ctx = service.WithOpenAIGuardianParentAffinity(ctx, c, firstMessage, reqModel)
+	// [kong] 会话数上限：首轮抢槽起就带上会话计数身份，账号槽连带续期会话；连接上的后续轮次也按它续期。
+	ctx = service.KongWithSessionCountHash(ctx, sessionHash)
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	profitVetoCount := 0
@@ -3215,8 +3219,6 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			ctx = preemptCtx
 			defer cleanupPreempt()
 		}
-		// [kong] 会话数上限：连接上的后续轮次按建连选号的会话哈希续期。
-		ctx = service.KongWithSessionCountHash(ctx, sessionHash)
 
 		for {
 			err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)

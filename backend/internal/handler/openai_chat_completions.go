@@ -161,6 +161,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 
 	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
 	promptCacheKey := h.gatewayService.ExtractSessionID(c, body)
+	c.Request = c.Request.WithContext(service.KongWithSessionCountHash(c.Request.Context(), sessionHash)) // [kong] 账号槽连带续期会话
 
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
