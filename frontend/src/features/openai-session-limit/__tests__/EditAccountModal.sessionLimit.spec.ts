@@ -92,7 +92,7 @@ describe('EditAccountModal 的 OpenAI 会话数上限', () => {
     await input.setValue('5')
     const payload = await submit(wrapper)
     expect(payload.extra.max_sessions).toBe(5)
-    expect(payload.extra.session_idle_timeout_minutes).toBe(15)
+    expect(payload.extra).not.toHaveProperty('session_idle_timeout_minutes')
     wrapper.unmount()
   })
 
