@@ -312,6 +312,11 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	kongPace.Start()
 	// [kong] 会话数上限：复用上游 Anthropic 会话限制的那份计数缓存。
 	openAIGatewayService.SetKongSessionLimitCache(sessionLimitCache)
+	// [kong] 请求存活续期：并发槽与会话登记在请求进行中续期（DESIGN-request-liveness.md）。
+	kongLiveness := service.NewKongRequestLiveness(concurrencyCache, openAIGatewayService)
+	concurrencyService.SetKongRequestLiveness(kongLiveness)
+	openAIGatewayService.SetKongRequestLiveness(kongLiveness)
+	kongLiveness.Start()
 	usageRecordWorkerPool := service.NewUsageRecordWorkerPool(configConfig)
 	userMsgQueueCache := repository.NewUserMsgQueueCache(redisClient)
 	userMessageQueueService := service.ProvideUserMessageQueueService(userMsgQueueCache, rpmCache, configConfig)
@@ -676,6 +681,12 @@ func provideCleanup(
 			{"KongOpenAIAccountPace", func() error {
 				if openAIGateway != nil {
 					openAIGateway.StopKongOpenAIAccountPace()
+				}
+				return nil
+			}},
+			{"KongRequestLiveness", func() error {
+				if openAIGateway != nil {
+					openAIGateway.StopKongRequestLiveness()
 				}
 				return nil
 			}},
