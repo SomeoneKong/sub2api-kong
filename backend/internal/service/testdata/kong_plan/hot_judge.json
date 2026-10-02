@@ -1,0 +1,65 @@
+[
+  {
+    "name": "默认三档的滞回",
+    "default": {"light": [60, 50], "heavy": [70, 60], "pause": [90, 80]},
+    "steps": [
+      {"hour": 0, "inc6": 10, "inc24": 59.9, "light": false, "heavy": false, "paused": false, "safety_paused": false},
+      {"hour": 1, "inc6": 10, "inc24": 60, "light": true, "heavy": false, "paused": false, "safety_paused": false},
+      {"hour": 2, "inc6": 10, "inc24": 55, "light": true, "heavy": false, "paused": false, "safety_paused": false},
+      {"hour": 3, "inc6": 10, "inc24": 71, "light": true, "heavy": true, "paused": false, "safety_paused": false},
+      {"hour": 4, "inc6": 10, "inc24": 95, "light": true, "heavy": true, "paused": true, "safety_paused": true},
+      {"hour": 5, "inc6": 10, "inc24": 85, "light": true, "heavy": true, "paused": true, "safety_paused": true},
+      {"hour": 6, "inc6": 10, "inc24": 79, "light": true, "heavy": true, "paused": false, "safety_paused": false},
+      {"hour": 7, "inc6": 10, "inc24": 59, "light": true, "heavy": false, "paused": false, "safety_paused": false},
+      {"hour": 8, "inc6": 10, "inc24": 49, "light": false, "heavy": false, "paused": false, "safety_paused": false}
+    ]
+  },
+  {
+    "name": "时段：[0, 0] 轻度、更严的重度与暂停、6 小时线",
+    "default": {"light": [60, 50], "heavy": [70, 60], "pause": [90, 80]},
+    "segments": [
+      {"24h": {"light": [0, 0], "heavy": [40, 35], "pause": [48, 45]}, "6h": {"pause": [25, 20]}}
+    ],
+    "steps": [
+      {"hour": 0, "inc6": 0, "inc24": 0, "segment": 1, "light": true, "heavy": false, "paused": false, "safety_paused": false},
+      {"hour": 1, "inc6": 12, "inc24": 41, "segment": 1, "light": true, "heavy": true, "paused": false, "safety_paused": false},
+      {"hour": 2, "inc6": 26, "inc24": 41, "segment": 1, "light": true, "heavy": true, "paused": true, "safety_paused": false},
+      {"hour": 3, "inc6": 21, "inc24": 44, "segment": 1, "light": true, "heavy": true, "paused": true, "safety_paused": false},
+      {"hour": 4, "inc6": 19, "inc24": 44, "segment": 1, "light": true, "heavy": true, "paused": false, "safety_paused": false},
+      {"hour": 5, "inc6": 10, "inc24": 30, "segment": 0, "light": false, "heavy": false, "paused": false, "safety_paused": false}
+    ]
+  },
+  {
+    "name": "[0, 0] 的暂停不看读数",
+    "default": {"light": [60, 50], "heavy": [70, 60], "pause": [90, 80]},
+    "segments": [
+      {"24h": {"pause": [0, 0]}}
+    ],
+    "steps": [
+      {"hour": 0, "inc6": 0, "inc24": 0, "segment": 1, "light": false, "heavy": false, "paused": true, "safety_paused": false},
+      {"hour": 1, "inc6": 0, "inc24": 0, "segment": 0, "light": false, "heavy": false, "paused": false, "safety_paused": false}
+    ]
+  },
+  {
+    "name": "默认关掉暂停一档：时段的暂停线不起作用",
+    "default": {"light": [60, 50], "heavy": [70, 60]},
+    "segments": [
+      {"24h": {"pause": [0, 0], "heavy": [40, 35]}}
+    ],
+    "steps": [
+      {"hour": 0, "inc6": 10, "inc24": 41, "segment": 1, "light": false, "heavy": true, "paused": false, "safety_paused": false}
+    ]
+  },
+  {
+    "name": "暂停在默认线与时段线都成立时才算默认线的暂停",
+    "default": {"light": [60, 50], "heavy": [70, 60], "pause": [90, 80]},
+    "segments": [
+      {"24h": {"pause": [48, 45]}}
+    ],
+    "steps": [
+      {"hour": 0, "inc6": 10, "inc24": 50, "segment": 1, "light": false, "heavy": false, "paused": true, "safety_paused": false},
+      {"hour": 1, "inc6": 10, "inc24": 92, "segment": 1, "light": true, "heavy": true, "paused": true, "safety_paused": true},
+      {"hour": 2, "inc6": 10, "inc24": 70, "segment": 1, "light": true, "heavy": true, "paused": true, "safety_paused": false}
+    ]
+  }
+]

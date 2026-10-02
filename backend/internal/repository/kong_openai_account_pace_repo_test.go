@@ -28,14 +28,14 @@ func TestKongPaceStore_SaveLoadDelete(t *testing.T) {
 	ctx := context.Background()
 	store, mr := newKongPaceStoreTest(t)
 
-	require.NoError(t, store.SaveAccountStates(ctx, map[int64][]byte{1: []byte(`{"a":1}`), 7: []byte(`{"a":7}`)}, nil))
+	require.NoError(t, store.SaveAccountStates(ctx, map[int64][]byte{1: []byte(`{"a":1}`), 7: []byte(`{"a":7}`)}, nil, service.KongPaceCommitExtra{}))
 	require.NoError(t, mr.Set(kongPaceAccountKeyPrefix+"junk", "x"))
 	got, err := store.LoadAccountStates(ctx)
 	require.NoError(t, err)
 	require.Equal(t, map[int64][]byte{1: []byte(`{"a":1}`), 7: []byte(`{"a":7}`)}, got)
 	require.Zero(t, mr.TTL(kongPaceAccountKeyPrefix+"1"), "account state must not expire")
 
-	require.NoError(t, store.SaveAccountStates(ctx, map[int64][]byte{1: []byte(`{"a":2}`)}, []int64{7}))
+	require.NoError(t, store.SaveAccountStates(ctx, map[int64][]byte{1: []byte(`{"a":2}`)}, []int64{7}, service.KongPaceCommitExtra{}))
 	got, err = store.LoadAccountStates(ctx)
 	require.NoError(t, err)
 	require.Equal(t, map[int64][]byte{1: []byte(`{"a":2}`)}, got)
@@ -69,9 +69,9 @@ func TestKongPaceRepository_ListParsesReadings(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta("FROM accounts a")).
 		WithArgs(service.PlatformOpenAI, service.AccountTypeOAuth).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "plan", "concurrency", "exp", "used", "reset", "window", "updated", "last_used"}).
-			AddRow(int64(3), "pro", 8, "2026-10-01T00:00:00Z", "43.5", "2026-09-26T08:00:00.123Z", "10080", "2026-09-23T16:59:00+08:00", time.Date(2026, 9, 23, 8, 58, 0, 0, time.UTC)).
-			AddRow(int64(4), "", 5, "", "NaN", "bad", "", "", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "plan", "concurrency", "exp", "used", "reset", "window", "updated", "last_used", "parent"}).
+			AddRow(int64(3), "pro", 8, "2026-10-01T00:00:00Z", "43.5", "2026-09-26T08:00:00.123Z", "10080", "2026-09-23T16:59:00+08:00", time.Date(2026, 9, 23, 8, 58, 0, 0, time.UTC), nil).
+			AddRow(int64(4), "", 5, "", "NaN", "bad", "", "", nil, int64(3)))
 
 	rows, err := NewKongPaceRepository(db).ListOpenAIOAuthAccounts(context.Background())
 	require.NoError(t, err)
@@ -88,7 +88,9 @@ func TestKongPaceRepository_ListParsesReadings(t *testing.T) {
 	require.True(t, r.SubscriptionExpiresAt.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)))
 	require.True(t, r.LastUsedAt.Equal(time.Date(2026, 9, 23, 8, 58, 0, 0, time.UTC)))
 
+	require.Nil(t, r.ParentAccountID)
 	empty := rows[1]
+	require.Equal(t, int64(3), *empty.ParentAccountID)
 	require.Nil(t, empty.UsedPercent)
 	require.Nil(t, empty.ResetAt)
 	require.Nil(t, empty.WindowMinutes)

@@ -576,7 +576,7 @@ func (s *kongPaceFakeStore) LoadAccountStates(context.Context) (map[int64][]byte
 	return out, s.loadErr
 }
 
-func (s *kongPaceFakeStore) SaveAccountStates(_ context.Context, states map[int64][]byte, deleted []int64) error {
+func (s *kongPaceFakeStore) SaveAccountStates(_ context.Context, states map[int64][]byte, deleted []int64, _ KongPaceCommitExtra) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.saveErr != nil {

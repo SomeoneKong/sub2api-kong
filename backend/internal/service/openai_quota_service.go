@@ -139,6 +139,7 @@ type OpenAIQuotaService struct {
 	referralClient       OpenAIReferralClient
 	agentIdentityTaskMu  sync.Mutex
 	agentIdentityWS      agentIdentityWSConnectionInvalidator
+	kongPlanLedger       *KongPlanLedger // [kong] 余额观测登记（kong_plan_ledger.go）
 }
 
 // NewOpenAIQuotaService constructs a quota service. token provider is required —
@@ -255,9 +256,16 @@ func (s *OpenAIQuotaService) CacheCreditsSnapshot(ctx context.Context, accountID
 	if usage == nil {
 		return infraerrors.New(http.StatusBadGateway, "OPENAI_QUOTA_EMPTY_USAGE", "openai quota query returned an empty result")
 	}
-	if err := s.accountRepo.UpdateExtra(ctx, accountID, map[string]any{
-		openaiQuotaCreditsKey: openAICreditsSnapshot{Credits: usage.Credits, FetchedAt: usage.FetchedAt},
-	}); err != nil {
+	s.kongPlanLedger.Observe(ctx, accountID, usage)                            // [kong] 写快照之前先登记余额观测
+	updates, err := kongQuotaUsageWrites(ctx, s.accountRepo, accountID, usage) // [kong] 额度刷新一并写入用量读数（经窗口转换）
+	if err != nil {
+		return infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_CACHE_WRITE_FAILED", "failed to read the account before caching usage").WithCause(err)
+	}
+	if updates == nil {
+		updates = make(map[string]any, 1)
+	}
+	updates[openaiQuotaCreditsKey] = openAICreditsSnapshot{Credits: usage.Credits, FetchedAt: usage.FetchedAt}
+	if err := s.accountRepo.UpdateExtra(ctx, accountID, updates); err != nil {
 		return infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_CACHE_WRITE_FAILED", "failed to cache Codex credits").WithCause(err)
 	}
 	return nil
@@ -268,7 +276,11 @@ func (s *OpenAIQuotaService) CachePostResetSnapshot(ctx context.Context, account
 	if usage == nil {
 		return s.cacheResetCreditsSnapshot(ctx, accountID, nil, nil)
 	}
-	updates := buildOpenAIAutoResetUsageUpdates(usage, time.Now())
+	s.kongPlanLedger.Observe(ctx, accountID, usage)                            // [kong] 写快照之前先登记余额观测
+	updates, err := kongQuotaUsageWrites(ctx, s.accountRepo, accountID, usage) // [kong] 窗口转换
+	if err != nil {
+		return infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_CACHE_WRITE_FAILED", "failed to read the account before caching usage").WithCause(err)
+	}
 	if updates == nil {
 		updates = make(map[string]any)
 	}

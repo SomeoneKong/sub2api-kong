@@ -58,6 +58,8 @@ type kongPaceDecision struct {
 	// sessions 是同一次第 2 层的会话分段。每一轮按它当时的状态取会话占用与满额账号：确认登记没通过的
 	// 账号在之后的轮次里已是满额。
 	sessions *kongSessionGate
+	// plan 是计划输入生效时的两轮排序：重排只在它的桶内进行。
+	plan *kongPlanSelection
 }
 
 // kongPaceBegin 在进入第 2 层时调用。功能未装配或配置文件不存在时返回 nil。
@@ -122,6 +124,9 @@ func (d *kongPaceDecision) reorder(available []accountWithLoad, rates openAILega
 	if d == nil || len(available) == 0 {
 		return available
 	}
+	if d.plan != nil {
+		available = d.plan.groupByBucket(available)
+	}
 	d.rates = rates
 	cfg := &d.loaded.cfg
 	views := make([]kongPaceAccountView, len(available))
@@ -140,7 +145,7 @@ func (d *kongPaceDecision) reorder(available []accountWithLoad, rates openAILega
 				facts, plan = &f, f.Plan
 			}
 		}
-		views[i] = d.p.view(cfg, acc.ID, plan, acc.Concurrency, facts, current, acc.LastUsedAt, d.sessions.paceUse(acc), d.now)
+		views[i] = d.p.view(cfg, acc.ID, plan, KongEffectiveConcurrency(acc), facts, current, acc.LastUsedAt, d.sessions.paceUse(acc), d.now)
 		views[i].Priority = acc.Priority
 		views[i].CompactTier = openAICompactSupportTier(acc)
 		if rate, ok := rates.rates[acc.ID]; ok && rates.enabled {
@@ -151,7 +156,8 @@ func (d *kongPaceDecision) reorder(available []accountWithLoad, rates openAILega
 	order := make([]int, 0, len(available))
 	for start := 0; start < len(available); {
 		end := start + 1
-		for end < len(available) && available[end].account.Priority == available[start].account.Priority {
+		for end < len(available) && available[end].account.Priority == available[start].account.Priority &&
+			(d.plan == nil || d.plan.sameBucket(available[end].account.ID, available[start].account.ID)) {
 			end++
 		}
 		run := make([]int, 0, end-start)
@@ -285,6 +291,14 @@ func (d *kongPaceDecision) attachSessions(g *kongSessionGate) {
 		return
 	}
 	d.sessions = g
+}
+
+// attachPlan 接上计划排序：之后每一轮先按它的桶分组，同一桶、同一原优先级的连续段才一起重排。
+func (d *kongPaceDecision) attachPlan(p *kongPlanSelection) {
+	if d == nil {
+		return
+	}
+	d.plan = p
 }
 
 // loadFailed 记下第 2 层因负载读取失败走了降级分支（不经过重排）。
