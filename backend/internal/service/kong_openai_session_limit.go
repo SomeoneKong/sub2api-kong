@@ -60,9 +60,10 @@ func newKongSessionLimit(cache SessionLimitCache, now func() time.Time) *kongSes
 	return &kongSessionLimit{cache: cache, now: now, lastLog: now()}
 }
 
-// kongSessionLimited 判断账号是否受会话上限约束：OpenAI OAuth 且设了正数上限。
+// kongSessionLimited 判断账号是否受会话上限约束：OpenAI OAuth 且生效上限为正数（账号自身不限、计划的覆盖值限制时
+// 也算受限）。
 func kongSessionLimited(account *Account) bool {
-	return account != nil && account.IsOpenAIOAuth() && account.GetMaxSessions() > 0
+	return account != nil && account.IsOpenAIOAuth() && kongEffectiveMaxSessions(account) > 0
 }
 
 // kongSessionIdleTimeout 是账号的空闲超时 T：登记、计数与展示共用这一个值。
@@ -201,7 +202,7 @@ func (s *OpenAIGatewayService) kongSessionGateBegin(ctx context.Context, session
 	g := &kongSessionGate{limit: l, hash: hash, ids: make([]int64, 0, len(candidates)), counts: counts, full: make(map[int64]bool)}
 	for _, acc := range candidates {
 		g.ids = append(g.ids, acc.ID)
-		if kongSessionLimited(acc) && counts[acc.ID] >= acc.GetMaxSessions() {
+		if kongSessionLimited(acc) && counts[acc.ID] >= kongEffectiveMaxSessions(acc) {
 			g.full[acc.ID] = true
 			continue
 		}
@@ -223,7 +224,7 @@ func (g *kongSessionGate) paceUse(account *Account) *kongPaceSessionUse {
 	if g == nil || account == nil {
 		return nil
 	}
-	u := &kongPaceSessionUse{Limit: account.GetMaxSessions(), Full: g.full[account.ID]}
+	u := &kongPaceSessionUse{Limit: kongEffectiveMaxSessions(account), Full: g.full[account.ID]}
 	if count, ok := g.counts[account.ID]; ok && kongSessionLimited(account) {
 		u.Active = &count
 	}
@@ -305,22 +306,33 @@ func (g *kongSessionGate) confirm(ctx context.Context, account *Account) bool {
 	if g == nil || !kongSessionLimited(account) {
 		return true
 	}
-	l := g.limit
 	if g.full[account.ID] {
+		return g.confirmLimit(ctx, account, kongSessionUnlimited)
+	}
+	return g.confirmLimit(ctx, account, kongEffectiveMaxSessions(account))
+}
+
+// confirmLimit 按给定上限登记会话：kongSessionUnlimited 即溢出，放行登记；否则做带上限的原子登记，名额已被别的新会话
+// 先占时把账号记为满额并返回 false。计划排序在宽限段传"上限 + 宽限"。Redis 出错时失败开放。
+func (g *kongSessionGate) confirmLimit(ctx context.Context, account *Account, limit int) bool {
+	l := g.limit
+	if limit == kongSessionUnlimited {
 		l.touch(ctx, account, g.hash)
 		l.record(func(st *kongSessionStats) { st.overflows++ })
 		slog.Warn("kong session limit: 有余量的账号都用不上，新会话落到满额账号",
-			"account_id", account.ID, "max_sessions", account.GetMaxSessions())
+			"account_id", account.ID, "max_sessions", kongEffectiveMaxSessions(account))
 		return true
 	}
-	allowed, err := l.cache.RegisterSession(ctx, account.ID, g.hash, account.GetMaxSessions(), kongSessionIdleTimeout(account))
+	allowed, err := l.cache.RegisterSession(ctx, account.ID, g.hash, limit, kongSessionIdleTimeout(account))
 	if err != nil {
 		l.fail(account.ID, err)
 		return true
 	}
 	if !allowed {
-		g.full[account.ID] = true
-		g.roomCount--
+		if !g.full[account.ID] {
+			g.full[account.ID] = true
+			g.roomCount--
+		}
 		l.record(func(st *kongSessionStats) { st.confirmRejected++ })
 	}
 	return allowed

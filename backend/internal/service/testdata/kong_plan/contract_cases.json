@@ -1,0 +1,230 @@
+{
+  "comment": "计划组件管理接口的契约用例。网关的 handler 测试与边车的假网关都跑这一份。每个用例从初始状态开始（代次 1、启用、序号 0、从未同步人工约束）。path 相对 /api/v1/admin/kong-plan。字符串 $now、$now+135m、$now-1m、$now+7h 在运行时替换为带时区的时刻：每个用例开始时取一次 $now，全部步骤共用（同号重试的内容必须逐字相同）。期望里 status 必须相等；reason 与 metadata 写了才比；data 按子集比较：写出的键必须相等，数组逐项比较。",
+  "accounts": {
+    "1": {"platform": "openai", "type": "oauth"},
+    "2": {"platform": "openai", "type": "oauth"},
+    "3": {"platform": "openai", "type": "apikey"}
+  },
+  "cases": [
+    {
+      "name": "发布：接受、同号重试、同号不同内容、旧序号",
+      "steps": [
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1",
+                  "fallback": [{"id": 1, "tier": "normal"}],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": [{"id": 2, "tier": "asap", "admit_below": {"6h": 37.5, "24h": 60}}, {"id": 1, "tier": "normal"}]}},
+         "expect": {"status": 200, "data": {"accepted": true, "idempotent": false, "generation": 1, "seq": 1, "ignored_ids": []}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1",
+                  "fallback": [{"id": 1, "tier": "normal", "active": true}],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": [{"id": 1, "tier": "normal"}, {"id": 2, "tier": "asap", "admit_below": {"24h": 60, "6h": 37.5}}]}},
+         "expect": {"status": 200, "data": {"accepted": true, "idempotent": true, "seq": 1}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}},
+         "expect": {"status": 409, "reason": "KONG_PLAN_SEQ_CONFLICT", "metadata": {"generation": "1", "enabled": "true", "seq": "1"}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 3, "plan_version": 5, "cycle_id": "c3", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}},
+         "expect": {"status": 200, "data": {"idempotent": false, "seq": 3}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 2, "plan_version": 5, "cycle_id": "c2", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}},
+         "expect": {"status": 409, "reason": "KONG_PLAN_SEQ_STALE", "metadata": {"seq": "3"}}},
+        {"method": "GET", "path": "/dispatch",
+         "expect": {"status": 200, "data": {"generation": 1, "seq": 3, "cycle_id": "c3", "in_use": "snapshot", "fallback": [], "snapshot": {"accounts": []}}}}
+      ]
+    },
+    {
+      "name": "发布：代次不符",
+      "steps": [
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 2, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}},
+         "expect": {"status": 409, "reason": "KONG_PLAN_GENERATION_MISMATCH", "metadata": {"generation": "1", "enabled": "true", "seq": "0"}}}
+      ]
+    },
+    {
+      "name": "停用、清空与恢复：清空前发出的高序号发布被拒，新代次的下一次发布被接受",
+      "steps": [
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [{"id": 1, "tier": "standby"}],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": [{"id": 1, "tier": "normal"}]}},
+         "expect": {"status": 200}},
+        {"method": "PUT", "path": "/publish", "body": {"action": "disable", "note": "排查"},
+         "expect": {"status": 200, "data": {"generation": 2, "enabled": false, "last_seq": 1, "in_use": "snapshot",
+                                            "dispatch": {"seq": 1, "has_fallback": true, "has_snapshot": true}}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 2, "seq": 2, "plan_version": 5, "cycle_id": "c2", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}},
+         "expect": {"status": 409, "reason": "KONG_PLAN_PUBLISH_DISABLED", "metadata": {"generation": "2", "enabled": "false", "seq": "1"}}},
+        {"method": "PUT", "path": "/publish", "body": {"action": "disable", "clear": "snapshot", "note": "回到兜底"},
+         "expect": {"status": 200, "data": {"generation": 3, "in_use": "fallback", "dispatch": {"has_fallback": true, "has_snapshot": false}}}},
+        {"method": "PUT", "path": "/publish", "body": {"action": "disable", "clear": "all", "note": "回到现状调度"},
+         "expect": {"status": 200, "data": {"generation": 4, "in_use": "legacy", "last_seq": 1}}},
+        {"method": "GET", "path": "/dispatch",
+         "expect": {"status": 200, "data": {"in_use": "legacy", "seq": 1, "fallback": null, "snapshot": null}}},
+        {"method": "PUT", "path": "/publish", "body": {"action": "enable", "note": "恢复"},
+         "expect": {"status": 200, "data": {"generation": 5, "enabled": true}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 50, "plan_version": 5, "cycle_id": "c50", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}},
+         "expect": {"status": 409, "reason": "KONG_PLAN_GENERATION_MISMATCH", "metadata": {"generation": "5"}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 5, "seq": 2, "plan_version": 5, "cycle_id": "c2", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}},
+         "expect": {"status": 200, "data": {"generation": 5, "seq": 2}}},
+        {"method": "GET", "path": "/publish",
+         "expect": {"status": 200, "data": {"generation": 5, "enabled": true, "last_seq": 2, "in_use": "snapshot", "control_revision": 0}}}
+      ]
+    },
+    {
+      "name": "发布状态：清空只能与停用一起用，备注必填",
+      "steps": [
+        {"method": "PUT", "path": "/publish", "body": {"action": "enable", "clear": "all", "note": "x"},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "clear"}}},
+        {"method": "PUT", "path": "/publish", "body": {"action": "disable"},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "note"}}}
+      ]
+    },
+    {
+      "name": "发布：快照有效期",
+      "steps": [
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [],
+                  "snapshot": {"expires_at": "$now-1m", "accounts": []}},
+         "expect": {"status": 400, "reason": "KONG_PLAN_SNAPSHOT_EXPIRY_INVALID"}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [],
+                  "snapshot": {"expires_at": "$now+7h", "accounts": []}},
+         "expect": {"status": 400, "reason": "KONG_PLAN_SNAPSHOT_EXPIRY_INVALID"}}
+      ]
+    },
+    {
+      "name": "发布：非 OAuth 账号带 credits 被拒，不存在的账号照常接受",
+      "steps": [
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1",
+                  "fallback": [{"id": 3, "tier": "normal", "credits": {"level": 2, "expires_at": "2026-12-31T23:59:00+08:00"}}],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}},
+         "expect": {"status": 400, "reason": "KONG_PLAN_CREDITS_NOT_OAUTH", "metadata": {"account_id": "3"}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1",
+                  "fallback": [{"id": 3, "tier": "normal"}],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": [{"id": 99, "tier": "normal", "credits": {"level": 1, "expires_at": "2026-12-31T23:59:00+08:00"}}]}},
+         "expect": {"status": 200, "data": {"ignored_ids": [99]}}}
+      ]
+    },
+    {
+      "name": "发布：静态校验",
+      "steps": [
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1",
+                  "fallback": [{"id": 1, "tier": "asap", "admit_below": {"6h": 1, "24h": 2}}],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "fallback[0].tier"}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": [{"id": 1, "tier": "asap"}]}},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "snapshot.accounts[0].admit_below"}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": [{"id": 1, "tier": "normal"}, {"id": 1, "tier": "standby"}]}},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "snapshot.accounts[1].id"}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": [{"id": 1, "tier": "normal", "credits": {"level": 10, "expires_at": "2026-12-31T23:59:00+08:00"}}]}},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "snapshot.accounts[0].credits.level"}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": []}, "foo": 1},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "foo"}}}
+      ]
+    },
+    {
+      "name": "人工约束：修订号",
+      "steps": [
+        {"method": "GET", "path": "/control",
+         "expect": {"status": 200, "data": {"revision": 0, "credits_mode": "shadow", "allow": [], "floor": 0, "per_point": null,
+                                            "overflow_margin": {"default": 0}, "file_hold": null, "latched_holds": [], "released_triggers": []}}},
+        {"method": "PUT", "path": "/control",
+         "body": {"revision": 1, "credits_mode": "on", "allow": [4, 3], "floor": 0, "per_point": null, "overflow_margin": {"default": 1, "3": 2}, "file_hold": null},
+         "expect": {"status": 200, "data": {"revision": 1, "credits_mode": "on", "allow": [3, 4], "overflow_margin": {"default": 1, "3": 2}}}},
+        {"method": "PUT", "path": "/control",
+         "body": {"revision": 1, "credits_mode": "on", "allow": [3, 4], "floor": 0, "overflow_margin": {"3": 2, "default": 1}},
+         "expect": {"status": 200, "data": {"idempotent": true, "revision": 1}}},
+        {"method": "PUT", "path": "/control",
+         "body": {"revision": 1, "credits_mode": "shadow", "allow": [3, 4], "floor": 0, "overflow_margin": {"default": 1}},
+         "expect": {"status": 409, "reason": "KONG_PLAN_REVISION_CONFLICT", "metadata": {"revision": "1"}}},
+        {"method": "PUT", "path": "/control",
+         "body": {"revision": 3, "credits_mode": "shadow", "allow": [], "floor": 5, "per_point": 2.5, "overflow_margin": {"default": 0}, "file_hold": {"since": "2026-10-02T14:00:00+08:00"}},
+         "expect": {"status": 200, "data": {"revision": 3, "credits_mode": "shadow", "allow": [], "floor": 5, "per_point": 2.5, "file_hold": {"since": "2026-10-02T06:00:00Z"}}}},
+        {"method": "PUT", "path": "/control",
+         "body": {"revision": 2, "credits_mode": "on", "allow": [], "floor": 0, "overflow_margin": {"default": 0}},
+         "expect": {"status": 409, "reason": "KONG_PLAN_REVISION_STALE", "metadata": {"revision": "3"}}},
+        {"method": "PUT", "path": "/control",
+         "body": {"revision": 4, "credits_mode": "on", "allow": [], "floor": 0, "overflow_margin": {"default": 9}},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "overflow_margin"}}}
+      ]
+    },
+    {
+      "name": "锁存暂停：设置、解除、迟到的同编号、按原因解除，同步不碰暂停",
+      "steps": [
+        {"method": "POST", "path": "/control/hold", "body": {"trigger": "daily_cap:c1", "reason": "daily_cap"},
+         "expect": {"status": 200, "data": {"state": "active"}}},
+        {"method": "POST", "path": "/control/hold", "body": {"trigger": "daily_cap:c1", "reason": "daily_cap"},
+         "expect": {"status": 200, "data": {"state": "active", "idempotent": true}}},
+        {"method": "PUT", "path": "/control",
+         "body": {"revision": 1, "credits_mode": "on", "allow": [1], "floor": 0, "overflow_margin": {"default": 1}},
+         "expect": {"status": 200, "data": {"latched_holds": [{"trigger": "daily_cap:c1", "reason": "daily_cap"}]}}},
+        {"method": "POST", "path": "/control/release", "body": {"triggers": ["daily_cap:c1"], "note": "人工确认"},
+         "expect": {"status": 200, "data": {"released": ["daily_cap:c1"], "active": []}}},
+        {"method": "POST", "path": "/control/hold", "body": {"trigger": "daily_cap:c1", "reason": "daily_cap"},
+         "expect": {"status": 200, "data": {"state": "released"}}},
+        {"method": "POST", "path": "/control/release", "body": {"triggers": ["manual:never-set"], "note": "预先作废"},
+         "expect": {"status": 200, "data": {"released": ["manual:never-set"], "active": []}}},
+        {"method": "POST", "path": "/control/hold", "body": {"trigger": "manual:never-set", "reason": "manual"},
+         "expect": {"status": 200, "data": {"state": "released"}}},
+        {"method": "POST", "path": "/control/hold", "body": {"trigger": "daily_cap:c2", "reason": "daily_cap"},
+         "expect": {"status": 200, "data": {"state": "active"}}},
+        {"method": "POST", "path": "/control/hold", "body": {"trigger": "manual:m1", "reason": "manual", "note": "止损"},
+         "expect": {"status": 200, "data": {"state": "active"}}},
+        {"method": "POST", "path": "/control/release", "body": {"reason": "daily_cap", "note": "按原因解除"},
+         "expect": {"status": 200, "data": {"released": ["daily_cap:c2"], "active": ["manual:m1"]}}},
+        {"method": "GET", "path": "/control",
+         "expect": {"status": 200, "data": {"revision": 1, "released_triggers": ["daily_cap:c1", "manual:never-set", "daily_cap:c2"],
+                                            "latched_holds": [{"trigger": "manual:m1", "reason": "manual", "note": "止损"}]}}},
+        {"method": "POST", "path": "/control/release", "body": {"triggers": ["manual:m1"], "reason": "manual", "note": "x"},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "triggers"}}},
+        {"method": "POST", "path": "/control/hold", "body": {"trigger": "has space", "reason": "manual"},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "trigger"}}}
+      ]
+    },
+    {
+      "name": "慢速部分：源事实时刻不能倒退",
+      "steps": [
+        {"method": "PUT", "path": "/forecast",
+         "body": {"cycle_id": "c1", "plan_version": 5, "computed_at": "2026-10-02T14:00:00+08:00", "interval_min": 60,
+                  "per_session_pp_per_hour": 1.5, "avg_session_pp": 0.8, "demand_estimate_pp_per_hour": 10.1,
+                  "accounts": [{"id": 1, "k": 1.0, "depth_pp_per_hour": 2.5}], "forecast": [], "runway_h": {"immediate": 67},
+                  "credits_runway_h": [{"level": 1, "hours": null}], "next_reset_at": "2026-10-03T01:00:00+08:00"},
+         "expect": {"status": 200, "data": {"accepted": true}}},
+        {"method": "PUT", "path": "/forecast",
+         "body": {"cycle_id": "c0", "plan_version": 5, "computed_at": "2026-10-02T13:59:00+08:00", "interval_min": 60,
+                  "per_session_pp_per_hour": 1.5, "avg_session_pp": 0.8, "demand_estimate_pp_per_hour": 10.1, "accounts": []},
+         "expect": {"status": 409, "reason": "KONG_PLAN_FORECAST_STALE"}},
+        {"method": "PUT", "path": "/forecast",
+         "body": {"cycle_id": "c2", "plan_version": 5, "computed_at": "2026-10-02T15:00:00+08:00", "interval_min": 60,
+                  "per_session_pp_per_hour": 1.5, "avg_session_pp": 0.8, "demand_estimate_pp_per_hour": 10.1, "accounts": [], "tight": true},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "tight"}}}
+      ]
+    },
+    {
+      "name": "调用方声明：从未声明时按 normal",
+      "steps": [
+        {"method": "GET", "path": "/caller",
+         "expect": {"status": 200, "data": {"state": "normal", "until": null, "expired": false}}}
+      ]
+    }
+  ]
+}

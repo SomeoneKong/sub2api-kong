@@ -519,7 +519,7 @@ func (s *OpenAIQuotaAutoResetService) assessExtra(account *Account, config OpenA
 }
 
 func (s *OpenAIQuotaAutoResetService) assessUsage(usage *OpenAIQuotaUsage, account *Account, config OpenAIAutoResetCreditConfig, now time.Time) openAIAutoResetAssessment {
-	updates := buildOpenAIAutoResetUsageUpdates(usage, now)
+	updates := kongQuotaUsageUpdates(account.Extra, usage) // [kong] 窗口转换
 	utilization5h := readOpenAIQuotaUsedPercent(updates, "5h") / 100
 	utilization7d := readOpenAIQuotaUsedPercent(updates, "7d") / 100
 	return s.buildAssessment(account, config, utilization5h, utilization7d)
@@ -595,7 +595,10 @@ func buildOpenAIAutoResetUsageUpdates(usage *OpenAIQuotaUsage, now time.Time) ma
 }
 
 func (s *OpenAIQuotaAutoResetService) persistFreshUsage(ctx context.Context, accountID int64, usage *OpenAIQuotaUsage, now time.Time) error {
-	updates := buildOpenAIAutoResetUsageUpdates(usage, now)
+	updates, err := kongQuotaUsageWrites(ctx, s.accountRepo, accountID, usage) // [kong] 窗口转换
+	if err != nil {
+		return err
+	}
 	if len(updates) > 0 {
 		if err := s.accountRepo.UpdateExtra(ctx, accountID, updates); err != nil {
 			return err

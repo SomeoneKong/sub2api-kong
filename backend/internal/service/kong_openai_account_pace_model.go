@@ -30,6 +30,8 @@ type KongPaceAccountRow struct {
 	WindowMinutes         *int
 	UsageUpdatedAt        *time.Time
 	LastUsedAt            *time.Time
+	// ParentAccountID 非空是 Spark 影子账号：它的 credits 是父账号的，计划组件不为它记账。
+	ParentAccountID *int64
 }
 
 // hasReading 表示这一行带着一条完整的 7d 读数。
@@ -42,11 +44,13 @@ func (r *KongPaceAccountRow) inactiveReading() bool {
 	return r.WindowMinutes != nil && *r.WindowMinutes <= 0 && r.UsageUpdatedAt != nil
 }
 
-// kongPaceRise 是一次已接受的上涨。
+// kongPaceRise 是一次已接受的上涨。Credits 为真的是计划组件从余额下降补记的消耗（DESIGN-account-selection.md
+// 第 4.2 节第 5 步）：7d 读数到顶后不再上涨，账号回到第一层后软线仍要看得到它。
 type kongPaceRise struct {
-	At        time.Time `json:"at"`         // 记账时刻
-	Points    float64   `json:"points"`     // 上涨的百分点
-	ReadingAt time.Time `json:"reading_at"` // 带来这次上涨的读数时刻
+	At        time.Time `json:"at"`                // 记账时刻
+	Points    float64   `json:"points"`            // 上涨的百分点
+	ReadingAt time.Time `json:"reading_at"`        // 带来这次上涨的读数时刻
+	Credits   bool      `json:"credits,omitempty"` // 余额补记
 }
 
 // kongPaceAccountState 是一个账号的当前窗口与消耗记录。
@@ -71,6 +75,20 @@ type kongPaceAccountState struct {
 	ProcessedAt  time.Time      `json:"processed_at"`
 	TrackedSince time.Time      `json:"tracked_since"`
 	Rises        []kongPaceRise `json:"rises"`
+
+	// 以下是计划组件的滚动状态，与上涨记录同一次写入（DESIGN-account-selection.md 第 2.4、4.1 节）。
+	// WindowSeq 是 7d 窗口序号：每个新窗口加一（起点、换窗）；未激活不变。
+	WindowSeq int64 `json:"window_seq,omitempty"`
+	// Balance 是最近一次有数值的余额观测（源查询时刻与余额），补记以它为基点。
+	Balance *kongPlanBalancePoint `json:"balance,omitempty"`
+	// UnknownUntil 之前账号有一段无法换算的 credits 消耗（换算率未知、没有基点），视同到线。
+	UnknownUntil time.Time `json:"unknown_until,omitempty"`
+}
+
+// kongPlanBalancePoint 是一次有数值的余额观测。
+type kongPlanBalancePoint struct {
+	At    time.Time `json:"at"`
+	Value float64   `json:"value"`
 }
 
 // kongPaceObservation 是一次读数判定的结果，供计数与日志。
@@ -169,6 +187,7 @@ func kongPaceObserve(st *kongPaceAccountState, row KongPaceAccountRow, now time.
 		st.ResetAt, st.MaxUsed, st.WindowMinutes = *row.ResetAt, used, *row.WindowMinutes
 		st.ReadingAt = *row.UsageUpdatedAt
 		st.Inactive = false
+		st.WindowSeq++
 		return st, kongPaceObsReset
 	case diff < -kongPaceWindowTolerance:
 		// 回滚：上游短暂回报被取代的旧窗口，整条忽略。
@@ -185,12 +204,26 @@ func kongPaceObserve(st *kongPaceAccountState, row KongPaceAccountRow, now time.
 	}
 }
 
+// kongPaceSetBaseline 以这条读数为起点建立窗口。没有当前窗口时无从判断它与上一个窗口是不是同一个，按新窗口处理，
+// 窗口序号加一。
 func kongPaceSetBaseline(st *kongPaceAccountState, row KongPaceAccountRow) {
+	st.WindowSeq++
 	st.HasWindow, st.Inactive = true, false
 	st.WindowMinutes = *row.WindowMinutes
 	st.ResetAt = *row.ResetAt
 	st.MaxUsed = *row.UsedPercent
 	st.ReadingAt = *row.UsageUpdatedAt
+}
+
+// kongPaceAddRise 按记账时刻有序地加一条上涨：余额补记记在观测的源查询时刻，可能早于已有的记录。
+func kongPaceAddRise(st *kongPaceAccountState, r kongPaceRise) {
+	i := len(st.Rises)
+	for i > 0 && st.Rises[i-1].At.After(r.At) {
+		i--
+	}
+	st.Rises = append(st.Rises, kongPaceRise{})
+	copy(st.Rises[i+1:], st.Rises[i:])
+	st.Rises[i] = r
 }
 
 func kongPaceTrimRises(st *kongPaceAccountState, now time.Time) {

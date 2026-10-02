@@ -1,0 +1,210 @@
+{
+  "description": "两轮排序的共用夹具（DESIGN-account-selection.md 第 4.2 节第 3、4 步）。网关的 Go 测试与模拟器的 Python 测试都跑它。accounts 按旧版选号这一轮的顺序给出。层由 used_7d 与 threshold_7d 判断：未到阈值为第一层；到了阈值，credits_ok（除级别外的资格条件）为真、条目有 credits、窗口不是未知时为 credits 层，否则为暂停；type 为 relay 的是中转。expect 是按顺序的桶：键为 段[/组][/healthy|busy][/imminent]；第一层与中转的桶按集合比较，credits 的桶按顺序比较；带 * 的是降段重试的位置。limits 是各位置确认登记时的上限（unlimited 为放行登记，0 为不登记）。demoted 是本次选号里已降到的段。",
+  "defaults": {
+    "type": "oauth",
+    "entry": {"tier": "normal", "active": true, "imminent": false},
+    "used_7d": 10,
+    "threshold_7d": 99,
+    "credits_ok": true,
+    "window_unknown": false,
+    "sessions": 0,
+    "sessions_known": true,
+    "max_sessions": 3,
+    "grace": 1,
+    "load_known": true,
+    "concurrency_full": false,
+    "inc6": 0,
+    "inc24": 0,
+    "pace_full": false,
+    "open_entry": false,
+    "unknown_active": false
+  },
+  "cases": [
+    {
+      "name": "档位组序：尽快 → 普通 → 非活跃 → 备用",
+      "accounts": [
+        {"id": 4, "entry": {"tier": "standby"}},
+        {"id": 3, "entry": {"tier": "normal", "active": false}},
+        {"id": 2},
+        {"id": 1, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}},
+        {"id": 5, "entry": {"tier": "standby", "active": false}},
+        {"id": 6, "entry": {"tier": "asap", "active": false, "admit_below": {"6h": 10, "24h": 30}}}
+      ],
+      "expect": [
+        ["room/asap/healthy", [1]],
+        ["room/normal/healthy", [2]],
+        ["room/inactive/healthy", [3, 6]],
+        ["room/standby/healthy", [4, 5]],
+        ["grace/normal/healthy", ["1*", "2*"]],
+        ["grace/inactive/healthy", ["3*", "6*"]],
+        ["grace/standby/healthy", ["4*", "5*"]],
+        ["overflow/normal/healthy", ["1*", "2*"]],
+        ["overflow/inactive/healthy", ["3*", "6*"]],
+        ["overflow/standby/healthy", ["4*", "5*"]]
+      ],
+      "limits": {"1": [3, 4, "unlimited"], "4": [3, 4, "unlimited"]}
+    },
+    {
+      "name": "尽快档准入：消耗到线、视同到线、负载未知、并发已满都不过，归入普通组",
+      "accounts": [
+        {"id": 1, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}, "inc6": 9.9, "inc24": 29.9},
+        {"id": 2, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}, "inc6": 10},
+        {"id": 3, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}, "inc24": 30},
+        {"id": 4, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}, "open_entry": true},
+        {"id": 5, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}, "unknown_active": true},
+        {"id": 6, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}, "concurrency_full": true},
+        {"id": 7, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}, "load_known": false},
+        {"id": 8, "max_sessions": 0}
+      ],
+      "expect": [
+        ["room/asap/healthy", [1]],
+        ["room/normal/healthy", [2, 3, 8]],
+        ["room/normal/busy", [4, 5, 6, 7]],
+        ["grace/normal/healthy", ["1*", "2*", "3*"]],
+        ["grace/normal/busy", ["4*", "5*", "6*", "7*"]],
+        ["overflow/normal/healthy", ["1*", "2*", "3*"]],
+        ["overflow/normal/busy", ["4*", "5*", "6*", "7*"]]
+      ],
+      "limits": {"8": [0]}
+    },
+    {
+      "name": "健康与临期：临期只在健康子集里提前，软线 full 与视同到线排到忙的一侧",
+      "accounts": [
+        {"id": 1, "max_sessions": 0},
+        {"id": 2, "max_sessions": 0, "entry": {"imminent": true}},
+        {"id": 3, "max_sessions": 0, "entry": {"imminent": true}, "pace_full": true},
+        {"id": 4, "max_sessions": 0, "pace_full": true},
+        {"id": 5, "max_sessions": 0, "entry": {"imminent": true}, "open_entry": true}
+      ],
+      "expect": [
+        ["room/normal/healthy/imminent", [2]],
+        ["room/normal/healthy", [1]],
+        ["room/normal/busy", [3, 4, 5]]
+      ]
+    },
+    {
+      "name": "会话分段：余量段 → 宽限段 → credits 余量段 → 溢出轮；宽限为 0 时没有宽限段",
+      "accounts": [
+        {"id": 1, "sessions": 3},
+        {"id": 2, "sessions": 4},
+        {"id": 3, "sessions": 2},
+        {"id": 4, "sessions": 3, "grace": 0},
+        {"id": 5, "used_7d": 99, "credits_ok": true, "entry": {"credits": {"level": 2, "expires_at": "2026-12-31T16:00:00Z"}}, "sessions": 1},
+        {"id": 6, "used_7d": 99, "entry": {"credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}, "sessions": 3},
+        {"id": 7, "sessions": 5, "max_sessions": 3, "grace": 2}
+      ],
+      "expect": [
+        ["room/normal/healthy", [3]],
+        ["grace/normal/healthy", [1, "3*"]],
+        ["credits_room", [5]],
+        ["overflow/normal/healthy", ["1*", 2, "3*", 4, 7]],
+        ["credits_overflow", [6, "5*"]]
+      ],
+      "limits": {"1": [4, "unlimited"], "3": [3, 4, "unlimited"], "5": [3, "unlimited"], "6": ["unlimited"], "4": ["unlimited"]}
+    },
+    {
+      "name": "credits 层严格按（级别，作废时刻，账号编号），不看原顺序",
+      "accounts": [
+        {"id": 9, "used_7d": 99.5, "entry": {"credits": {"level": 3, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 8, "used_7d": 99.5, "entry": {"credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 7, "used_7d": 99.5, "entry": {"credits": {"level": 1, "expires_at": "2026-11-30T16:00:00Z"}}},
+        {"id": 6, "used_7d": 99.5, "entry": {"credits": {"level": 1, "expires_at": "2026-11-30T16:00:00Z"}}},
+        {"id": 5, "used_7d": 99.5, "entry": {"credits": {"level": 2, "expires_at": "2026-10-31T16:00:00Z"}}, "max_sessions": 0}
+      ],
+      "expect": [
+        ["credits_room", [6, 7, 8, 5, 9]],
+        ["credits_overflow", ["6*", "7*", "8*", "9*"]]
+      ]
+    },
+    {
+      "name": "暂停与中转排在全部 OAuth 之后；中转不论档位",
+      "accounts": [
+        {"id": 1, "type": "relay", "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}},
+        {"id": 2, "used_7d": 99, "credits_ok": false, "entry": {"credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 3, "used_7d": 99, "window_unknown": true, "entry": {"credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 4, "used_7d": 99},
+        {"id": 5, "max_sessions": 0, "entry": {"tier": "standby"}},
+        {"id": 6, "type": "relay"}
+      ],
+      "expect": [
+        ["room/standby/healthy", [5]],
+        ["paused", [2, 3, 4]],
+        ["relay", [1, 6]]
+      ]
+    },
+    {
+      "name": "负载未知（第 3 层、负载读取失败）：全部按忙，尽快档不准入，临期不提前，组序与层序照常",
+      "all": {"load_known": false},
+      "accounts": [
+        {"id": 1, "max_sessions": 0, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}},
+        {"id": 2, "max_sessions": 0, "entry": {"imminent": true}},
+        {"id": 3, "max_sessions": 0, "entry": {"tier": "standby"}},
+        {"id": 4, "max_sessions": 0, "used_7d": 99, "entry": {"credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}}
+      ],
+      "expect": [
+        ["room/normal/busy", [1, 2]],
+        ["room/standby/busy", [3]],
+        ["credits_room", [4]]
+      ]
+    },
+    {
+      "name": "没有会话计数：全部在余量段，不登记、没有重试位置",
+      "all": {"sessions_known": false},
+      "accounts": [
+        {"id": 1, "sessions": 9},
+        {"id": 2, "used_7d": 99, "sessions": 9, "entry": {"credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}}
+      ],
+      "expect": [
+        ["room/normal/healthy", [1]],
+        ["credits_room", [2]]
+      ],
+      "limits": {"1": [0], "2": [0]}
+    },
+    {
+      "name": "降段跨轮保留：已降到宽限段的账号不回到余量段，尽快身份随之失去",
+      "demoted": {"1": "grace", "2": "overflow", "3": "credits_overflow"},
+      "accounts": [
+        {"id": 1, "entry": {"tier": "asap", "admit_below": {"6h": 10, "24h": 30}}},
+        {"id": 2},
+        {"id": 3, "used_7d": 99, "entry": {"credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 4}
+      ],
+      "expect": [
+        ["room/normal/healthy", [4]],
+        ["grace/normal/healthy", [1, "4*"]],
+        ["overflow/normal/healthy", ["1*", 2, "4*"]],
+        ["credits_overflow", [3]]
+      ],
+      "limits": {"1": [4, "unlimited"], "2": ["unlimited"], "3": ["unlimited"]}
+    },
+    {
+      "name": "生效会话上限取条目的覆盖值",
+      "accounts": [
+        {"id": 1, "sessions": 2, "max_sessions": 3, "grace": 0, "entry": {"max_sessions": 2}},
+        {"id": 2, "sessions": 2, "max_sessions": 3, "grace": 0}
+      ],
+      "expect": [
+        ["room/normal/healthy", [2]],
+        ["overflow/normal/healthy", [1, "2*"]]
+      ],
+      "limits": {"1": ["unlimited"], "2": [3, "unlimited"]}
+    },
+    {
+      "name": "第一层账号的条目给了 credits：在 credits 段预留改判后的重试位置，排在 credits 本来的成员之后、中转之前",
+      "accounts": [
+        {"id": 1, "entry": {"credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 2, "used_7d": 99, "entry": {"credits": {"level": 2, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 3, "type": "relay"}
+      ],
+      "expect": [
+        ["room/normal/healthy", [1]],
+        ["grace/normal/healthy", ["1*"]],
+        ["credits_room", [2, "1*"]],
+        ["overflow/normal/healthy", ["1*"]],
+        ["credits_overflow", ["1*", "2*"]],
+        ["relay", [3]]
+      ],
+      "limits": {"1": [3, 4, 3, "unlimited", "unlimited"], "2": [3, "unlimited"]}
+    }
+  ]
+}
