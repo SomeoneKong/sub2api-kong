@@ -22,6 +22,7 @@
 - **OpenAI 请求体快速路径**（跳过必然不改写的处理、复用顶层查找，设计见 `DESIGN-openai-request-body-fastpath.md`）
 - **账号计划执行端用到的管理端点**（按到期时间指定重置卡的用卡端点，设计见
   `DESIGN-openai-plan-reset-by-expiry.md`）
+- **请求存活续期**（并发槽与会话登记在请求进行中续期，设计见 `DESIGN-request-liveness.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
@@ -242,6 +243,20 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
 - **只加文件，不改上游接口**。`kong-reset-quota` 的 handler 通过接口断言取服务层的 `KongResetCreditByExpiry`，不往
   上游的 `openAIQuotaService` 接口里加方法（那会连带改上游测试桩）。到期时间在服务层现查卡明细换成卡 ID，卡 ID
   仍不出服务层；`redeem_request_id` 由调用方稳定生成、原样交上游做幂等。碰上游的只有 `routes/admin.go` 一行。
+
+### 请求存活续期
+
+- **挂在 `ConcurrencyService` 的三个获取入口，会话跟着账号槽走**。`concurrency_service.go` 里账号槽（含不限并发的
+  分支）、用户槽、API Key 占用返回的释放函数各包一层 `kongTrack`，结构体加一个可选字段；进程内一个续期器
+  （`kong_request_liveness.go`）每 30 秒刷新在途占用，并发槽只刷新仍存在的成员
+  （`repository/kong_concurrency_liveness.go`），会话只刷新已有的登记（上游 `RefreshSession`），释放时先注销、
+  结束刷新交给续期器异步执行。账号槽的会话计数身份取自请求上下文，所以 handler 里新增的抢槽路径（重试、换号、
+  借用）不必另接；但新增的 OpenAI 入口要在算出会话哈希后放进上下文（见会话数上限一节）。
+- **rebase 时复核**：上游若新增不经这三个入口的占槽方式，要一并接上；若改了这三个入口的释放函数形状，`kongTrack`
+  的包装位置要跟着调。
+- **装配**（`wire_gen.go`）：建续期器，`SetKongRequestLiveness` 分别注入并发服务与网关服务，然后 `Start`；cleanup
+  里 `StopKongRequestLiveness`。
+- **不要让续期加入会话**：选号先抢槽、再确认名额，被拒的尝试不能被计入。
 
 ## 本地验证的已知差异
 
