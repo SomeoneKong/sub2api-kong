@@ -1,10 +1,9 @@
 /**
  * OpenAI OAuth 账号的会话数上限（设计见 DESIGN-openai-session-limit.md）。
  *
- * 上限存在账号 extra 的 max_sessions，空即不限制。设置上限时一并写入空闲超时 15 分钟（若 extra 里还没有）：
- * 会话只在请求开始时登记，空闲超时必须覆盖单个请求的时长，上游默认的 5 分钟会把长请求中途算作会话结束。
+ * 上限存在账号 extra 的 max_sessions，空即不限制。空闲超时不在这里写入：没有这个键时按后端缺省 5 分钟；
+ * 会话在请求进行中与结束时都会续期（DESIGN-request-liveness.md），空闲超时只需覆盖请求之间的停顿。
  */
-export const OPENAI_SESSION_IDLE_TIMEOUT_MINUTES = 15
 
 interface AccountKind {
   platform?: string | null
@@ -51,9 +50,6 @@ export function applyOpenAISessionLimit(
     delete extra.session_idle_timeout_minutes
   } else {
     extra.max_sessions = next
-    if (normalizeMaxSessions(extra.session_idle_timeout_minutes) === null) {
-      extra.session_idle_timeout_minutes = OPENAI_SESSION_IDLE_TIMEOUT_MINUTES
-    }
   }
   updatePayload.extra = extra
 }
