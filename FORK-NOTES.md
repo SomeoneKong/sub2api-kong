@@ -23,6 +23,8 @@
 - **账号计划执行端用到的管理端点**（按到期时间指定重置卡的用卡端点，设计见
   `DESIGN-openai-plan-reset-by-expiry.md`）
 - **请求存活续期**（并发槽与会话登记在请求进行中续期，设计见 `DESIGN-request-liveness.md`）
+- **账号选择与 credits**（计划输入生效时的定层、两轮排序、credits 层与容量视图，设计见
+  `DESIGN-openai-plan-dispatch.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
@@ -257,6 +259,38 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
 - **装配**（`wire_gen.go`）：建续期器，`SetKongRequestLiveness` 分别注入并发服务与网关服务，然后 `Start`；cleanup
   里 `StopKongRequestLiveness`。
 - **不要让续期加入会话**：选号先抢槽、再确认名额，被拒的尝试不能被计入。
+
+### 账号选择与 credits
+
+设计见 `DESIGN-openai-plan-dispatch.md`。全部是单行 `[kong]` 挂钩，挂在旧版选号、生效上限、两条暂停路径、绑定
+的复用与写入、WS 逐轮复核和额度写入处。新逻辑在 `kong_plan_*.go`、`kong_pool_capacity.go` 与 repository /
+handler / routes 下的同名文件，另有几处在节奏与会话组件里（设计第 12 节）。
+
+- **选号**（`openai_gateway_scheduling.go` 的 `selectAccountWithLoadAwareness`）：第 2 层入口 `kongPlanBegin`，过
+  滤满并发账号之前 `keepLoads`（决策记录用）、会话分段处 `preferRoomLoads`、最终顺序处 `sequenceLoads`，主循
+  环、负载读取失败、第 3 层三个尝试循环在每个位置开头 `next`、抢到槽后（第 3 层在返回等待计划之前）`confirm`，
+  非批量分支入口的 `!kongPlanInEffect()` 条件（计划生效时绕开非批量分支、改走完整循环）与负载读取
+  `kongPlanLoadBatch`（这时按负载读取失败处理），负载读取失败分支 `preferRoomAccounts`、第 3 层 `roomFirst`。
+- **生效上限**：全部抢槽与等待计划的并发上限换成 `KongEffectiveConcurrency`（选号、续接、guardian），负载率的分母
+  `kongEffectiveLoadFactor`，handler 的 WS 后续轮次与同账号重试用 `KongWSTurnConcurrency`。
+- **暂停路径**：A 路径 `shouldAutoPauseOpenAIAccountByQuota` 两处 `kongPlanSkip7d`、B 路径
+  `account_scheduling_threshold_eval.go` 一处 `kongPlanDrop7dCandidates`（credits 层去掉 7d 候选，判不出时只写
+  短标记）。
+- **绑定**：复用前粘性第 1 层、非批量粘性与 guardian 调 `kongPlanReuseSticky`，续接调 `kongPlanReuseResponse` 并用
+  `kongPlanKeepResponseBindings` 包住绑定存储；会话绑定写入前 `kongPlanMarkSession`（在
+  `openai_sticky_compat.go` 的共用绑定函数里，所有会话绑定都经它）、token 计数用的非批量选号在写绑定处加
+  `!kongPlanInEffect()`（计划生效时只复用、不新绑）、利润门之后 `kongPlanReplaceBinding`，响应绑定的六个写入点
+  前 `kongPlanMarkResponse`。
+- **WS 与额度写入**：`openai_gateway_handler.go` 的 WS 建连 `KongPlanWSBegin`、每轮 `KongPlanWSTurnAllowed`；
+  `openai_quota_service.go` 写额度快照前 `kongPlanLedger.Observe` 与 `kongQuotaUsageWrites`，
+  `openai_quota_auto_reset.go` 两处同一个窗口转换；`handler.go` 一个字段、`router.go` 一行注册
+  `/api/v1/pool`。
+- **装配**（`wire_gen.go`）：存储与决策记录各自 `Start`，直接给 `AdminHandlers` 赋 `KongPlan` 字段，记账接到节奏组
+  件与额度服务（`SetKongPlanLedger`），`SetKongPlanRuntime` 装上运行时。
+- **rebase 时复核**：定层的"已到 7d 阈值"（`kongPlanReached7d`）与阈值（`windowThresholdPercent`）复刻了 A、B 两条
+  暂停路径的判定，上游改这两处时要同步；上游新增的会话绑定写入要经那个共用函数、不经两轮排序、也不是续接命中的
+  选号，不得在计划生效时写新绑定、新增的响应绑定写入点要先写续接标记、新增的选号循环要消费 `next` /
+  `confirm`、新增的并发上限读取点要用生效上限；漏接不报错，只会让计划输入在那条路径上失效。
 
 ## 本地验证的已知差异
 
