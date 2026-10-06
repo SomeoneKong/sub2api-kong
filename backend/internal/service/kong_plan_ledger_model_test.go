@@ -12,7 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// 共用夹具 testdata/kong_plan/balance_timelines.json：边车的余额账本跑同一份。
+// 共用夹具 testdata/kong_plan/balance_timelines.json：边车的余额账本跑同一份。夹具里的账号套餐系数都是 1，
+// 点与本账号百分点相同。
 
 type kongPlanTimelineFile struct {
 	Cases []struct {
@@ -56,7 +57,7 @@ func TestKongPlanBalanceTimelines(t *testing.T) {
 					for _, e := range entries {
 						hasOpen = hasOpen || !e.Settled
 					}
-					kongPlanApplyObservation(st, kongPlanObservation{At: now, Balance: ev.Balance}, tc.PerPoint, hasOpen)
+					kongPlanApplyObservation(st, kongPlanObservation{At: now, Balance: ev.Balance}, tc.PerPoint, 1, hasOpen)
 				case "enter":
 					if entries[ev.Seq] == nil {
 						entries[ev.Seq] = &KongPlanTierEntry{Seq: ev.Seq, EnteredAt: now}

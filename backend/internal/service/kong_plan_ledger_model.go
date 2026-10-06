@@ -39,11 +39,13 @@ func kongPlanMarkUnknown(st *kongPaceAccountState, at time.Time) {
 	}
 }
 
-// kongPlanApplyObservation 用一次观测推进账号的余额记账。hasOpen：账号此刻有未结算的入层。
+// kongPlanApplyObservation 用一次观测推进账号的余额记账。perPoint 是一点合多少 credits，k 是观测时刻账号的套餐系数
+// （取不到为 0）；hasOpen：账号此刻有未结算的入层。
 //   - 只对源查询时刻比基点新、带余额数值的观测计算差额；同一次下降不会记两次。不看账号当时在哪一层。
-//   - 下降量 ÷ perPoint 记为消耗，记在观测的源查询时刻；perPoint 未知时改记一个"未知"。余额上升不记消耗。
+//   - 下降量 ÷ (perPoint × k) 折成本账号百分点记为消耗，记在观测的源查询时刻；perPoint 或 k 未知时改记一个"未知"。
+//     余额上升不记消耗。
 //   - 没有数值的观测不推进基点。还没有基点时，首个有数值的观测只建立基点；此前已经入层的，这段消耗无法还原，记"未知"。
-func kongPlanApplyObservation(st *kongPaceAccountState, obs kongPlanObservation, perPoint *float64, hasOpen bool) {
+func kongPlanApplyObservation(st *kongPaceAccountState, obs kongPlanObservation, perPoint *float64, k float64, hasOpen bool) {
 	if obs.Balance == nil {
 		return
 	}
@@ -58,11 +60,11 @@ func kongPlanApplyObservation(st *kongPaceAccountState, obs kongPlanObservation,
 	default:
 		if drop := st.Balance.Value - v; drop > 0 {
 			points := math.NaN()
-			if perPoint != nil && *perPoint > 0 {
-				points = drop / *perPoint
+			if perPoint != nil && *perPoint > 0 && k > 0 {
+				points = drop / (*perPoint * k)
 			}
 			if math.IsNaN(points) || math.IsInf(points, 0) {
-				kongPlanMarkUnknown(st, obs.At) // 换算率未知，或小到换算结果溢出
+				kongPlanMarkUnknown(st, obs.At) // 换算率或套餐系数未知，或小到换算结果溢出
 			} else {
 				kongPaceAddRise(st, kongPaceRise{At: obs.At, Points: points, ReadingAt: obs.At, Credits: true})
 			}

@@ -48,7 +48,7 @@ func (r *KongPaceAccountRow) inactiveReading() bool {
 // 第 4.2 节第 5 步）：7d 读数到顶后不再上涨，账号回到第一层后软线仍要看得到它。
 type kongPaceRise struct {
 	At        time.Time `json:"at"`                // 记账时刻
-	Points    float64   `json:"points"`            // 上涨的百分点
+	Points    float64   `json:"points"`            // 上涨的本账号百分点（按状态里记下的规格）
 	ReadingAt time.Time `json:"reading_at"`        // 带来这次上涨的读数时刻
 	Credits   bool      `json:"credits,omitempty"` // 余额补记
 }
@@ -81,8 +81,13 @@ type kongPaceAccountState struct {
 	WindowSeq int64 `json:"window_seq,omitempty"`
 	// Balance 是最近一次有数值的余额观测（源查询时刻与余额），补记以它为基点。
 	Balance *kongPlanBalancePoint `json:"balance,omitempty"`
-	// UnknownUntil 之前账号有一段无法换算的 credits 消耗（换算率未知、没有基点），视同到线。
+	// UnknownUntil 之前账号有一段无法换算的 credits 消耗（换算率或套餐系数未知、没有基点），视同到线。
 	UnknownUntil time.Time `json:"unknown_until,omitempty"`
+	// Multiple 是上次记下的规格倍数（K × 单位倍数，老 pro 20、新 pro 10），已记的上涨是这个规格的百分点；0 表示还没记过。
+	// 记倍数而不是 K：改内部单位时 K 一起变，规格没变。
+	Multiple float64 `json:"multiple,omitempty"`
+	// LegacyK 是此前的版本记下的套餐系数（按单位 20 理解），只读：记下倍数时清掉。
+	LegacyK float64 `json:"k,omitempty"`
 }
 
 // kongPlanBalancePoint 是一次有数值的余额观测。
@@ -213,6 +218,33 @@ func kongPaceSetBaseline(st *kongPaceAccountState, row KongPaceAccountRow) {
 	st.ResetAt = *row.ResetAt
 	st.MaxUsed = *row.UsedPercent
 	st.ReadingAt = *row.UsageUpdatedAt
+}
+
+// kongPaceApplyMultiple 记下账号此刻的规格倍数 m。倍数变了（如老 pro 从 x20 降到 x10）时，已记的上涨（含 credits
+// 补记）乘 旧倍数/新倍数（即 旧K/新K）折成新规格的本账号百分点：点数不变，同样的消耗占新额度的比例跟着变；读数基点
+// （MaxUsed 等）照旧。第一次记（还没有旧值）只记不折算。调用方要在追加本拍的新上涨之前调用：新上涨已是新规格的。
+// 返回原来的倍数与是否折算了。
+func kongPaceApplyMultiple(st *kongPaceAccountState, m float64) (float64, bool) {
+	if st == nil || !(m > 0) {
+		return 0, false
+	}
+	old := st.Multiple
+	if old == 0 && st.LegacyK > 0 {
+		old = st.LegacyK * kongPlanDefaultUnitMultiple
+	}
+	// 倍数由 K × 单位算出，同一规格换了单位可能差一点舍入误差：不算变化，沿用记下的值，误差不会累积。
+	if old > 0 && math.Abs(old-m) <= 1e-9*math.Max(old, m) {
+		st.Multiple, st.LegacyK = old, 0
+		return old, false
+	}
+	if old > 0 {
+		ratio := old / m
+		for i := range st.Rises {
+			st.Rises[i].Points *= ratio
+		}
+	}
+	st.Multiple, st.LegacyK = m, 0
+	return old, old > 0
 }
 
 // kongPaceAddRise 按记账时刻有序地加一条上涨：余额补记记在观测的源查询时刻，可能早于已有的记录。

@@ -153,6 +153,7 @@ func (s *OpenAIGatewayService) KongPoolCapacity(ctx context.Context) (*KongPoolC
 		if limit := kongPlanEffectiveMaxSessions(res.Entry, acc); limit > 0 {
 			capPP = math.Min(capPP, float64(limit)*perSession)
 		}
+		k := p.kAt(now) // 此刻的套餐系数：把本账号百分点换成点
 		switch res.Layer {
 		case kongPlanLayerSubscription:
 			used := 0.0 // 与 A 路径同一种读法：重置时刻已过、或读数陈旧又没有待到的重置时，旧用量不再算数
@@ -160,7 +161,7 @@ func (s *OpenAIGatewayService) KongPoolCapacity(ctx context.Context) (*KongPoolC
 				used = u * 100
 			}
 			room := rt.windowThresholdPercent(ctx, acc, "7d", now) - used
-			v := math.Max(0, math.Min(room, capPP)) * p.K
+			v := math.Max(0, math.Min(room, capPP)) * k
 			if v <= 0 {
 				continue
 			}
@@ -184,13 +185,14 @@ func (s *OpenAIGatewayService) KongPoolCapacity(ctx context.Context) (*KongPoolC
 					sum := *lv.BalanceCredits + bal.Value
 					lv.BalanceCredits = &sum
 				}
-				if perPoint != nil && *perPoint > 0 {
-					v = math.Min(v, math.Max(0, bal.Value-st.control.Floor) / *perPoint)
+				if perPoint != nil && *perPoint > 0 && k > 0 {
+					// 余额折成本账号百分点：一个本账号百分点合 perPoint × K 个 credits
+					v = math.Min(v, math.Max(0, bal.Value-st.control.Floor)/(*perPoint*k))
 				}
 			} else {
 				lv.BalanceCredits = nil
 			}
-			v *= p.K
+			v *= k
 			lv.PPPerHour += v
 			lv.Accounts++
 		default:

@@ -362,7 +362,8 @@ func kongPlanPublishMetadata(p KongPlanPublishState) map[string]string {
 	}
 }
 
-// PerPoint 返回人工约束里的换算率（一个本账号百分点折合多少 credits）；未知或状态还没加载时为 nil。
+// PerPoint 返回人工约束里的换算率（一点合多少 credits）；未知或状态还没加载时为 nil。换成本账号百分点还要乘账号的
+// 套餐系数（AccountK）。
 func (s *KongPlanStore) PerPoint() *float64 {
 	st := s.current()
 	if st == nil || st.control.PerPoint == nil {
@@ -370,6 +371,37 @@ func (s *KongPlanStore) PerPoint() *float64 {
 	}
 	v := *st.control.PerPoint
 	return &v
+}
+
+// AccountK 从最近一次保存的慢速部分取账号在 at 时刻的套餐系数。没有慢速部分、或其中没有这个账号时 ok 为 false。
+// 慢速部分过期也照样取：时间线里写着已知的切换，边车停了也能按时刻取到正确的系数。
+func (s *KongPlanStore) AccountK(id int64, at time.Time) (float64, bool) {
+	k, _, ok := s.accountK(id, at)
+	return k, ok
+}
+
+// AccountMultiple 返回账号在 at 时刻的规格倍数 = K × 单位倍数（老 pro 20、新 pro 10）。它与内部单位无关：单位从 x20
+// 改成 x10 时所有账号的 K 一起翻倍，倍数不变。取不到的情形同 AccountK。
+func (s *KongPlanStore) AccountMultiple(id int64, at time.Time) (float64, bool) {
+	k, unit, ok := s.accountK(id, at)
+	return k * unit, ok
+}
+
+// accountK 从同一份慢速部分取账号的套餐系数与单位倍数。
+func (s *KongPlanStore) accountK(id int64, at time.Time) (k, unit float64, ok bool) {
+	if s == nil {
+		return 0, 0, false
+	}
+	st := s.current()
+	if st == nil || st.forecast == nil {
+		return 0, 0, false
+	}
+	for _, a := range st.forecast.Accounts {
+		if a.ID == id {
+			return a.kAt(at), st.forecast.unitMultiple(), true
+		}
+	}
+	return 0, 0, false
 }
 
 // KongPlanDispatchResult 是发布的成功响应。

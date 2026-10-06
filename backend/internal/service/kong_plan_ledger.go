@@ -59,7 +59,7 @@ type KongPlanLedger struct {
 	latest map[int64]kongPlanBalancePoint
 }
 
-// NewKongPlanLedger 创建记账组件。plan 提供换算率（人工约束）。
+// NewKongPlanLedger 创建记账组件。plan 提供换算率（人工约束）与账号的套餐系数（慢速部分）。
 func NewKongPlanLedger(store KongPlanLedgerStore, plan *KongPlanStore) *KongPlanLedger {
 	return &KongPlanLedger{store: store, plan: plan,
 		entries: map[int64]map[int64]*KongPlanTierEntry{}, latest: map[int64]kongPlanBalancePoint{}}
@@ -284,9 +284,25 @@ func (l *KongPlanLedger) perPoint() *float64 {
 	return l.plan.PerPoint()
 }
 
+// accountK 取慢速部分里账号在 at 时刻的套餐系数（KongPlanStore.AccountK）；没有计划组件时 ok 为 false。
+func (l *KongPlanLedger) accountK(id int64, at time.Time) (float64, bool) {
+	if l == nil || l.plan == nil {
+		return 0, false
+	}
+	return l.plan.AccountK(id, at)
+}
+
+// accountMultiple 取账号在 at 时刻的规格倍数（KongPlanStore.AccountMultiple）；没有计划组件时 ok 为 false。
+func (l *KongPlanLedger) accountMultiple(id int64, at time.Time) (float64, bool) {
+	if l == nil || l.plan == nil {
+		return 0, false
+	}
+	return l.plan.AccountMultiple(id, at)
+}
+
 // advance 处理待处理的观测并判断结算，直接改 states 里的节奏状态（推进者持有的工作副本）。返回要随节奏状态一起
 // 提交的部分，以及提交成功之后才应用到镜像的结算。tracked 是推进者认识的账号（OpenAI OAuth、非影子）：
-// 别的账号的观测直接删掉。
+// 别的账号的观测直接删掉。now 是本拍时刻，源时刻晚于它的观测这一拍不处理。
 func (l *KongPlanLedger) advance(ctx context.Context, states map[int64]*kongPaceAccountState, tracked map[int64]bool, now time.Time) (KongPaceCommitExtra, func(), error) {
 	var extra KongPaceCommitExtra
 	raws, err := l.store.ListObservations(ctx)
@@ -317,12 +333,17 @@ func (l *KongPlanLedger) advance(ctx context.Context, states map[int64]*kongPace
 	})
 	perPoint := l.perPoint()
 	for _, it := range items {
+		if it.obs.At.After(now) {
+			// 源时刻晚于本拍时刻（推进者取时刻之后才登记的）：留在列表里到下一拍处理，那时记下的规格倍数已不早于它。
+			continue
+		}
 		extra.DoneObservations = append(extra.DoneObservations, it.raw)
 		st := states[it.obs.AccountID]
 		if st == nil || !tracked[it.obs.AccountID] {
 			continue
 		}
-		kongPlanApplyObservation(st, it.obs, perPoint, l.hasOpen(it.obs.AccountID))
+		k, _ := l.accountK(it.obs.AccountID, it.obs.At) // 慢速部分里没有这个账号时为 0，按未知记
+		kongPlanApplyObservation(st, it.obs, perPoint, k, l.hasOpen(it.obs.AccountID))
 	}
 
 	l.mu.RLock()

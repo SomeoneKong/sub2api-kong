@@ -146,28 +146,61 @@ type KongPlanReleaseRequest struct {
 	Note     string
 }
 
+// kongPlanDefaultUnitMultiple 是没给单位倍数时的取值：点是 x20 账号周额度的 1%。
+const kongPlanDefaultUnitMultiple = 20.0
+
 // KongPlanForecast 是容量视图的慢速部分。forecast、runway_h、credits_runway_h 原样转给调用方。
 type KongPlanForecast struct {
-	CycleID                 string                    `json:"cycle_id"`
-	PlanVersion             int64                     `json:"plan_version"`
-	ComputedAt              time.Time                 `json:"computed_at"`
-	IntervalMin             int                       `json:"interval_min"`
-	PerSessionPPPerHour     float64                   `json:"per_session_pp_per_hour"`
-	AvgSessionPP            float64                   `json:"avg_session_pp"`
-	DemandEstimatePPPerHour float64                   `json:"demand_estimate_pp_per_hour"`
-	Accounts                []KongPlanForecastAccount `json:"accounts"`
-	Forecast                json.RawMessage           `json:"forecast"`
-	RunwayH                 json.RawMessage           `json:"runway_h"`
-	CreditsRunwayH          json.RawMessage           `json:"credits_runway_h"`
-	NextResetAt             *time.Time                `json:"next_reset_at"`
-	ReceivedAt              time.Time                 `json:"received_at"`
+	CycleID                 string    `json:"cycle_id"`
+	PlanVersion             int64     `json:"plan_version"`
+	ComputedAt              time.Time `json:"computed_at"`
+	IntervalMin             int       `json:"interval_min"`
+	PerSessionPPPerHour     float64   `json:"per_session_pp_per_hour"`
+	AvgSessionPP            float64   `json:"avg_session_pp"`
+	DemandEstimatePPPerHour float64   `json:"demand_estimate_pp_per_hour"`
+	// UnitMultiple 是内部单位的倍数：点是 x(UnitMultiple) 账号周额度的 1%，K = 账号倍数 ÷ UnitMultiple。
+	UnitMultiple   float64                   `json:"unit_multiple"`
+	Accounts       []KongPlanForecastAccount `json:"accounts"`
+	Forecast       json.RawMessage           `json:"forecast"`
+	RunwayH        json.RawMessage           `json:"runway_h"`
+	CreditsRunwayH json.RawMessage           `json:"credits_runway_h"`
+	NextResetAt    *time.Time                `json:"next_reset_at"`
+	ReceivedAt     time.Time                 `json:"received_at"`
 }
 
-// KongPlanForecastAccount 是当前能力用到的账号参数：套餐系数与深度线速度。
+// unitMultiple 返回单位倍数；更早保存、没有这一项的慢速部分按 20。
+func (f *KongPlanForecast) unitMultiple() float64 {
+	if f.UnitMultiple > 0 {
+		return f.UnitMultiple
+	}
+	return kongPlanDefaultUnitMultiple
+}
+
+// KongPlanForecastAccount 是账号参数：套餐系数 K（一份周额度合多少个 100 点）、它的时间线与深度线速度。
 type KongPlanForecastAccount struct {
-	ID             int64   `json:"id"`
-	K              float64 `json:"k"`
-	DepthPPPerHour float64 `json:"depth_pp_per_hour"`
+	ID             int64              `json:"id"`
+	K              float64            `json:"k"`
+	KTimeline      []KongPlanKSegment `json:"k_timeline"`
+	DepthPPPerHour float64            `json:"depth_pp_per_hour"`
+}
+
+// KongPlanKSegment 是套餐系数时间线的一段：从 From 起系数为 K，直到下一段的起点。
+type KongPlanKSegment struct {
+	From time.Time `json:"from"`
+	K    float64   `json:"k"`
+}
+
+// kAt 返回账号在 at 时刻的套餐系数：时间线里最后一个起点不晚于 at 的分段；没有这样的分段（时间线为空或全在
+// 未来）时用 K。时间线已按起点严格升序校验过。
+func (a KongPlanForecastAccount) kAt(at time.Time) float64 {
+	k := a.K
+	for _, s := range a.KTimeline {
+		if s.From.After(at) {
+			break
+		}
+		k = s.K
+	}
+	return k
 }
 
 // KongPoolCallerRequest 是调用方声明。
@@ -628,6 +661,7 @@ func ParseKongPlanForecast(body io.Reader) (*KongPlanForecast, error) {
 		PerSessionPPPerHour     *float64                   `json:"per_session_pp_per_hour"`
 		AvgSessionPP            *float64                   `json:"avg_session_pp"`
 		DemandEstimatePPPerHour *float64                   `json:"demand_estimate_pp_per_hour"`
+		UnitMultiple            *float64                   `json:"unit_multiple"`
 		Accounts                *[]KongPlanForecastAccount `json:"accounts"`
 		Forecast                json.RawMessage            `json:"forecast"`
 		RunwayH                 json.RawMessage            `json:"runway_h"`
@@ -659,6 +693,13 @@ func ParseKongPlanForecast(body io.Reader) (*KongPlanForecast, error) {
 			return nil, kongPlanInvalid(field, field+" 必填且不能为负")
 		}
 	}
+	unit := kongPlanDefaultUnitMultiple
+	if raw.UnitMultiple != nil {
+		if !(*raw.UnitMultiple > 0) {
+			return nil, kongPlanInvalid("unit_multiple", "unit_multiple 必须为正数（不给时按 20）")
+		}
+		unit = *raw.UnitMultiple
+	}
 	if raw.Accounts == nil {
 		return nil, kongPlanInvalid("accounts", "accounts 必填（可以是空数组）")
 	}
@@ -671,6 +712,11 @@ func ParseKongPlanForecast(body io.Reader) (*KongPlanForecast, error) {
 		if i > 0 && accounts[i-1].ID == a.ID {
 			return nil, kongPlanInvalid("accounts", fmt.Sprintf("accounts 里账号 %d 重复", a.ID))
 		}
+		timeline, err := kongPlanCheckKTimeline(a.KTimeline, a.ID)
+		if err != nil {
+			return nil, err
+		}
+		accounts[i].KTimeline = timeline
 	}
 	f := &KongPlanForecast{
 		CycleID:                 *raw.CycleID,
@@ -680,6 +726,7 @@ func ParseKongPlanForecast(body io.Reader) (*KongPlanForecast, error) {
 		PerSessionPPPerHour:     *raw.PerSessionPPPerHour,
 		AvgSessionPP:            *raw.AvgSessionPP,
 		DemandEstimatePPPerHour: *raw.DemandEstimatePPPerHour,
+		UnitMultiple:            unit,
 		Accounts:                accounts,
 		Forecast:                kongPlanRawOrNull(raw.Forecast),
 		RunwayH:                 kongPlanRawOrNull(raw.RunwayH),
@@ -693,6 +740,28 @@ func ParseKongPlanForecast(body io.Reader) (*KongPlanForecast, error) {
 		f.NextResetAt = &at
 	}
 	return f, nil
+}
+
+// kongPlanCheckKTimeline 校验账号的套餐系数时间线并把起点统一成 UTC：起点必填、严格升序，系数为正。
+func kongPlanCheckKTimeline(raw []KongPlanKSegment, id int64) ([]KongPlanKSegment, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]KongPlanKSegment, len(raw))
+	for i, s := range raw {
+		from := s.From.UTC()
+		if s.From.IsZero() || from.Year() < 1 || from.Year() > 9999 {
+			return nil, kongPlanInvalid("accounts", fmt.Sprintf("账号 %d 的 k_timeline[%d].from 必填且在可表示的年份内", id, i))
+		}
+		if !(s.K > 0) {
+			return nil, kongPlanInvalid("accounts", fmt.Sprintf("账号 %d 的 k_timeline[%d].k 必须为正", id, i))
+		}
+		if i > 0 && !from.After(out[i-1].From) {
+			return nil, kongPlanInvalid("accounts", fmt.Sprintf("账号 %d 的 k_timeline 起点必须严格升序", id))
+		}
+		out[i] = KongPlanKSegment{From: from, K: s.K}
+	}
+	return out, nil
 }
 
 func kongPlanRawOrNull(m json.RawMessage) json.RawMessage {

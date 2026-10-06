@@ -20,8 +20,8 @@ func TestKongPlanApplyObservation_TinyPerPointMarksUnknown(t *testing.T) {
 	st := &kongPaceAccountState{}
 	t0 := time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)
 	tiny := 1e-320
-	kongPlanApplyObservation(st, kongPlanObservation{At: t0, Balance: kongPlanF(1000)}, &tiny, false)
-	kongPlanApplyObservation(st, kongPlanObservation{At: t0.Add(time.Hour), Balance: kongPlanF(999)}, &tiny, false)
+	kongPlanApplyObservation(st, kongPlanObservation{At: t0, Balance: kongPlanF(1000)}, &tiny, 1, false)
+	kongPlanApplyObservation(st, kongPlanObservation{At: t0.Add(time.Hour), Balance: kongPlanF(999)}, &tiny, 1, false)
 	for _, r := range st.Rises {
 		require.False(t, math.IsInf(r.Points, 0), "换算结果溢出不能记成消耗")
 	}

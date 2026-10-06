@@ -205,8 +205,10 @@
       "steps": [
         {"method": "PUT", "path": "/forecast",
          "body": {"cycle_id": "c1", "plan_version": 5, "computed_at": "2026-10-02T14:00:00+08:00", "interval_min": 60,
-                  "per_session_pp_per_hour": 1.5, "avg_session_pp": 0.8, "demand_estimate_pp_per_hour": 10.1,
-                  "accounts": [{"id": 1, "k": 1.0, "depth_pp_per_hour": 2.5}], "forecast": [], "runway_h": {"immediate": 67},
+                  "per_session_pp_per_hour": 1.5, "avg_session_pp": 0.8, "demand_estimate_pp_per_hour": 10.1, "unit_multiple": 20,
+                  "accounts": [{"id": 1, "k": 1.0, "depth_pp_per_hour": 2.5,
+                                "k_timeline": [{"from": "2026-10-30T15:00:00+08:00", "k": 0.5}]}],
+                  "forecast": [], "runway_h": {"immediate": 67},
                   "credits_runway_h": [{"level": 1, "hours": null}], "next_reset_at": "2026-10-03T01:00:00+08:00"},
          "expect": {"status": 200, "data": {"accepted": true}}},
         {"method": "PUT", "path": "/forecast",
@@ -216,7 +218,11 @@
         {"method": "PUT", "path": "/forecast",
          "body": {"cycle_id": "c2", "plan_version": 5, "computed_at": "2026-10-02T15:00:00+08:00", "interval_min": 60,
                   "per_session_pp_per_hour": 1.5, "avg_session_pp": 0.8, "demand_estimate_pp_per_hour": 10.1, "accounts": [], "tight": true},
-         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "tight"}}}
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "tight"}}},
+        {"method": "PUT", "path": "/forecast",
+         "body": {"cycle_id": "c2", "plan_version": 5, "computed_at": "2026-10-02T15:00:00+08:00", "interval_min": 60,
+                  "per_session_pp_per_hour": 1.5, "avg_session_pp": 0.8, "demand_estimate_pp_per_hour": 10.1, "accounts": [], "unit_multiple": 0},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "unit_multiple"}}}
       ]
     },
     {

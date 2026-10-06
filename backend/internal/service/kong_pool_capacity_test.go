@@ -26,14 +26,20 @@ func (h *kongPlanTierHarness) forecast(t *testing.T, cycle string, computedAt ti
 	for i, id := range ids {
 		accs[i] = fmt.Sprintf(`{"id": %d, "k": 1, "depth_pp_per_hour": 2.5}`, id)
 	}
+	h.forecastAccounts(t, cycle, computedAt, "["+strings.Join(accs, ",")+"]")
+}
+
+// forecastAccounts 写一份慢速部分，账号参数直接给 JSON 数组。
+func (h *kongPlanTierHarness) forecastAccounts(t *testing.T, cycle string, computedAt time.Time, accounts string) {
+	t.Helper()
 	f := func(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 	req, err := ParseKongPlanForecast(strings.NewReader(fmt.Sprintf(`{"cycle_id": %q, "plan_version": 1, "computed_at": %q,
 		"interval_min": 60, "per_session_pp_per_hour": 1.5, "avg_session_pp": 0.8, "demand_estimate_pp_per_hour": 10,
-		"accounts": [%s],
+		"accounts": %s,
 		"forecast": [{"from": %q, "pp_per_hour": 2.5, "sessions": 1}, {"from": %q, "pp_per_hour": 12, "sessions": 8}],
 		"runway_h": {"immediate": 67, "all_cards": null, "concentrate": null},
 		"credits_runway_h": [{"level": 1, "hours": null}], "next_reset_at": %q}`,
-		cycle, f(computedAt), strings.Join(accs, ","), f(h.now), f(h.now.Add(3*time.Hour)), f(h.reset))))
+		cycle, f(computedAt), accounts, f(h.now), f(h.now.Add(3*time.Hour)), f(h.reset))))
 	require.NoError(t, err)
 	_, err = h.store.PutForecast(context.Background(), req)
 	require.NoError(t, err)

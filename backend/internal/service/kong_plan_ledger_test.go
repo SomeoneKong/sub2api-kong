@@ -154,9 +154,38 @@ type kongPlanLedgerHarness struct {
 	store  *kongPlanFakePaceStore
 	ls     *kongPlanFakeLedgerStore
 	ledger *KongPlanLedger
+	plan   *KongPlanStore
 	now    time.Time
 }
 
+// kongPlanForecastWith 拼一份只带账号参数的慢速部分；extra 是另加的顶层字段（空或以逗号结尾），accounts 直接给 JSON 数组。
+func kongPlanForecastWith(extra, accounts string) string {
+	return `{"cycle_id": "c", "plan_version": 1, "computed_at": "2026-10-02T06:00:00Z", ` + extra + `
+		"interval_min": 60, "per_session_pp_per_hour": 1.5, "avg_session_pp": 0.8, "demand_estimate_pp_per_hour": 1,
+		"accounts": ` + accounts + `}`
+}
+
+// kongPlanPutForecast 写一份只带账号参数的慢速部分（不给单位倍数）。
+func kongPlanPutForecast(t *testing.T, s *KongPlanStore, accounts string) {
+	t.Helper()
+	kongPlanPutForecastBody(t, s, kongPlanForecastWith("", accounts))
+}
+
+// kongPlanPutForecastUnit 写一份带单位倍数的慢速部分。
+func kongPlanPutForecastUnit(t *testing.T, s *KongPlanStore, unit float64, accounts string) {
+	t.Helper()
+	kongPlanPutForecastBody(t, s, kongPlanForecastWith(fmt.Sprintf(`"unit_multiple": %g,`, unit), accounts))
+}
+
+func kongPlanPutForecastBody(t *testing.T, s *KongPlanStore, body string) {
+	t.Helper()
+	f, err := ParseKongPlanForecast(strings.NewReader(body))
+	require.NoError(t, err)
+	_, err = s.PutForecast(context.Background(), f)
+	require.NoError(t, err)
+}
+
+// newKongPlanLedgerHarness 建一套推进者与记账；慢速部分里每个账号的套餐系数都是 1。
 func newKongPlanLedgerHarness(t *testing.T, rows []KongPaceAccountRow, perPoint string) *kongPlanLedgerHarness {
 	t.Helper()
 	plan, _ := newKongPlanTestStore(t, newKongPlanFakeRepo())
@@ -165,7 +194,12 @@ func newKongPlanLedgerHarness(t *testing.T, rows []KongPaceAccountRow, perPoint 
 	require.NoError(t, err)
 	_, err = plan.PutControl(context.Background(), ctl)
 	require.NoError(t, err)
-	h := &kongPlanLedgerHarness{repo: &kongPaceFakeRepo{rows: rows}, ls: newKongPlanFakeLedgerStore(), now: kongPaceT0}
+	accs := make([]string, len(rows))
+	for i, r := range rows {
+		accs[i] = fmt.Sprintf(`{"id": %d, "k": 1, "depth_pp_per_hour": 2.5}`, r.ID)
+	}
+	kongPlanPutForecast(t, plan, "["+strings.Join(accs, ",")+"]")
+	h := &kongPlanLedgerHarness{repo: &kongPaceFakeRepo{rows: rows}, ls: newKongPlanFakeLedgerStore(), plan: plan, now: kongPaceT0}
 	h.store = &kongPlanFakePaceStore{ledger: h.ls}
 	h.ledger = NewKongPlanLedger(h.ls, plan)
 	h.pace = NewKongOpenAIAccountPace(h.repo, h.store, nil, t.TempDir()+"/absent.yaml")

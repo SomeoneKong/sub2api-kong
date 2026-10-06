@@ -223,14 +223,28 @@ func (p *KongOpenAIAccountPace) factsTick() {
 		slog.Warn("kong pace: 读取账号额度失败，沿用上一份快照", "error", err)
 		return
 	}
+	// 本拍的时刻在查完账号之后取：查询期间可能跨过规格切换，读到的读数都不晚于这一刻，倍数、读数与余额观测按同一时刻
+	// 判断（晚于它的观测留到下一拍）。
+	now = p.now()
 
 	seen := make(map[int64]bool, len(rows))
 	tracked := make(map[int64]bool, len(rows))
 	for _, row := range rows {
 		seen[row.ID] = true
 		tracked[row.ID] = row.ParentAccountID == nil
+		// 规格倍数变了：先把已记的上涨折成新规格，再处理本拍的读数与余额观测——本拍新记的上涨已是新规格的百分点
+		// （余额补记按观测时刻的 K 换算）。
+		mult, multOK := p.ledger.accountMultiple(row.ID, now)
+		if multOK {
+			if old, rescaled := kongPaceApplyMultiple(p.states[row.ID], mult); rescaled {
+				slog.Info("kong pace: 规格倍数变化，已记的上涨按 旧倍数/新倍数 折算", "account_id", row.ID, "from", old, "to", mult)
+			}
+		}
 		st, obs := kongPaceObserve(p.states[row.ID], row, now)
 		p.states[row.ID] = st
+		if multOK {
+			kongPaceApplyMultiple(st, mult) // 刚建的状态在这里第一次记下；已记过的倍数相同，不再折算
+		}
 		switch obs {
 		case kongPaceObsRollback:
 			p.counters.rollbacks.Add(1)
@@ -437,6 +451,13 @@ func (p *KongOpenAIAccountPace) view(cfg *KongPaceConfig, id int64, plan string,
 	}
 
 	pp := cfg.plan(plan)
+	// 容量系数优先用慢速部分里此刻的规格，按套餐表的刻度（x20 账号为 1）折算：倍数 ÷ 20，单位为 20 时就是 K，改内部
+	// 单位时不变。里面没有这个账号时按套餐表估，只用于选号。让位量与软线仍按套餐名。
+	if m, ok := p.ledger.accountMultiple(id, now); ok {
+		if c := m / kongPlanDefaultUnitMultiple; c > 0 && c <= kongPaceMaxCapacity {
+			pp.Capacity = c
+		}
+	}
 	v.Capacity, v.Yield = pp.Capacity, pp.YieldPP
 	v.Inc6 = kongPaceIncrease(st, now, 6*time.Hour)
 	v.Inc24 = kongPaceIncrease(st, now, 24*time.Hour)
