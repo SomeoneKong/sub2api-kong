@@ -100,16 +100,24 @@ gjson 副本的 `TestJSONString` 在 Go 1.27 下失败，原版 v1.18.0 同样�
 `TestKongOpenAIBodyFastpathGolden`，把生成的基准拷回来；回到当前代码不带这个变量再跑一遍，快速路径关、开两个子测试
 都要通过。新增 e2e 用例之后也要这样重录。
 
-**`-race` 下上游测试套整体不干净**，这不是本 fork 的问题。`kong-race.yml`（只手动触发，见下节）
-在 `./internal/service/` 上跑 `-race` 时**必然红**：2026-09-19 实测本分支 81 个用例失败、
-纯上游基线 `base/v0.2.7-aea725f2` 100 个失败，竞态点完全相同——`ratelimit_service.go:540`、
-`openai_ws_forwarder_logutil.go:515`、`openai_gateway_forward.go` 里调 `forwardOpenAIWSV2` 那一处
-（行号差的正是本 fork 插入的注释），另有 `logger.go` / `slog_handler.go` / `scheduler_snapshot_service.go`。
+**`-race` 下上游测试套整体不干净**，这不是本 fork 的问题：每次都报十几个竞态、几十个连带失败的用例，
+并且每次不一样。竞态全在上游的测试写法上——测试桩不加锁、并行用例各自 `gin.SetMode`、改包级变量时上一个
+用例的后台协程还在跑、构造器起了 worker 之后测试再改字段；碰到生产文件的几处（`account.go` 的模型映射缓存、
+`content_moderation.go`、`grok_free_quota_gate.go`、`email_service.go`）也都是测试自己制造的共享。另有两个
+用例在 race 构建下变慢而失败：工具 Schema 的分配次数守卫、16MiB WS 首帧超时。所以不修上游测试（改上游文件
+就多一处 rebase 冲突面），由 `kong-race.yml` 的分诊脚本 `.github/kong/race_triage.py` 判定：只有包没跑完、
+本 fork 的用例（`kong_*_test.go` 里定义的）失败且不只是因为检测到竞态、或竞态的调用栈里有本 fork 的代码时才
+红。本 fork 的代码按两样认：`kong_*.go` 文件，以及相对上游基线（最近的 `base/*` tag）新增的行——接入点在
+上游名字的文件里，只认 `kong_*.go` 会漏掉它们。唯一例外是两次访问都在 gin 的全局模式上的竞态：并行用例
+`gin.SetMode`，调用栈常经过 zstd 发送的接入点，但与本 fork 无关。上游噪声列在运行摘要里，不影响结论。
 
-所以**判读方式不是看红绿，而是看竞态报告里有没有 `kong_*.go` 帧、以及有没有 Kong 用例失败**。
-那次实测两者都是 0。要在纯上游基线上复现作对照：从 `base/*` tag 建临时分支、只把
-`.github/workflows/kong-race.yml` 加进去、push 后 `gh workflow run kong-race.yml --ref <该分支>`，
-比完删分支（`workflow_dispatch` 要求 workflow 文件存在于被指定的 ref 上，所以必须建分支）。
+`kong-race.yml` 在推 `main` 且改了后端时自动跑，也可以手动触发（可指定包与 `-run`）；缺省跑所有含
+`kong_*.go` 的包。分诊规则改动后，拿历次运行的日志回放一遍（`gh run view <id> --log`，去掉每行的
+`race\tRace detector\t<时间> ` 前缀即是 go test 的原始输出）。要在纯上游基线上复现作对照：从 `base/*` tag
+建临时分支、只把 `.github/workflows/kong-race.yml` 与 `.github/kong/` 加进去、push 后
+`gh workflow run kong-race.yml --ref <该分支> -f packages='<要比的包>'`（基线上没有 `kong_*.go`，缺省的包
+清单是空的，必须显式指定，如 `./internal/service/`），比完删分支（`workflow_dispatch` 要求 workflow 文件
+存在于被指定的 ref 上，所以必须建分支）。
 
 ## 版本号与发布
 

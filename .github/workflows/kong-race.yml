@@ -1,20 +1,27 @@
 name: Kong Race Detector
 
-# 只手动触发。
+# 推 main（改了后端时）自动跑，也可以手动触发。
 #
 # 为什么单独一个文件而不是往 backend-ci.yml 里加一个 job：本 fork 会长期 rebase 到新的上游基线，
 # 上游文件每改一处都是一处冲突面。新文件永不冲突，与提交切分用的是同一条原则（见 FORK-NOTES）。
 #
-# 为什么不并入常规 CI：race 构建慢且吃内存，而本 fork 需要它的地方是固定的几处并发代码
-# （WS 透传路径上跨 goroutine 的票据上下文）。需要时手动跑一次拿结论，比每个 PR 都付代价划算。
+# 上游测试套在 -race 下一直不干净，每次都报十几个竞态、几十个连带失败的用例，并且每次不一样。所以这里
+# 不看 go test 的退出码，而是由 .github/kong/race_triage.py 分诊：只有包没跑完、本 fork 的用例失败、
+# 或竞态的调用栈里有本 fork 的代码（kong_*.go，或相对上游基线新增的行）时才算失败；上游噪声只列在运行摘要里。
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - '.github/kong/**'
+      - '.github/workflows/kong-race.yml'
   workflow_dispatch:
     inputs:
       packages:
-        description: '要跑的包（go test 的路径模式），默认只跑 service 包'
+        description: '要跑的包（go test 的路径模式），留空跑所有含 kong_*.go 的包'
         required: false
         type: string
-        default: ./internal/service/
+        default: ''
       run:
         description: '只跑匹配的用例（go test -run 的正则），留空跑全部'
         required: false
@@ -27,8 +34,11 @@ permissions:
 jobs:
   race:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # 分诊要拿上游基线 tag（base/*）算本 fork 改过的行
       - uses: actions/setup-go@v6
         with:
           go-version-file: backend/go.mod
@@ -41,11 +51,32 @@ jobs:
           PACKAGES: ${{ github.event.inputs.packages }}
           RUN_FILTER: ${{ github.event.inputs.run }}
         run: |
-          set -o pipefail
           # -race 需要 CGO；Linux runner 自带工具链，本机 Windows 上跑不了，这正是本 workflow 的理由。
-          ARGS="-race -tags=unit -count=1"
+          # 要跑的包解析成导入路径写进 packages.txt，分诊按它核对每个包都有结果
+          if [ -z "$PACKAGES" ]; then
+            # 主模块里含 kong_*.go 的包（go list 不含 third_party 下的嵌套模块）
+            go list -f '{{.ImportPath}} {{.Dir}}' ./... | while read -r pkg dir; do
+              if ls "$dir"/kong_*.go >/dev/null 2>&1; then echo "$pkg"; fi
+            done > packages.txt
+          else
+            go list $PACKAGES > packages.txt
+          fi
+          [ -s packages.txt ] || { echo "没有要跑的包"; exit 1; }
+          # service 包在 race 构建下要跑近 10 分钟，go test 缺省的 10 分钟超时不够
+          ARGS="-race -tags=unit -count=1 -timeout 30m"
           if [ -n "$RUN_FILTER" ]; then
             ARGS="$ARGS -run $RUN_FILTER"
           fi
-          echo "go test $ARGS $PACKAGES"
-          go test $ARGS $PACKAGES
+          echo "go test $ARGS $(tr '\n' ' ' < packages.txt)"
+          # go test 的退出码不作数（上游噪声必然让它非零），结论由下一步分诊；日志没写全（tee 失败）直接失败
+          set +e
+          go test $ARGS $(cat packages.txt) 2>&1 | tee race.log
+          status=("${PIPESTATUS[@]}")
+          set -e
+          echo "go test 退出码 ${status[0]}"
+          [ "${status[1]}" -eq 0 ]
+      - name: Triage
+        working-directory: backend
+        run: |
+          BASE=$(git describe --tags --match 'base/*' --abbrev=0 HEAD)
+          python3 ../.github/kong/race_triage.py race.log . "$BASE" packages.txt
