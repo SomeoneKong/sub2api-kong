@@ -12,8 +12,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 )
 
 // 账号指纹测试对上游的访问：经账号自己的代理，用账号自己的凭据向 codex responses 端点发一份挑战，读回
@@ -92,7 +90,7 @@ func kongFingerprintAccessToken(account *Account) (string, error) {
 	return token, nil
 }
 
-// buildCodexRequest 构造一个 codex responses 请求。instructions 固定为网关的默认 instructions、推理强度取自
+// buildCodexRequest 构造一个 codex responses 请求。instructions 固定为网关的默认 instructions（换行统一为 LF）、推理强度取自
 // 挑战：两者都与建库时一致，否则请求经网关时会按模型注入不同的基础提示词、各模型按各自默认的强度作答，
 // 写法与库里的样本不可比。
 //
@@ -118,7 +116,7 @@ func (u *kongFingerprintUpstream) buildCodexRequest(ctx context.Context, account
 		}},
 		"stream":       true,
 		"store":        false,
-		"instructions": openai.DefaultInstructions,
+		"instructions": kongFingerprintInstructions(),
 		"reasoning":    map[string]any{"effort": challenge.Effort},
 	}
 	body, err := json.Marshal(payload)

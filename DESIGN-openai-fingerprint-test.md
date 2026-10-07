@@ -52,7 +52,7 @@
 
 请求的固定条件：
 
-- **instructions** 固定为网关的 `openai.DefaultInstructions`，所有目标都一样。不能留空，否则请求经网关时会按模型
+- **instructions** 固定为网关的 `openai.DefaultInstructions`（换行统一为 LF，与建库时发送的逐字节相同），所有目标都一样。不能留空，否则请求经网关时会按模型
   注入不同的 Codex 基础提示词，与建库条件不一致。库里记着建库时 instructions 的摘要，加载时与网关当前的比对。
 - **推理强度** `reasoning.effort` 取自库，为 `low`。这些题在 low 下几乎不推理，差别直接体现在写法上。
 - `stream: true`、`store: false`、不带票、经账号自己的代理、单份超时 180 秒。

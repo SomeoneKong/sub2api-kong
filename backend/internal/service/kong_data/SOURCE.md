@@ -3,7 +3,7 @@
 `gpt_text_bank.json` 用于账号指纹测试的模型归因（设计见仓库根 `DESIGN-openai-fingerprint-test.md`）。
 它由工作区的 `fp-lab/library.py build` 生成，原样复制进来，不手改。
 
-当前版本：fp-lab 的 `library/gpt-text-v3.json`，`built_at` 2026-10-07T06:11:40Z。8 个 GPT 模型，
+当前版本：fp-lab 的 `library/gpt-text-v3.json`，`built_at` 2026-10-07T07:18:19Z。8 个 GPT 模型，
 每个模型 40 份合并挑战，取自 10-07 的两个时段，推理强度 low，instructions 为网关的默认 instructions。
 
 库里有：

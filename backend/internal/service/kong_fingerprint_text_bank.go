@@ -136,7 +136,7 @@ func kongParseFingerprintBank(data []byte, source string) (*KongFingerprintBank,
 		return fail("缺少推理强度 effort")
 	}
 	// 建库时的 instructions 必须就是测试请求要带的这一份：instructions 不同，模型的写法就不同。
-	sum := sha256.Sum256([]byte(openai.DefaultInstructions))
+	sum := sha256.Sum256([]byte(kongFingerprintInstructions()))
 	if file.InstructionsSHA256 != hex.EncodeToString(sum[:]) {
 		return fail("的 instructions 摘要与网关的默认 instructions 不一致")
 	}
@@ -271,6 +271,12 @@ func kongParseFingerprintBank(data []byte, source string) (*KongFingerprintBank,
 	digest := sha256.Sum256(data)
 	bank.digest = hex.EncodeToString(digest[:])
 	return bank, nil
+}
+
+// kongFingerprintInstructions 是挑战请求带的 instructions：网关的默认 instructions，换行统一为 LF。
+// 嵌入的 instructions.txt 在 Windows 工作区会被检出成 CRLF；统一之后各平台构建发出的内容相同，也与建库时发送的相同。
+func kongFingerprintInstructions() string {
+	return strings.ReplaceAll(openai.DefaultInstructions, "\r\n", "\n")
 }
 
 func kongTextCount(counts map[string]*float64, feature string) float64 {

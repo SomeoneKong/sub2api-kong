@@ -336,7 +336,8 @@ func TestKongFingerprintRequestUsesStoredToken(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Model != "gpt-5.6-sol" || body.Instructions != openai.DefaultInstructions || body.Reasoning.Effort != "low" ||
+	if body.Model != "gpt-5.6-sol" || body.Instructions != strings.ReplaceAll(openai.DefaultInstructions, "\r\n", "\n") ||
+		strings.Contains(body.Instructions, "\r") || body.Reasoning.Effort != "low" ||
 		len(body.Input) != 1 || len(body.Input[0].Content) != 1 || body.Input[0].Content[0].Text != "prompt" {
 		t.Fatalf("请求体 = %s", raw)
 	}
