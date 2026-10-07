@@ -126,6 +126,49 @@ func TestKongPlanSelect_ConfirmUsesRecheckedTier(t *testing.T) {
 	require.False(t, p.confirm(context.Background(), nil, &other), "登记不进去就不用这个账号的 credits")
 }
 
+func TestKongPlanSelect_ConfirmRetierKeepsPausedOfRound(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		before, after bool
+		want          kongPlanSeg
+	}{
+		{"选号途中快照撤掉暂停", true, false, kongPlanSegHeld},
+		{"选号途中快照加上暂停", false, true, kongPlanSegCreditsRoom},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newKongPlanTierHarness(t)
+			h.control(t, 2, `"on"`, "[2]", 0)
+			entry := func(paused bool) string {
+				e := h.creditsEntry(2, 1)
+				if paused {
+					e = strings.Replace(e, `"tier": "normal"`, `"tier": "normal", "paused": true`, 1)
+				}
+				return "[" + e + "]"
+			}
+			h.publish(t, 1, entry(tc.before))
+			h.setPace(2, kongPaceAccountState{Plan: "pro", HasWindow: true, WindowMinutes: 10080, ResetAt: h.reset, WindowSeq: 4,
+				Balance: &kongPlanBalancePoint{At: h.now.Add(-time.Hour), Value: 500}})
+			listed := h.selAccount(2, 1, 0, 98)
+			fresh := h.selAccount(2, 1, 0, 99)
+			p := (&OpenAIGatewayService{}).kongPlanBegin(context.Background(), []*Account{&listed}, nil, nil)
+			p.sequenceAccounts([]*Account{&listed})
+			require.True(t, p.next(2))
+			h.publish(t, 1, entry(tc.after))
+			require.False(t, p.confirm(context.Background(), nil, &fresh), "复核时才进 credits 层：放弃这个位置")
+			var got *kongPlanSlot
+			for p.cursor < len(p.slots) {
+				if p.next(2) && p.cur != nil {
+					got = p.cur
+					break
+				}
+			}
+			require.NotNil(t, got, "本轮为它预留的 credits 改判位置仍能用上")
+			require.True(t, got.Ghost)
+			require.Equal(t, tc.want, got.Key.Seg)
+		})
+	}
+}
+
 func TestKongPlanStore_RuntimeReadReloadsAfterUncertainWrite(t *testing.T) {
 	repo := newKongPlanFakeRepo()
 	s, _ := newKongPlanTestStore(t, repo)

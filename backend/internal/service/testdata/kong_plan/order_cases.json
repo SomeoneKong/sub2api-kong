@@ -1,5 +1,5 @@
 {
-  "description": "两轮排序的共用夹具（DESIGN-account-selection.md 第 4.2 节第 3、4 步）。网关的 Go 测试与模拟器的 Python 测试都跑它。accounts 按旧版选号这一轮的顺序给出。层由 used_7d 与 threshold_7d 判断：未到阈值为第一层；到了阈值，credits_ok（除级别外的资格条件）为真、条目有 credits、窗口不是未知时为 credits 层，否则为暂停；type 为 relay 的是中转。expect 是按顺序的桶：键为 段[/组][/healthy|busy][/imminent]；第一层与中转的桶按集合比较，credits 的桶按顺序比较；带 * 的是降段重试的位置。limits 是各位置确认登记时的上限（unlimited 为放行登记，0 为不登记）。demoted 是本次选号里已降到的段。",
+  "description": "两轮排序的共用夹具（DESIGN-account-selection.md 第 4.2 节第 3、4 步）。网关的 Go 测试与模拟器的 Python 测试都跑它。accounts 按旧版选号这一轮的顺序给出。层由 used_7d 与 threshold_7d 判断：未到阈值为第一层；到了阈值，credits_ok（除级别外的资格条件）为真、条目有 credits、窗口不是未知时为 credits 层，否则为暂停；条目 paused 为真的第一层与 credits 层账号在计划暂停段（held）；type 为 relay 的是中转。expect 是按顺序的桶：键为 段[/组][/healthy|busy][/imminent]；第一层与中转的桶按集合比较，credits 的桶按顺序比较；带 * 的是降段重试的位置。limits 是各位置确认登记时的上限（unlimited 为放行登记，0 为不登记）。demoted 是本次选号里已降到的段。",
   "defaults": {
     "type": "oauth",
     "entry": {"tier": "normal", "active": true, "imminent": false},
@@ -205,6 +205,28 @@
         ["relay", [3]]
       ],
       "limits": {"1": [3, 4, 3, "unlimited", "unlimited"], "2": [3, "unlimited"]}
+    },
+    {
+      "name": "计划暂停：第一层与 credits 层的暂停账号排在溢出轮之后、按现状暂停与中转之前，不降段、放行登记；第一层的改判位置也在这一段",
+      "accounts": [
+        {"id": 1, "sessions": 1},
+        {"id": 2, "sessions": 0, "entry": {"paused": true, "credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 3, "used_7d": 99, "credits_ok": true, "entry": {"paused": true, "credits": {"level": 1, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 4, "used_7d": 99, "credits_ok": true, "entry": {"credits": {"level": 2, "expires_at": "2026-12-31T16:00:00Z"}}},
+        {"id": 5, "used_7d": 99},
+        {"id": 6, "type": "relay"}
+      ],
+      "expect": [
+        ["room/normal/healthy", [1]],
+        ["grace/normal/healthy", ["1*"]],
+        ["credits_room", [4]],
+        ["overflow/normal/healthy", ["1*"]],
+        ["credits_overflow", ["4*"]],
+        ["held", [2, 3, "2*"]],
+        ["paused", [5]],
+        ["relay", [6]]
+      ],
+      "limits": {"1": [3, 4, "unlimited"], "2": ["unlimited", "unlimited"], "3": ["unlimited"], "4": [3, "unlimited"]}
     }
   ]
 }

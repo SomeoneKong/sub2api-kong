@@ -26,6 +26,7 @@ const (
 	kongPlanSegCreditsRoom                            // 余量轮：credits 层，会话数低于上限
 	kongPlanSegOverflow                               // 溢出轮：第一层
 	kongPlanSegCreditsOverflow                        // 溢出轮：credits 层
+	kongPlanSegHeld                                   // 计划暂停：快照条目 paused 的第一层与 credits 层账号，别的都接不住才用
 	kongPlanSegPaused                                 // 定层为暂停却仍在候选里：复核时由现状的暂停判定拦下
 	kongPlanSegRelay                                  // 非 OAuth 中转
 )
@@ -42,6 +43,8 @@ func (s kongPlanSeg) String() string {
 		return "overflow"
 	case kongPlanSegCreditsOverflow:
 		return "credits_overflow"
+	case kongPlanSegHeld:
+		return "held"
 	case kongPlanSegPaused:
 		return "paused"
 	case kongPlanSegRelay:
@@ -139,8 +142,12 @@ type kongPlanSlot struct {
 	Ghost bool
 }
 
-// kongPlanNaturalSeg 按本次选号开始时的会话数给出账号所在的段。
+// kongPlanNaturalSeg 按本次选号开始时的会话数给出账号所在的段。计划暂停的第一层与 credits 层账号不论会话数都在计划暂停段：
+// 排在所有正常候选之后，不降段、不受会话上限约束；第一层的复核时改判为 credits 层的，改判位置也在这一段。
 func kongPlanNaturalSeg(f *kongPlanFacts) kongPlanSeg {
+	if f.Tier.Entry.Paused && (f.Tier.Layer == kongPlanLayerSubscription || f.Tier.Layer == kongPlanLayerCredits) {
+		return kongPlanSegHeld
+	}
 	switch f.Tier.Layer {
 	case kongPlanLayerSubscription:
 		switch {
@@ -574,6 +581,8 @@ func (p *kongPlanSelection) confirm(ctx context.Context, g *kongSessionGate, acc
 		now := rt.now()
 		if res := rt.tier(ctx, account, now); res.Layer == kongPlanLayerCredits {
 			if f.Tier.Layer == kongPlanLayerSubscription {
+				// 改判位置是按选号开始时的计划暂停排的：选号途中快照换了也沿用开始时的，降到的段才对得上预留的位置
+				res.Entry.Paused = f.Tier.Entry.Paused
 				f.Tier = res
 				p.facts[account.ID] = f
 				p.retierRound(account.ID, res)

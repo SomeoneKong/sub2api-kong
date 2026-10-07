@@ -231,6 +231,21 @@
         {"method": "GET", "path": "/caller",
          "expect": {"status": 200, "data": {"state": "normal", "until": null, "expired": false}}}
       ]
+    },
+    {
+      "name": "条目的计划暂停：快照可带、读回原样；兜底不能带",
+      "steps": [
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [{"id": 1, "tier": "normal", "paused": true}],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": [{"id": 1, "tier": "normal"}]}},
+         "expect": {"status": 400, "reason": "KONG_PLAN_INVALID", "metadata": {"field": "fallback[0]"}}},
+        {"method": "PUT", "path": "/dispatch",
+         "body": {"generation": 1, "seq": 1, "plan_version": 5, "cycle_id": "c1", "fallback": [{"id": 1, "tier": "normal"}],
+                  "snapshot": {"expires_at": "$now+135m", "accounts": [{"id": 1, "tier": "normal", "paused": true}, {"id": 2, "tier": "normal", "paused": false}]}},
+         "expect": {"status": 200, "data": {"accepted": true, "seq": 1}}},
+        {"method": "GET", "path": "/dispatch",
+         "expect": {"status": 200, "data": {"in_use": "snapshot", "snapshot": {"accounts": [{"id": 1, "paused": true}, {"id": 2}]}}}}
+      ]
     }
   ]
 }

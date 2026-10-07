@@ -254,13 +254,13 @@ func (p *kongPlanSelection) recordSelected(id int64, s *kongPlanSlot) {
 		row.Waited = 1
 	}
 	p.stats.add(p.statKey(id, f.Tier.Layer, key), row)
-	if key.Seg.credits() || key.Seg == kongPlanSegRelay {
+	if key.Seg.credits() || key.Seg == kongPlanSegHeld || key.Seg == kongPlanSegRelay {
 		p.recordAhead(id)
 	}
 }
 
-// recordAhead：选中 credits 层账号或中转时，本轮仍有周额度的第一层账号各记一次接不了的原因。降到溢出轮的是已到上限
-// 加宽限（或名额被别的请求占满），负载已满或未知的是忙，其余（复核不过、抢不到槽）归一类。
+// recordAhead：选中 credits 层账号、计划暂停段或中转时，本轮仍有周额度的第一层账号各记一次接不了的原因。降到溢出轮的是
+// 已到上限加宽限（或名额被别的请求占满），负载已满或未知的是忙，其余（复核不过、抢不到槽）归一类。计划暂停的不在前面，不记。
 func (p *kongPlanSelection) recordAhead(selected int64) {
 	facts := p.round
 	if facts == nil {
@@ -271,6 +271,9 @@ func (p *kongPlanSelection) recordAhead(selected int64) {
 			continue
 		}
 		seg := kongPlanSegWith(&f, p.minSeg)
+		if seg == kongPlanSegHeld {
+			continue
+		}
 		var d KongPlanStatRow
 		switch {
 		case seg == kongPlanSegOverflow:

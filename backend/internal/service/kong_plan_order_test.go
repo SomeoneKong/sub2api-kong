@@ -70,6 +70,7 @@ func kongPlanCaseFacts(t *testing.T, raw map[string]any) kongPlanFacts {
 			AdmitBelow  *KongPlanAdmitBelow `json:"admit_below"`
 			MaxSessions *int                `json:"max_sessions"`
 			Credits     *KongPlanCredits    `json:"credits"`
+			Paused      bool                `json:"paused"`
 		}
 		Used7d          float64 `json:"used_7d"`
 		Threshold7d     float64 `json:"threshold_7d"`
@@ -89,7 +90,7 @@ func kongPlanCaseFacts(t *testing.T, raw map[string]any) kongPlanFacts {
 	}
 	require.NoError(t, json.Unmarshal(b, &a))
 	entry := KongPlanEntry{ID: a.ID, Tier: a.Entry.Tier, Active: a.Entry.Active, Imminent: a.Entry.Imminent,
-		AdmitBelow: a.Entry.AdmitBelow, MaxSessions: a.Entry.MaxSessions, Credits: a.Entry.Credits}
+		AdmitBelow: a.Entry.AdmitBelow, MaxSessions: a.Entry.MaxSessions, Credits: a.Entry.Credits, Paused: a.Entry.Paused}
 	f := kongPlanFacts{ID: a.ID, Tier: kongPlanTierResult{Entry: entry, AtLine: a.OpenEntry || a.UnknownActive}}
 	if a.Type != "relay" {
 		switch {
@@ -335,6 +336,38 @@ func TestKongPlanSelect_RelayAfterAllOAuth(t *testing.T) {
 
 	sel := h.sess.selectAccount(t, context.Background(), "s-new")
 	require.Equal(t, int64(1), sel.Account.ID, "中转不论档位、不论原优先级，排在溢出的 OAuth 之后")
+}
+
+func TestKongPlanSelect_HeldOnlyWhenOthersCannot(t *testing.T) {
+	th := newKongPlanTierHarness(t)
+	// 1 有周额度但计划暂停，2 在 credits 层：先用 credits 层的 2
+	accounts := []Account{th.selAccount(1, 0, 3, 50), th.selAccount(2, 9, 3, 99)}
+	h := newKongPlanSelHarness(t, accounts, stubConcurrencyCache{},
+		`[{"id": 1, "tier": "normal", "paused": true}, `+th.creditsEntry(2, 1)+`]`, 2)
+	sel := h.sess.selectAccount(t, context.Background(), "s-new")
+	require.Equal(t, int64(2), sel.Account.ID, "计划暂停的账号排在 credits 层之后")
+
+	// 只剩计划暂停的账号（与中转）：用它，不因暂停让请求失败；排在中转之前
+	relay := Account{ID: 3, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 5, Priority: 0, GroupIDs: []int64{1}}
+	h2 := newKongPlanSelHarness(t, []Account{relay, th.selAccount(1, 5, 1, 50)}, stubConcurrencyCache{},
+		`[{"id": 1, "tier": "normal", "paused": true}]`)
+	h2.sess.cache.put(1, "a")
+	sel = h2.sess.selectAccount(t, context.Background(), "s-new")
+	require.Equal(t, int64(1), sel.Account.ID, "别的 OAuth 都接不住时用计划暂停的账号，先于中转")
+	require.Equal(t, []int{kongSessionUnlimited}, h2.sess.cache.registerCaps, "计划暂停段不受会话上限约束")
+}
+
+func TestKongPlanSelect_HeldKeepsExistingBinding(t *testing.T) {
+	th := newKongPlanTierHarness(t)
+	accounts := []Account{th.selAccount(1, 0, 3, 50), th.selAccount(2, 0, 3, 50)}
+	h := newKongPlanSelHarness(t, accounts, stubConcurrencyCache{}, `[]`)
+	first := h.sess.selectAccount(t, context.Background(), "s-old")
+	held := first.Account.ID
+	other := int64(3) - held
+	// 选中之后这个账号被计划暂停：已有会话照常复用，新会话落到另一个账号
+	h.publish(t, 1, fmt.Sprintf(`[{"id": %d, "tier": "normal", "paused": true}]`, held))
+	require.Equal(t, held, h.sess.selectAccount(t, context.Background(), "s-old").Account.ID, "已有会话不改绑")
+	require.Equal(t, other, h.sess.selectAccount(t, context.Background(), "s-new").Account.ID, "新会话不给计划暂停的账号")
 }
 
 func TestKongPlanSelect_AsapAdmissionOrdersGroups(t *testing.T) {

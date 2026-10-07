@@ -189,6 +189,24 @@ func TestParseKongPlanDispatch_FingerprintIgnoresFormatting(t *testing.T) {
 	require.NotEqual(t, a.SHA256, c.SHA256)
 }
 
+func TestParseKongPlanDispatch_PausedFalseOmitted(t *testing.T) {
+	exp := time.Date(2026, 10, 2, 8, 0, 0, 0, time.UTC)
+	a := mustParseKongPlanDispatch(t, kongPlanDispatchJSONBody(1, 7, exp, kongPlanFallback, kongPlanAccounts))
+	b := mustParseKongPlanDispatch(t, kongPlanDispatchJSONBody(1, 7, exp, kongPlanFallback,
+		strings.Replace(kongPlanAccounts, `"max_sessions": 3`, `"max_sessions": 3, "paused": false`, 1)))
+	require.Equal(t, a.SHA256, b.SHA256, "显式写 false 与省略的指纹相同：不暂停的条目指纹不变")
+	out, err := json.Marshal(b.Snapshot.Accounts)
+	require.NoError(t, err)
+	require.NotContains(t, string(out), "paused", "为假时读回不写出")
+
+	c := mustParseKongPlanDispatch(t, kongPlanDispatchJSONBody(1, 7, exp, kongPlanFallback,
+		strings.Replace(kongPlanAccounts, `"max_sessions": 3`, `"max_sessions": 3, "paused": true`, 1)))
+	require.NotEqual(t, a.SHA256, c.SHA256)
+	out, err = json.Marshal(c.Snapshot.Accounts)
+	require.NoError(t, err)
+	require.Contains(t, string(out), `"paused":true`)
+}
+
 func TestKongPlanStore_DispatchStateChecks(t *testing.T) {
 	ctx := context.Background()
 	s, clock := newKongPlanTestStore(t, newKongPlanFakeRepo())

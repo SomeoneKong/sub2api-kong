@@ -79,7 +79,8 @@ type KongPlanCredits struct {
 }
 
 // KongPlanEntry 是兜底或快照里一个账号的条目。省略的 active / imminent 解析时补成 true / false，
-// 所以同一份内容不论写法都得到同一个指纹。
+// 所以同一份内容不论写法都得到同一个指纹。Paused 是计划暂停（只在快照里）：两轮排序把账号排进计划暂停段，
+// 别的候选都接不住时才用它；为假时不写出，没有暂停的内容指纹与不认这个字段的版本相同。
 type KongPlanEntry struct {
 	ID             int64               `json:"id"`
 	Tier           string              `json:"tier"`
@@ -89,6 +90,7 @@ type KongPlanEntry struct {
 	MaxSessions    *int                `json:"max_sessions"`
 	MaxConcurrency *int                `json:"max_concurrency"`
 	Credits        *KongPlanCredits    `json:"credits"`
+	Paused         bool                `json:"paused,omitempty"`
 }
 
 // KongPlanSnapshot 是快照：在兜底之上加入边车的实时决定，带有效期。
@@ -311,6 +313,7 @@ type kongPlanEntryJSON struct {
 	MaxSessions    *int                    `json:"max_sessions"`
 	MaxConcurrency *int                    `json:"max_concurrency"`
 	Credits        *kongPlanCreditsJSON    `json:"credits"`
+	Paused         *bool                   `json:"paused"`
 }
 
 type kongPlanDispatchJSON struct {
@@ -424,8 +427,11 @@ func kongPlanParseEntries(raw []kongPlanEntryJSON, field string, fallback bool) 
 		if r.Imminent != nil {
 			e.Imminent = *r.Imminent
 		}
-		if fallback && (!e.Active || e.Imminent) {
-			return nil, kongPlanInvalid(f, "兜底条目的 active 必须为 true、imminent 必须为 false")
+		if r.Paused != nil {
+			e.Paused = *r.Paused
+		}
+		if fallback && (!e.Active || e.Imminent || e.Paused) {
+			return nil, kongPlanInvalid(f, "兜底条目的 active 必须为 true、imminent 与 paused 必须为 false")
 		}
 		if e.Tier == KongPlanTierAsap {
 			if r.AdmitBelow == nil || r.AdmitBelow.H6 == nil || r.AdmitBelow.H24 == nil {
