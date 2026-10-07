@@ -4,17 +4,19 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 )
 
 // SSE 的一个事件可以有多行 `data:`，规范要求把它们连起来再当成一份载荷。
 //
 // 逐行各自解码是错的：多行事件的每一行都不是完整 JSON，于是每一行都解码失败。而解码失败若只是
-// continue，正文会静默少掉一段——归因只看「数字够不够」，217 个和 218 个都够，一份被损坏的回答
-// 照样会被计入归因。
+// continue，正文会静默少掉一段——少几个词照样能拆出足够的题，一份被损坏的回答照样会被计入归因。
 func TestKongReadCodexSSETextMultiLineData(t *testing.T) {
 	single := strings.Join([]string{
 		`data: {"type":"response.output_text.delta","delta":"[1,2,3]"}`,
@@ -48,7 +50,7 @@ func TestKongReadCodexSSETextMultiLineData(t *testing.T) {
 	}
 }
 
-// 中途损坏的事件必须让这一份挑战失败，即使剩下的数字仍然够用。
+// 中途损坏的事件必须让这一份挑战失败，即使剩下的正文仍然够用。
 func TestKongReadCodexSSETextRejectsCorruptEvent(t *testing.T) {
 	stream := strings.Join([]string{
 		`data: {"type":"response.output_text.delta","delta":"[1,2,3,"}`,
@@ -100,7 +102,7 @@ func TestKongReadCodexSSETextStopsAtCompleted(t *testing.T) {
 // 流首 BOM、三种换行、未知空白行：都不能把一份合法的流判成损坏。
 //
 // BOM 不吃掉，第一行开头就多出那三个字节，`data:` 前缀匹配不上——那个事件被当作未知字段行
-// 忽略，正文少掉第一段。而归因只看「数字够不够」，少一段仍然够，于是静默截断的回答照样会被计入归因。
+// 忽略，正文少掉第一段，而少几道题的回答仍可能够数，于是静默截断的回答照样会被计入归因。
 func TestKongReadCodexSSETextFramingVariants(t *testing.T) {
 	events := []string{
 		`data: {"type":"response.output_text.delta","delta":"[1,2,3]"}`,
@@ -306,12 +308,37 @@ func TestKongModelSnapshotMatch(t *testing.T) {
 }
 
 // 挑战用账号上存着的 access token（与"测试连接"同口径），不带任何票；没有 token 时不发请求。
+// 请求体带网关的默认 instructions 与挑战的推理强度，与建库条件一致。
 func TestKongFingerprintRequestUsesStoredToken(t *testing.T) {
 	u := &kongFingerprintUpstream{}
 	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "tok-1"}}
-	req, err := u.buildCodexRequest(context.Background(), account, "gpt-5.6-sol", "prompt")
+	challenge := KongFingerprintChallenge{ID: "c", Prompt: "prompt", Effort: "low"}
+	req, err := u.buildCodexRequest(context.Background(), account, "gpt-5.6-sol", challenge)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var body struct {
+		Model        string `json:"model"`
+		Instructions string `json:"instructions"`
+		Reasoning    struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
+		Input []struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"input"`
+	}
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Model != "gpt-5.6-sol" || body.Instructions != openai.DefaultInstructions || body.Reasoning.Effort != "low" ||
+		len(body.Input) != 1 || len(body.Input[0].Content) != 1 || body.Input[0].Content[0].Text != "prompt" {
+		t.Fatalf("请求体 = %s", raw)
 	}
 	if got := req.Header.Get("Authorization"); got != "Bearer tok-1" {
 		t.Fatalf("Authorization = %q", got)
@@ -321,7 +348,7 @@ func TestKongFingerprintRequestUsesStoredToken(t *testing.T) {
 	}
 
 	account.Credentials = map[string]any{}
-	if _, err := u.buildCodexRequest(context.Background(), account, "gpt-5.6-sol", "prompt"); err == nil {
+	if _, err := u.buildCodexRequest(context.Background(), account, "gpt-5.6-sol", challenge); err == nil {
 		t.Fatal("没有 access token 时应报错")
 	}
 }

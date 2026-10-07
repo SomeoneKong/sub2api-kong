@@ -30,8 +30,8 @@ type RunOptions = { signal: AbortSignal; onEvent: (e: FingerprintTestEvent) => v
 describe('FingerprintTestHost', () => {
   beforeEach(() => {
     getTargetsMock.mockResolvedValue([
-      { model: 'gpt-5.5', display_name: 'GPT-5.5' },
-      { model: 'gpt-5.4', display_name: 'GPT-5.4' },
+      { model: 'gpt-6.1-sol', display_name: 'gpt-6.1-sol' },
+      { model: 'gpt-6-astra', display_name: 'gpt-6-astra' },
     ])
     runMock.mockReset()
   })
@@ -51,27 +51,52 @@ describe('FingerprintTestHost', () => {
     expect(bodyText()).toContain('acc-7')
     expect(bodyText()).toContain('不是绝对档位判定')
     expect(bodyText()).toContain('指纹库以外的模型也会被归到最像的候选上')
-    expect(bodyText()).toContain('默认 instructions')
+    expect(bodyText()).toContain('只测 low 推理强度')
     expect(bodyText()).toContain('不保证落到同一个模型')
     wrapper.unmount()
   })
 
   it('默认选第一个目标，逐份显示证据，执行结果与模型结论分开显示', async () => {
     runMock.mockImplementation(async (_id: number, _model: string, { onEvent }: RunOptions) => {
-      onEvent({ type: 'started', test_id: 'tid-1', target_model: 'gpt-5.5', max_parts: 3 })
-      onEvent({ type: 'part_started', test_id: 'tid-1', part: { index: 1, challenge_id: 'c1' } })
+      const group = { model: 'gpt-6-astra|gpt-6.1-sol', display_name: 'gpt-6-astra / gpt-6.1-sol', probability: 0.999 }
+      const pair = [
+        { model: 'gpt-6.1-sol', display_name: 'gpt-6.1-sol', probability: 0.9986 },
+        { model: 'gpt-6-astra', display_name: 'gpt-6-astra', probability: 0.0014 },
+      ]
+      onEvent({ type: 'started', test_id: 'tid-1', target_model: 'gpt-6.1-sol', max_parts: 4 })
+      onEvent({ type: 'part_started', test_id: 'tid-1', part: { index: 1, challenge_id: 'text-packed-v1' } })
       onEvent({
         type: 'part',
         test_id: 'tid-1',
         part: {
           index: 1,
-          challenge_id: 'c1',
+          challenge_id: 'text-packed-v1',
           status_code: 200,
-          reported_model: 'gpt-5.5-2026-01-01',
-          digit_count: 96,
+          reported_model: 'gpt-6.1-sol-2026-01-01',
+          section_count: 9,
           valid: true,
-          attribution: 'gpt-5.5',
-          cumulative: [{ model: 'gpt-5.5', display_name: 'GPT-5.5', probability: 0.95 }],
+          attribution: group.model,
+          cumulative: [group],
+          pair: [
+            { model: 'gpt-6.1-sol', display_name: 'gpt-6.1-sol', probability: 0.9634 },
+            { model: 'gpt-6-astra', display_name: 'gpt-6-astra', probability: 0.0366 },
+          ],
+        },
+      })
+      onEvent({ type: 'part_started', test_id: 'tid-1', part: { index: 2, challenge_id: 'text-packed-v1' } })
+      onEvent({
+        type: 'part',
+        test_id: 'tid-1',
+        part: {
+          index: 2,
+          challenge_id: 'text-packed-v1',
+          status_code: 200,
+          reported_model: 'gpt-6.1-sol',
+          section_count: 10,
+          valid: true,
+          attribution: group.model,
+          cumulative: [group],
+          pair,
         },
       })
       onEvent({
@@ -80,9 +105,12 @@ describe('FingerprintTestHost', () => {
         result: {
           execution: 'completed',
           end_reason: 'fingerprint_confident',
+          detail: '指纹判为 gpt-6.1-sol',
           verdict: 'match',
-          parts: 1,
-          candidates: [{ model: 'gpt-5.5', display_name: 'GPT-5.5', probability: 0.95 }],
+          decided: 'gpt-6.1-sol',
+          parts: 2,
+          candidates: [group],
+          pair,
           persist_error: 'db down',
         },
       })
@@ -97,16 +125,22 @@ describe('FingerprintTestHost', () => {
 
     expect(runMock).toHaveBeenCalledTimes(1)
     expect(runMock.mock.calls[0][0]).toBe(7)
-    expect(runMock.mock.calls[0][1]).toBe('gpt-5.5')
+    expect(runMock.mock.calls[0][1]).toBe('gpt-6.1-sol')
 
     const text = bodyText()
     expect(text).toContain('第 1 份')
-    expect(text).toContain('gpt-5.5-2026-01-01')
-    expect(text).toContain('96')
-    expect(text).toContain('95.0%')
+    expect(text).toContain('gpt-6.1-sol-2026-01-01')
+    expect(text).toContain('第 2 份')
+    expect(text).toContain('96.3%')
+    expect(text).toContain('gpt-6-astra / gpt-6.1-sol')
+    expect(text).toContain('两者细分')
+    expect(text).toContain('99.9%')
+    expect(text).toContain('0.1%')
+    expect(text).toContain('相近两者的细分')
+    expect(text).toContain('指纹判为 gpt-6.1-sol')
     expect(testIdText('fp-execution')).toBe('完成')
     expect(testIdText('fp-verdict')).toBe('一致')
-    expect(text).toContain('累计指纹归因达到 0.9，且各份归因一致')
+    expect(text).toContain('累计指纹归因达到 0.95，且各份归因一致')
     expect(text).toContain('有证据没写进库')
     expect(text).toContain('tid-1')
     wrapper.unmount()
@@ -114,7 +148,7 @@ describe('FingerprintTestHost', () => {
 
   it('执行失败时没有模型结论', async () => {
     runMock.mockImplementation(async (_id: number, _model: string, { onEvent }: RunOptions) => {
-      onEvent({ type: 'started', test_id: 'tid-2', target_model: 'gpt-5.5', max_parts: 3 })
+      onEvent({ type: 'started', test_id: 'tid-2', target_model: 'gpt-6.1-sol', max_parts: 4 })
       onEvent({
         type: 'done',
         test_id: 'tid-2',

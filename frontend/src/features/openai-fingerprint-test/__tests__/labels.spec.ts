@@ -49,6 +49,7 @@ describe('endReasonText', () => {
       'fingerprint_confident',
       'parts_disagree',
       'parts_exhausted',
+      'pair_unresolved',
       'client_cancelled',
       'proxy_unavailable',
       'upstream_status',
@@ -71,7 +72,7 @@ describe('endReasonText', () => {
 describe('partValidityText', () => {
   it('有效、无效带原因、无效不带原因', () => {
     expect(partValidityText({ valid: true })).toBe('有效')
-    expect(partValidityText({ valid: false, invalid_reason: 'insufficient_digits' })).toBe('无效：数字个数不足')
+    expect(partValidityText({ valid: false, invalid_reason: 'sections_missing' })).toBe('无效：拆出的题不足 7 道')
     expect(partValidityText({ valid: false, invalid_reason: 'truncated' })).toBe('无效：正文不完整')
     expect(partValidityText({ valid: false, invalid_reason: 'brand_new' })).toBe('无效：brand_new')
     expect(partValidityText({ valid: false })).toBe('无效')

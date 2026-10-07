@@ -5,21 +5,21 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// 指纹测试的流程与判定：上游与存储都是假的，回答取自 golden 样本（kong_fingerprint_golden.jsonl），
-// 它们的归因结果在 kong_fingerprint_test.go 里已经锁住。
+// 指纹测试的流程与判定：上游与存储都是假的，回答取自 golden 资料（kong_fingerprint_text_golden.json），
+// 它们的分段、得分与判定在 kong_fingerprint_text_test.go 里已经锁住。
 //
-// 用到的样本（单份归因 / 累计）：
-//   - 0：gpt-6-astra 0.9991（单份即够把握）
-//   - 2：gpt-5.6-sol 0.5786；2 之后接 7：gpt-5.6-sol 0.9837（两份同向）
-//   - 4：gpt-5.6-sol 0.9936（单份即够把握）
-//   - 5：gpt-6-astra 0.7845；5 之后接 2：gpt-5.6-sol 0.9675，但两份单份归因不同
+// 用到的序列（内置库下逐份判定的结果）：
+//   - gpt-6-sol#0：一份即判为 gpt-6-sol；gpt-6-luna#0、gpt-6-astra#0 同理各自一份落定（后者落在难分的一对里）
+//   - gpt-6.1-sol#0 → #1：目标在这一对里时第一份不下结论，第二份判为 gpt-6.1-sol
+//   - gpt-6-astra#0 → gpt-6-sol#0 → gpt-6-sol#1：前两份累计不够把握，第三份累计够了但各份第一层不一致
 
-const kongFPTestTarget = "gpt-5.6-sol"
+const kongFPTestTarget = "gpt-6-sol"
 
 type kongFPFakeAccounts map[int64]*Account
 
@@ -41,7 +41,7 @@ type kongFPFakeUpstream struct {
 	proxyErr   error
 	steps      []kongFPStep
 	mu         sync.Mutex
-	challenges []string
+	challenges []KongFingerprintChallenge
 	proxyURLs  []string
 }
 
@@ -61,7 +61,7 @@ func (u *kongFPFakeUpstream) ResolveProxyURL(ctx context.Context, proxyID *int64
 func (u *kongFPFakeUpstream) RunChallenge(ctx context.Context, _ *Account, proxyURL, _ string, challenge KongFingerprintChallenge) (*KongUpstreamAnswer, error) {
 	u.mu.Lock()
 	i := len(u.challenges)
-	u.challenges = append(u.challenges, challenge.ID)
+	u.challenges = append(u.challenges, challenge)
 	u.proxyURLs = append(u.proxyURLs, proxyURL)
 	u.mu.Unlock()
 	if i >= len(u.steps) {
@@ -124,10 +124,10 @@ func newKongFPTestTester(t *testing.T, up *kongFPFakeUpstream, store *kongFPFake
 	return tester
 }
 
-func kongFPGoldenAnswer(t *testing.T, row int, reported string) *KongUpstreamAnswer {
+// kongFPAnswer 是一份取自 golden 的成功回答。
+func kongFPAnswer(t *testing.T, name, reported string) kongFPStep {
 	t.Helper()
-	rows := kongFPLoadGolden(t)
-	return &KongUpstreamAnswer{Text: rows[row].Text, ReportedModel: reported, StatusCode: 200, LatencyMs: 1000}
+	return kongFPStep{answer: &KongUpstreamAnswer{Text: kongFPGoldenText(t, name), ReportedModel: reported, StatusCode: 200, LatencyMs: 1000}}
 }
 
 // kongFPRun 跑一次测试，返回全部事件与结论。
@@ -145,6 +145,16 @@ func kongFPRun(t *testing.T, ctx context.Context, tester *KongFingerprintTester,
 	return events, events[len(events)-1].Result
 }
 
+// kongFPRunSteps 用安排好的各份回答对目标跑一次测试。
+func kongFPRunSteps(t *testing.T, target string, steps ...kongFPStep) (*kongFPFakeUpstream, *kongFPFakeStore, []KongFingerprintTestEvent, *KongFingerprintTestResult) {
+	t.Helper()
+	up := &kongFPFakeUpstream{steps: steps}
+	store := &kongFPFakeStore{}
+	tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
+	events, got := kongFPRun(t, context.Background(), tester, 1, target)
+	return up, store, events, got
+}
+
 func kongFPCheckResult(t *testing.T, got *KongFingerprintTestResult, execution, reason, verdict string, parts int) {
 	t.Helper()
 	if got.Execution != execution || got.EndReason != reason || got.Verdict != verdict || got.Parts != parts {
@@ -153,31 +163,36 @@ func kongFPCheckResult(t *testing.T, got *KongFingerprintTestResult, execution, 
 	}
 }
 
-func TestKongFingerprintTargetsAreGPTOnly(t *testing.T) {
+// kongFPPartEvents 取出各份的结果事件。
+func kongFPPartEvents(events []KongFingerprintTestEvent) []*KongFingerprintTestPart {
+	var out []*KongFingerprintTestPart
+	for _, e := range events {
+		if e.Type == "part" {
+			out = append(out, e.Part)
+		}
+	}
+	return out
+}
+
+func TestKongFingerprintTargetsAreBankModels(t *testing.T) {
 	tester := newKongFPTestTester(t, &kongFPFakeUpstream{}, &kongFPFakeStore{}, kongFPFakeAccounts{})
 	targets := tester.Targets()
-	if len(targets) == 0 {
-		t.Fatal("可测目标不能为空")
+	if len(targets) != len(tester.bank.Models) {
+		t.Fatalf("可测目标 = %+v，期望库里的 %v", targets, tester.bank.Models)
 	}
-	seen := map[string]bool{}
-	for _, target := range targets {
-		seen[target.Model] = true
-		if target.DisplayName == "" {
-			t.Errorf("%s 缺显示名", target.Model)
+	for i, target := range targets {
+		if target.Model != tester.bank.Models[i] || target.DisplayName == "" {
+			t.Errorf("第 %d 个目标 = %+v", i, target)
 		}
 	}
-	for _, m := range tester.bank.Models {
-		if want := m.Family == kongFingerprintTargetFamily; seen[m.ID] != want {
-			t.Errorf("%s（家族 %s）是否可测 = %v，期望 %v", m.ID, m.Family, seen[m.ID], want)
+	for _, m := range []string{kongFPTestTarget, "gpt-6.1-sol", "gpt-6-astra"} {
+		if !tester.bank.HasModel(m) {
+			t.Fatalf("%s 必须可测", m)
 		}
-	}
-	if !seen[kongFPTestTarget] {
-		t.Fatalf("%s 必须可测", kongFPTestTarget)
 	}
 }
 
 func TestKongFingerprintBeginValidates(t *testing.T) {
-	var claude string
 	accounts := kongFPFakeAccounts{
 		1: kongFPOAuthAccount(1, nil),
 		2: {ID: 2, Platform: PlatformOpenAI, Type: AccountTypeAPIKey},
@@ -186,15 +201,6 @@ func TestKongFingerprintBeginValidates(t *testing.T) {
 		5: {ID: 5, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"auth_mode": OpenAIAuthModeAgentIdentity}},
 	}
 	tester := newKongFPTestTester(t, &kongFPFakeUpstream{}, &kongFPFakeStore{}, accounts)
-	for _, m := range tester.bank.Models {
-		if m.Family != kongFingerprintTargetFamily {
-			claude = m.ID
-			break
-		}
-	}
-	if claude == "" {
-		t.Fatal("指纹库里应有非 GPT 的干扰候选")
-	}
 
 	cases := []struct {
 		name    string
@@ -203,7 +209,7 @@ func TestKongFingerprintBeginValidates(t *testing.T) {
 		want    error
 	}{
 		{"不在库里的模型", 1, "gpt-unknown", ErrKongFingerprintTarget},
-		{"干扰候选不可测", 1, claude, ErrKongFingerprintTarget},
+		{"难分的一对合并成的类不是模型", 1, tester.bank.GroupClass(), ErrKongFingerprintTarget},
 		{"账号不存在", 99, kongFPTestTarget, ErrKongFingerprintAccount},
 		{"API key 账号", 2, kongFPTestTarget, ErrKongFingerprintAccount},
 		{"非 OpenAI 账号", 3, kongFPTestTarget, ErrKongFingerprintAccount},
@@ -233,28 +239,33 @@ func TestKongFingerprintBeginValidates(t *testing.T) {
 func TestKongFingerprintConfidentSinglePart(t *testing.T) {
 	cases := []struct {
 		name     string
-		row      int
+		answer   string
 		reported string
 		verdict  string
+		decided  string
 	}{
-		{"指纹指向目标", 4, "gpt-5.6-sol", KongFingerprintVerdictMatch},
-		{"回报带快照后缀仍算同一模型", 4, "gpt-5.6-sol-2026-03-17", KongFingerprintVerdictMatch},
-		{"没回报模型不算对不上", 4, "", KongFingerprintVerdictMatch},
-		{"指纹指向别的模型", 0, "gpt-5.6-sol", KongFingerprintVerdictMismatch},
+		{"指纹指向目标", "gpt-6-sol#0", "gpt-6-sol", KongFingerprintVerdictMatch, "gpt-6-sol"},
+		{"回报带快照后缀仍算同一模型", "gpt-6-sol#0", "gpt-6-sol-2026-09-30", KongFingerprintVerdictMatch, "gpt-6-sol"},
+		{"没回报模型不算对不上", "gpt-6-sol#0", "", KongFingerprintVerdictMatch, "gpt-6-sol"},
+		{"指纹指向别的模型", "gpt-6-luna#0", "gpt-6-sol", KongFingerprintVerdictMismatch, "gpt-6-luna"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			up := &kongFPFakeUpstream{steps: []kongFPStep{{answer: kongFPGoldenAnswer(t, tc.row, tc.reported)}}}
-			store := &kongFPFakeStore{}
-			tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
-			events, got := kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)
+			up, store, events, got := kongFPRunSteps(t, kongFPTestTarget, kongFPAnswer(t, tc.answer, tc.reported))
 			kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndConfident, tc.verdict, 1)
-			if len(got.Candidates) == 0 || got.Candidates[0].Probability < kongFingerprintConfidence {
-				t.Fatalf("结论应附按概率排序的候选：%+v", got.Candidates)
+			if got.Decided != tc.decided || !strings.Contains(got.Detail, tc.decided) || len(got.Pair) != 0 {
+				t.Fatalf("结论指向 = %q（detail=%q，pair=%+v），期望 %s", got.Decided, got.Detail, got.Pair, tc.decided)
+			}
+			if len(got.Candidates) != 7 || got.Candidates[0].Model != tc.decided || got.Candidates[0].Probability < 0.95 {
+				t.Fatalf("结论应附按概率排序的第一层分布：%+v", got.Candidates)
+			}
+			if len(up.challenges) != 1 || up.challenges[0].ID != "text-packed-v1" || up.challenges[0].Effort != "low" ||
+				!strings.Contains(up.challenges[0].Prompt, "### 1") {
+				t.Fatalf("挑战 = %+v", up.challenges)
 			}
 
 			wantTypes := []string{"started", "part_started", "part", "done"}
-			if len(events) != len(wantTypes) {
+			if len(events) != len(wantTypes) || events[0].MaxParts != 4 {
 				t.Fatalf("事件 = %+v", events)
 			}
 			for i, typ := range wantTypes {
@@ -263,7 +274,8 @@ func TestKongFingerprintConfidentSinglePart(t *testing.T) {
 				}
 			}
 			part := events[2].Part
-			if part == nil || !part.Valid || part.Attribution == "" || part.ReportedModel != tc.reported || len(part.Cumulative) == 0 {
+			if part == nil || !part.Valid || part.Attribution != tc.decided || part.SectionCount != 10 ||
+				part.ReportedModel != tc.reported || len(part.Cumulative) != kongFingerprintCumulativeTop || len(part.Pair) != 0 {
 				t.Fatalf("份结果 = %+v", part)
 			}
 
@@ -271,12 +283,15 @@ func TestKongFingerprintConfidentSinglePart(t *testing.T) {
 				t.Fatalf("落库：%d 条测试 / %d 次收尾 / %d 份探测", len(store.tests), len(store.finished), len(store.probes))
 			}
 			fin := store.finished[0]
-			if fin.Verdict != tc.verdict || fin.EndReason != kongFingerprintEndConfident || fin.RuleVersion != kongFingerprintRuleVersion || fin.FinishedAt.IsZero() {
+			if fin.Verdict != tc.verdict || fin.EndReason != kongFingerprintEndConfident || fin.RuleVersion != "2" || fin.FinishedAt.IsZero() {
 				t.Fatalf("收尾记录 = %+v", fin)
 			}
 			probe := store.probes[0]
-			if !probe.CountedInAverage || probe.PartAttribution == nil || probe.CumProbability == nil || probe.Scores == nil ||
-				probe.DigitCount == 0 || probe.ReportedModel != tc.reported || probe.VerifyEgress != "direct" || probe.LibraryVersion == nil {
+			if !probe.CountedInAverage || !probe.ParseValid || probe.PartAttribution == nil || *probe.PartAttribution != tc.decided ||
+				probe.CumProbability == nil || *probe.CumProbability < 0.95 || probe.TemperatureTier == nil || *probe.TemperatureTier != 1 ||
+				len(probe.Scores) != 8 || len(probe.SectionScores) != 10 || probe.DigitCount != 10 || probe.Digits == nil || len(probe.Digits) != 0 ||
+				probe.AnswerText != kongFPGoldenText(t, tc.answer) || probe.ReportedModel != tc.reported || probe.VerifyEgress != "direct" ||
+				probe.ChallengeID != "text-packed-v1" || probe.LibraryVersion["rule_version"] != "2" || probe.LibraryVersion["digest"] == "" {
 				t.Fatalf("探测记录 = %+v", probe)
 			}
 		})
@@ -285,91 +300,145 @@ func TestKongFingerprintConfidentSinglePart(t *testing.T) {
 
 // 规则 2 先于规则 3：指纹再像目标，上游回报的是另一个模型就是对不上。
 func TestKongFingerprintReportedModelMismatch(t *testing.T) {
-	up := &kongFPFakeUpstream{steps: []kongFPStep{{answer: kongFPGoldenAnswer(t, 4, "gpt-6-astra")}}}
-	store := &kongFPFakeStore{}
-	tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
-	_, got := kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)
+	_, _, _, got := kongFPRunSteps(t, kongFPTestTarget, kongFPAnswer(t, "gpt-6-sol#0", "gpt-6-astra"))
 	kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndReportedMismatch, KongFingerprintVerdictMismatch, 1)
-	if got.Detail == "" {
-		t.Fatal("应说明上游回报了什么")
+	if !strings.Contains(got.Detail, "gpt-6-astra") || got.Decided != "" {
+		t.Fatalf("应说明上游回报了什么、不给指纹结论：detail=%q decided=%q", got.Detail, got.Decided)
 	}
 }
 
-func TestKongFingerprintSecondPartReachesConfidence(t *testing.T) {
-	up := &kongFPFakeUpstream{steps: []kongFPStep{
-		{answer: kongFPGoldenAnswer(t, 2, "")},
-		{answer: kongFPGoldenAnswer(t, 7, "")},
-	}}
-	store := &kongFPFakeStore{}
-	tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
-	_, got := kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)
-	kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndConfident, KongFingerprintVerdictMatch, 2)
-	if len(up.challenges) != 2 || up.challenges[0] != "query-01" || up.challenges[1] != "query-02" {
-		t.Fatalf("挑战应按顺序取用：%v", up.challenges)
+// 目标在难分的一对里：第一层落在这一对上之后，至少要两份第二层证据才下结论。
+func TestKongFingerprintPairNeedsTwoParts(t *testing.T) {
+	cases := []struct {
+		name    string
+		target  string
+		verdict string
+	}{
+		{"目标是 6.1-sol", "gpt-6.1-sol", KongFingerprintVerdictMatch},
+		{"目标是 astra 而实际是 6.1-sol", "gpt-6-astra", KongFingerprintVerdictMismatch},
 	}
-	if len(store.probes) != 2 || store.probes[1].PartIndex != 2 {
-		t.Fatalf("探测记录 = %+v", store.probes)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up, store, events, got := kongFPRunSteps(t, tc.target,
+				kongFPAnswer(t, "gpt-6.1-sol#0", ""), kongFPAnswer(t, "gpt-6.1-sol#1", ""))
+			kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndConfident, tc.verdict, 2)
+			if got.Decided != "gpt-6.1-sol" || len(got.Pair) != 2 || got.Pair[0].Model != "gpt-6.1-sol" || got.Pair[0].Probability < 0.95 {
+				t.Fatalf("结论 = %q，第二层 = %+v", got.Decided, got.Pair)
+			}
+			if len(up.challenges) != 2 || up.challenges[0] != up.challenges[1] {
+				t.Fatalf("每份发的都是同一个挑战：%+v", up.challenges)
+			}
+			parts := kongFPPartEvents(events)
+			group := "gpt-6-astra|gpt-6.1-sol"
+			if len(parts) != 2 || parts[0].Attribution != group || parts[0].Cumulative[0].Model != group ||
+				parts[0].Cumulative[0].DisplayName != "gpt-6-astra / gpt-6.1-sol" || len(parts[0].Pair) != 2 {
+				t.Fatalf("第一份 = %+v", parts[0])
+			}
+			if p := store.probes[1]; p.TemperatureTier == nil || *p.TemperatureTier != 2 || p.CumProbability == nil || *p.CumProbability < 0.95 {
+				t.Fatalf("第二份探测记录 = %+v", p)
+			}
+			// 第一份时第二层的概率已经算出来了，但还不到两份，不下结论。
+			if p := store.probes[0]; p.CumProbability == nil || *p.CumProbability >= 0.99 {
+				t.Fatalf("第一份记的应是第二层的概率：%+v", p.CumProbability)
+			}
+		})
 	}
 }
 
-// 累计够把握但各份的单份归因不一致：不带票的各份请求不保证落到同一个模型，只报告观察到了差异。
-func TestKongFingerprintPartsDisagree(t *testing.T) {
+// 目标不在难分的一对里时，回答落在这一对上一份就够判不一致。
+func TestKongFingerprintGroupAnswerForOtherTarget(t *testing.T) {
+	_, _, _, got := kongFPRunSteps(t, kongFPTestTarget, kongFPAnswer(t, "gpt-6-astra#0", ""))
+	kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndConfident, KongFingerprintVerdictMismatch, 1)
+	if got.Decided != "gpt-6-astra" {
+		t.Fatalf("结论指向 = %q", got.Decided)
+	}
+}
+
+// 四份用完、第一层确定是这一对，但第二层不够把握：如实报告"二者之一"。
+func TestKongFingerprintPairUnresolved(t *testing.T) {
 	up := &kongFPFakeUpstream{steps: []kongFPStep{
-		{answer: kongFPGoldenAnswer(t, 5, "")},
-		{answer: kongFPGoldenAnswer(t, 2, "")},
+		kongFPAnswer(t, "gpt-6-astra#0", ""), kongFPAnswer(t, "gpt-6-astra#1", ""),
+		kongFPAnswer(t, "gpt-6-astra#2", ""), kongFPAnswer(t, "gpt-6-astra#outlier", ""),
 	}}
 	tester := newKongFPTestTester(t, up, &kongFPFakeStore{}, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
-	_, got := kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)
-	kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndPartsDisagree, KongFingerprintVerdictInconclusive, 2)
+	// 每份证据截得很小，四份相加也到不了阈值。
+	bank := *tester.bank
+	bank.pairCap = 0.5
+	tester.bank = &bank
+	_, got := kongFPRun(t, context.Background(), tester, 1, "gpt-6-astra")
+	kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndPairUnresolved, KongFingerprintVerdictInconclusive, 4)
+	if got.Decided != bank.GroupClass() || !strings.Contains(got.Detail, "分不清") || len(got.Pair) != 2 {
+		t.Fatalf("结论 = %q（detail=%q，pair=%+v）", got.Decided, got.Detail, got.Pair)
+	}
 }
 
-func TestKongFingerprintPartsExhausted(t *testing.T) {
-	short := &KongUpstreamAnswer{Text: "[1, 2, 3]", StatusCode: 200}
-	up := &kongFPFakeUpstream{steps: []kongFPStep{{answer: short}, {answer: short}, {answer: short}}}
-	store := &kongFPFakeStore{}
-	tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
-	_, got := kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)
-	kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndPartsExhausted, KongFingerprintVerdictInconclusive, 3)
-	if len(got.Candidates) != 0 {
-		t.Fatalf("没有可用回答时不该有候选：%+v", got.Candidates)
+// 累计够把握但各份的第一层归因不一致：不带票的各份请求不保证落到同一个模型，只报告观察到了差异。
+func TestKongFingerprintPartsDisagree(t *testing.T) {
+	_, _, _, got := kongFPRunSteps(t, "gpt-6-astra",
+		kongFPAnswer(t, "gpt-6-astra#0", ""), kongFPAnswer(t, "gpt-6-sol#0", ""), kongFPAnswer(t, "gpt-6-sol#1", ""))
+	kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndPartsDisagree, KongFingerprintVerdictInconclusive, 3)
+	if got.Decided != "" {
+		t.Fatalf("各份不一致时不给指纹结论：%q", got.Decided)
 	}
-	if len(store.probes) != 3 {
-		t.Fatalf("三份都应留档：%d", len(store.probes))
-	}
-	for _, p := range store.probes {
-		if p.CountedInAverage || p.InvalidReason == nil || *p.InvalidReason != KongProbeInsufficientDigits || p.DigitCount != 3 {
-			t.Fatalf("探测记录 = %+v", p)
+}
+
+// 拆不出足够的题：这一份用掉了、原文留档，但不计入归因。
+func TestKongFingerprintSectionsMissing(t *testing.T) {
+	t.Run("四份都拆不出", func(t *testing.T) {
+		step := kongFPAnswer(t, "edge:no_headers", "")
+		_, store, _, got := kongFPRunSteps(t, kongFPTestTarget, step, step, step, step)
+		kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndPartsExhausted, KongFingerprintVerdictInconclusive, 4)
+		if len(got.Candidates) != 0 {
+			t.Fatalf("没有可用回答时不该有候选：%+v", got.Candidates)
 		}
-	}
-}
-
-// 2xx 之后读流出错：这一份用掉了、原始数字留档，但不计入归因；回报的模型照样作数。
-func TestKongFingerprintTruncatedPart(t *testing.T) {
-	t.Run("不计入归因", func(t *testing.T) {
-		up := &kongFPFakeUpstream{steps: []kongFPStep{
-			{answer: kongFPGoldenAnswer(t, 0, ""), err: errors.New("stream reset")},
-			{answer: kongFPGoldenAnswer(t, 4, "")},
-		}}
-		store := &kongFPFakeStore{}
-		tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
-		events, got := kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)
-		// 第一份若计入，累计会被拉向 astra；只计第二份时是 gpt-5.6-sol 0.9936。
+		if len(store.probes) != 4 {
+			t.Fatalf("四份都应留档：%d", len(store.probes))
+		}
+		for _, p := range store.probes {
+			if p.CountedInAverage || p.InvalidReason == nil || *p.InvalidReason != KongProbeInvalidSectionsMissing ||
+				p.DigitCount != 0 || p.AnswerText == "" || p.CumProbability != nil || p.TemperatureTier != nil {
+				t.Fatalf("探测记录 = %+v", p)
+			}
+		}
+	})
+	t.Run("少于七题的一份不计入", func(t *testing.T) {
+		_, store, events, got := kongFPRunSteps(t, kongFPTestTarget,
+			kongFPAnswer(t, "edge:four_headers_missing", ""), kongFPAnswer(t, "gpt-6-sol#0", ""))
 		kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndConfident, KongFingerprintVerdictMatch, 2)
 		p := store.probes[0]
-		if p.CountedInAverage || p.InvalidReason == nil || *p.InvalidReason != KongProbeInvalidTruncated || p.DigitCount == 0 {
+		if p.CountedInAverage || p.InvalidReason == nil || *p.InvalidReason != KongProbeInvalidSectionsMissing ||
+			p.DigitCount != 6 || len(p.SectionScores) != 6 || p.PartAttribution != nil {
+			t.Fatalf("拆出六题的一份 = %+v", p)
+		}
+		if first := kongFPPartEvents(events)[0]; first.Valid || first.SectionCount != 6 || first.InvalidReason != KongProbeInvalidSectionsMissing {
+			t.Fatalf("拆出六题的一份的事件 = %+v", first)
+		}
+		if p := store.probes[1]; p.TemperatureTier == nil || *p.TemperatureTier != 1 {
+			t.Fatalf("有效份数只算计入的那一份：%+v", p.TemperatureTier)
+		}
+	})
+}
+
+// 2xx 之后读流出错：这一份用掉了、原文留档，但不计入归因；回报的模型照样作数。
+func TestKongFingerprintTruncatedPart(t *testing.T) {
+	t.Run("不计入归因", func(t *testing.T) {
+		first := kongFPAnswer(t, "gpt-6-astra#0", "")
+		first.err = errors.New("stream reset")
+		_, store, events, got := kongFPRunSteps(t, kongFPTestTarget, first, kongFPAnswer(t, "gpt-6-sol#0", ""))
+		// 第一份若计入，它落在难分的一对上，与第二份不一致，不会判为一致。
+		kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndConfident, KongFingerprintVerdictMatch, 2)
+		p := store.probes[0]
+		if p.CountedInAverage || p.InvalidReason == nil || *p.InvalidReason != KongProbeInvalidTruncated || p.AnswerText == "" {
 			t.Fatalf("截断的一份 = %+v", p)
 		}
-		first := events[2].Part
-		if first.Valid || first.InvalidReason != KongProbeInvalidTruncated || first.Error == "" {
-			t.Fatalf("截断的一份的事件 = %+v", first)
+		if part := kongFPPartEvents(events)[0]; part.Valid || part.InvalidReason != KongProbeInvalidTruncated || part.Error == "" {
+			t.Fatalf("截断的一份的事件 = %+v", part)
 		}
 	})
 	t.Run("回报的模型照样作数", func(t *testing.T) {
-		up := &kongFPFakeUpstream{steps: []kongFPStep{
-			{answer: kongFPGoldenAnswer(t, 4, "gpt-6-astra"), err: errors.New("stream reset")},
-		}}
-		tester := newKongFPTestTester(t, up, &kongFPFakeStore{}, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
-		_, got := kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)
+		step := kongFPAnswer(t, "gpt-6-sol#0", "gpt-6-astra")
+		step.err = errors.New("stream reset")
+		_, _, _, got := kongFPRunSteps(t, kongFPTestTarget, step)
 		kongFPCheckResult(t, got, KongFingerprintExecCompleted, kongFingerprintEndReportedMismatch, KongFingerprintVerdictMismatch, 1)
 	})
 }
@@ -382,17 +451,14 @@ func TestKongFingerprintRequestFailure(t *testing.T) {
 	}{
 		{"上游非 2xx", kongFPStep{answer: &KongUpstreamAnswer{StatusCode: 429}, err: errors.New("status 429")}, kongFingerprintEndUpstreamStatus},
 		{"发送失败", kongFPStep{err: errors.New("dial failed")}, kongFingerprintEndUpstreamError},
-		{"超时", kongFPStep{answer: &KongUpstreamAnswer{Text: "[1, 2", StatusCode: 200}, err: context.DeadlineExceeded}, kongFingerprintEndTimeout},
+		{"超时", kongFPStep{answer: &KongUpstreamAnswer{Text: "### 1\nThank", StatusCode: 200}, err: context.DeadlineExceeded}, kongFingerprintEndTimeout},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			up := &kongFPFakeUpstream{steps: []kongFPStep{tc.step, {answer: kongFPGoldenAnswer(t, 4, "")}}}
-			store := &kongFPFakeStore{}
-			tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
-			_, got := kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)
+			up, store, _, got := kongFPRunSteps(t, kongFPTestTarget, tc.step, kongFPAnswer(t, "gpt-6-sol#0", ""))
 			kongFPCheckResult(t, got, KongFingerprintExecFailed, tc.reason, "", 1)
 			if len(up.challenges) != 1 {
-				t.Fatalf("失败后不应再发下一份：%v", up.challenges)
+				t.Fatalf("失败后不应再发下一份：%d 份", len(up.challenges))
 			}
 			if len(store.probes) != 1 || store.probes[0].InvalidReason == nil || *store.probes[0].InvalidReason != KongProbeInvalidRequestFailed {
 				t.Fatalf("失败的一份也要留档：%+v", store.probes)
@@ -421,7 +487,7 @@ func TestKongFingerprintProxyUnavailable(t *testing.T) {
 
 func TestKongFingerprintEgressFollowsAccountProxy(t *testing.T) {
 	proxyID := int64(7)
-	up := &kongFPFakeUpstream{steps: []kongFPStep{{answer: kongFPGoldenAnswer(t, 4, "")}}}
+	up := &kongFPFakeUpstream{steps: []kongFPStep{kongFPAnswer(t, "gpt-6-sol#0", "")}}
 	store := &kongFPFakeStore{}
 	tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, &proxyID)})
 	kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)
@@ -435,11 +501,11 @@ func TestKongFingerprintEgressFollowsAccountProxy(t *testing.T) {
 
 // 管理员断开：进行中的那一份立即中止；已经取得的证据用独立的 ctx 照样落库，账号随之释放。
 func TestKongFingerprintCancelled(t *testing.T) {
-	up := &kongFPFakeUpstream{steps: []kongFPStep{{answer: kongFPGoldenAnswer(t, 2, "")}, {block: true}}}
+	up := &kongFPFakeUpstream{steps: []kongFPStep{kongFPAnswer(t, "gpt-6.1-sol#0", ""), {block: true}}}
 	store := &kongFPFakeStore{}
 	tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
 	ctx, cancel := context.WithCancel(context.Background())
-	run, err := tester.Begin(context.Background(), 1, kongFPTestTarget)
+	run, err := tester.Begin(context.Background(), 1, "gpt-6.1-sol")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +541,7 @@ func TestKongFingerprintCancelled(t *testing.T) {
 }
 
 func TestKongFingerprintCancelledBeforeFirstPart(t *testing.T) {
-	up := &kongFPFakeUpstream{steps: []kongFPStep{{answer: kongFPGoldenAnswer(t, 4, "")}}}
+	up := &kongFPFakeUpstream{steps: []kongFPStep{kongFPAnswer(t, "gpt-6-sol#0", "")}}
 	tester := newKongFPTestTester(t, up, &kongFPFakeStore{}, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -489,7 +555,7 @@ func TestKongFingerprintCancelledBeforeFirstPart(t *testing.T) {
 // 读代理的请求随管理员断开一起被取消：记为取消，不是代理不可用。
 func TestKongFingerprintCancelledWhileResolvingProxy(t *testing.T) {
 	proxyID := int64(7)
-	up := &kongFPFakeUpstream{steps: []kongFPStep{{answer: kongFPGoldenAnswer(t, 4, "")}}}
+	up := &kongFPFakeUpstream{steps: []kongFPStep{kongFPAnswer(t, "gpt-6-sol#0", "")}}
 	store := &kongFPFakeStore{}
 	tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, &proxyID)})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -506,7 +572,7 @@ func TestKongFingerprintCancelledWhileResolvingProxy(t *testing.T) {
 
 // 落库失败不改变结论，但要让管理员知道库里的记录不全。
 func TestKongFingerprintPersistErrorSurfaces(t *testing.T) {
-	up := &kongFPFakeUpstream{steps: []kongFPStep{{answer: kongFPGoldenAnswer(t, 4, "")}}}
+	up := &kongFPFakeUpstream{steps: []kongFPStep{kongFPAnswer(t, "gpt-6-sol#0", "")}}
 	store := &kongFPFakeStore{probeErr: errors.New("db down")}
 	tester := newKongFPTestTester(t, up, store, kongFPFakeAccounts{1: kongFPOAuthAccount(1, nil)})
 	_, got := kongFPRun(t, context.Background(), tester, 1, kongFPTestTarget)

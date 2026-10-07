@@ -109,6 +109,12 @@ func (r *KongTicketRepository) InsertFingerprintProbe(ctx context.Context, p *se
 			return fmt.Errorf("marshal probe scores (part %d): %w", p.PartIndex, err)
 		}
 	}
+	sectionScores := []byte("null")
+	if len(p.SectionScores) > 0 {
+		if sectionScores, err = json.Marshal(p.SectionScores); err != nil {
+			return fmt.Errorf("marshal probe section scores (part %d): %w", p.PartIndex, err)
+		}
+	}
 	library := []byte("{}")
 	if len(p.LibraryVersion) > 0 {
 		if library, err = json.Marshal(p.LibraryVersion); err != nil {
@@ -120,12 +126,12 @@ func (r *KongTicketRepository) InsertFingerprintProbe(ctx context.Context, p *se
 			(verification_id, part_index, account_id, target_model, verify_egress, challenge_id,
 			 digits, digit_count, scores, part_attribution, cum_probability, temperature_tier,
 			 library_version, parse_valid, counted_in_average, invalid_reason, latency_ms, output_tokens,
-			 reported_model)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+			 reported_model, answer_text, section_scores)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
 		p.VerificationID, p.PartIndex, p.AccountID, p.TargetModel, kongNullString(p.VerifyEgress), p.ChallengeID,
 		string(digits), p.DigitCount, string(scores), p.PartAttribution, p.CumProbability, p.TemperatureTier,
 		string(library), p.ParseValid, p.CountedInAverage, p.InvalidReason, p.LatencyMs, p.OutputTokens,
-		kongNullString(p.ReportedModel))
+		kongNullString(p.ReportedModel), kongNullString(p.AnswerText), string(sectionScores))
 	if err != nil {
 		return fmt.Errorf("insert probe part %d: %w", p.PartIndex, err)
 	}

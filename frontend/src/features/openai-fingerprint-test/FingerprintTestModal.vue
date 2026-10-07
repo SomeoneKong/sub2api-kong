@@ -18,9 +18,10 @@
       <div class="rounded-lg bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:bg-amber-500/10 dark:text-amber-300">
         <p>结果是这几次挑战观察到的相对信号，不是绝对档位判定：</p>
         <ul class="mt-1 list-disc space-y-0.5 pl-4">
-          <li>闭集归因：指纹库以外的模型也会被归到最像的候选上；</li>
-          <li>校准库取自不带 instructions 的环境，而测试请求带着 codex 的默认 instructions；</li>
+          <li>闭集归因：只在指纹库的模型里选，指纹库以外的模型也会被归到最像的候选上（例如 gpt-reserve 会被判为 gpt-5.6-luna）；</li>
+          <li>只测 low 推理强度：结论说明的是此刻这个账号在 low 强度下被服务的模型；</li>
           <li>各份挑战不带票，不保证落到同一个模型，各份指向不同时只报告观察到了差异；</li>
+          <li>参考样本有时效：上游悄悄更新模型后写法会变，表现为下不了结论的情况增多，需要重建指纹库；</li>
           <li>上游回报的模型名是上游的声明，与指纹是两类独立证据。</li>
         </ul>
       </div>
@@ -36,6 +37,7 @@
         <p v-if="targetsError" class="text-xs text-red-600 dark:text-red-400">{{ targetsError }}</p>
         <p v-else class="text-xs text-gray-500 dark:text-gray-400">
           经账号自己的代理逐份发挑战，每份都是一次真实的上游请求；关闭弹窗即停止剩余挑战。
+          多数目标 1 份即可下结论，gpt-6-astra 与 gpt-6.1-sol 一般要 2 份。
         </p>
       </div>
 
@@ -64,8 +66,8 @@
             <dd class="font-mono">{{ p.status_code ?? '—' }}</dd>
             <dt class="text-gray-500 dark:text-gray-500">上游回报的模型</dt>
             <dd class="font-mono">{{ p.reported_model || '未回报' }}</dd>
-            <dt class="text-gray-500 dark:text-gray-500">数字个数</dt>
-            <dd class="font-mono">{{ p.digit_count ?? 0 }}</dd>
+            <dt class="text-gray-500 dark:text-gray-500">拆出的题数</dt>
+            <dd class="font-mono">{{ p.section_count ?? 0 }}</dd>
             <dt class="text-gray-500 dark:text-gray-500">本份归因</dt>
             <dd>{{ p.attribution ? nameOf(p.attribution, p.cumulative) : '—' }}</dd>
             <dt class="text-gray-500 dark:text-gray-500">累计分布</dt>
@@ -76,6 +78,15 @@
                 <span class="font-mono">{{ formatProbability(c.probability) }}</span>
               </span>
             </dd>
+            <template v-if="p.pair?.length">
+              <dt class="text-gray-500 dark:text-gray-500">两者细分</dt>
+              <dd>
+                <span v-for="c in p.pair" :key="c.model" class="mr-3 inline-block whitespace-nowrap">
+                  {{ c.display_name || c.model }}
+                  <span class="font-mono">{{ formatProbability(c.probability) }}</span>
+                </span>
+              </dd>
+            </template>
             <template v-if="p.latency_ms">
               <dt class="text-gray-500 dark:text-gray-500">耗时</dt>
               <dd class="font-mono">
@@ -109,6 +120,15 @@
           <div class="mb-1 text-gray-500 dark:text-gray-400">最终分布（共用 {{ result.parts }} 份挑战）</div>
           <ul class="space-y-0.5 text-gray-700 dark:text-gray-300">
             <li v-for="c in result.candidates" :key="c.model" class="flex justify-between gap-4">
+              <span class="truncate">{{ c.display_name || c.model }}</span>
+              <span class="font-mono">{{ formatProbability(c.probability) }}</span>
+            </li>
+          </ul>
+        </div>
+        <div v-if="result.pair?.length" class="text-xs">
+          <div class="mb-1 text-gray-500 dark:text-gray-400">相近两者的细分（累计概率）</div>
+          <ul class="space-y-0.5 text-gray-700 dark:text-gray-300">
+            <li v-for="c in result.pair" :key="c.model" class="flex justify-between gap-4">
               <span class="truncate">{{ c.display_name || c.model }}</span>
               <span class="font-mono">{{ formatProbability(c.probability) }}</span>
             </li>

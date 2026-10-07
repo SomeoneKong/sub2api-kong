@@ -8,7 +8,7 @@ export interface FingerprintTarget {
   display_name: string
 }
 
-/** 一个候选模型与它的概率。 */
+/** 一个候选与它的概率。两个相近、难分的模型在累计分布里合成一个候选，model 写作 `<模型>|<模型>`。 */
 export interface FingerprintCandidate {
   model: string
   display_name: string
@@ -23,13 +23,16 @@ export interface FingerprintPart {
   error?: string
   /** 上游在这一份响应里回报的模型；缺省表示没观测到。 */
   reported_model?: string
-  digit_count?: number
+  /** 从回答里拆出的题数。 */
+  section_count?: number
   /** 这一份计入了归因。 */
   valid?: boolean
   invalid_reason?: string
-  /** 这一份**自己**最像的模型；cumulative 是累计到这一份为止的分布（前几名）。 */
+  /** 这一份**自己**最像的候选；cumulative 是累计到这一份为止的分布（前几名）。 */
   attribution?: string
   cumulative?: FingerprintCandidate[]
+  /** 累计分布落在难分的两个模型上之后，两者各自的概率。 */
+  pair?: FingerprintCandidate[]
   latency_ms?: number
   output_tokens?: number
 }
@@ -46,8 +49,11 @@ export interface FingerprintResult {
   end_reason: string
   detail?: string
   verdict?: FingerprintVerdict
+  /** 指纹结论指向的候选；分不清难分的两个模型时是合成的那个候选。 */
+  decided?: string
   parts: number
   candidates?: FingerprintCandidate[]
+  pair?: FingerprintCandidate[]
   /** 非空表示有证据没写进库：结论照常给出，但事后读库还原不全。 */
   persist_error?: string
 }

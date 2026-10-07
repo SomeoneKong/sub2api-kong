@@ -44,7 +44,7 @@ const part = {
     challenge_id: 'c1',
     status_code: 200,
     reported_model: 'gpt-5.5',
-    digit_count: 120,
+    section_count: 10,
     valid: true,
     attribution: 'gpt-5.5',
     cumulative: [{ model: 'gpt-5.5', display_name: 'GPT-5.5', probability: 0.93 }],

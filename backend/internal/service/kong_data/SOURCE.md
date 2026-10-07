@@ -1,34 +1,34 @@
-# 指纹归因的校准资料
+# 账号指纹测试的文本指纹库
 
-`unified_bank.json` 来自 [ModelTrace](https://github.com/xqy2006/ModelTrace) 的统一模型库
-（`data/unified_bank.json`），用于账号指纹测试的模型归因（设计见仓库根 `DESIGN-openai-fingerprint-test.md`）。
+`gpt_text_bank.json` 用于账号指纹测试的模型归因（设计见仓库根 `DESIGN-openai-fingerprint-test.md`）。
+它由工作区的 `fp-lab/library.py build` 生成，原样复制进来，不手改。
 
-当前版本：上游 commit `55a2e4a`，`built_at` 2026-09-23T06:17:08，16 个候选模型（gpt 8 个、claude 8 个，
-含 `gpt-6-sol` / `gpt-6-luna`）。
+当前版本：fp-lab 的 `library/gpt-text-v3.json`，`built_at` 2026-10-07T06:11:40Z。8 个 GPT 模型，
+每个模型 40 份合并挑战，取自 10-07 的两个时段，推理强度 low，instructions 为网关的默认 instructions。
 
-**这份资料不是本项目产出的**，算法也照官方口径移植、不自创变体——偏差不会报错，只会表现成
-测不出结论或测错模型。移植正确性由
-`internal/service/kong_fingerprint_test.go` 的 golden file 回归测试锁住。
+库里有：
+- 模型列表，也就是指纹测试可选的目标；
+- 合并挑战的题目全文与各题的名字；
+- 建库时的推理强度与 instructions 摘要；
+- 每个模型在每道题上的用词与词对计数；
+- 两层判定的参数（阈值、最多份数、第一层温度、第二层的 w / m / cap）。
 
-资料内容：候选模型的中心向量、两个分支各自的共享环境干扰方向、以及按有效份数分档的
-softmax 校准温度。维度在加载时校验（`kongParseFingerprintBank`）——维度对不上时算法会算出一个
-「看起来正常」的分数而不是报错，那是移植偏差最危险的形态。
+加载时逐项校验（`kongParseFingerprintBank`）：计数缺一个模型、题目与计数对不上号时，评分照样会算出
+看起来正常的分数，而不是报错。instructions 摘要必须等于网关当前的默认 instructions：两者不同，
+模型的写法就和库里的样本不可比。
 
-**换资料不必重新构建镜像**：设置环境变量 `KONG_FINGERPRINT_BANK` 指向外部文件即可覆盖内置的
-这份。每次归因都会把当时所用资料的 `schema` / `built_at` / 内容摘要记进探测记录——档 "1" 不是
-一份永不变的资料，换了资料同一序列会算出不同概率，没有版本标识就既不能复核也不能重算。
+**换库不必重新构建镜像**：设置环境变量 `KONG_FINGERPRINT_BANK` 指向外部文件即可覆盖内置的这份。
+每一份探测记录都带着当时所用库的内容摘要与判定规则版本，换库后历史结论仍能复核，也能凭存下的回答原文重算。
 
-## 换内置资料的步骤
+## 换内置库的步骤
 
-1. 确认上游从上一版到新版之间 `fingerprint.py`、`challenge_suite.py` 没有改动（`git diff --stat
-   <旧 commit> <新 commit> -- fingerprint.py challenge_suite.py`）。改了就是算法变更，要先移植算法，
-   不能只换资料。
-2. 用 `git show <新 commit>:data/unified_bank.json` 取原始字节覆盖本文件，并更新上面的版本说明。
-3. 重算 golden：在上游仓库里对 `testdata/kong_fingerprint_golden.jsonl` 的每一行调用
-   `analyze_outputs([{"text": text, "expected_count": expected_count}], bank)`，改写 `parsed`
-   （`diagnostics[0].parsed_numbers`）、`best` / `best_p`（`prediction` / `probability`）与 `top`
-   （前三名），概率保留 4 位小数，其余字段不动。**先用旧资料跑一遍，确认能逐条复现现有 golden**，
-   再换新资料生成——否则说不清差异来自资料还是来自重算方式。
-4. 跑 `go test -tags=unit -run '^TestKong' ./internal/service/`。资料里 `family` 为 `gpt` 的候选就是
-   指纹测试可选的目标模型，增删候选会直接改变管理端的可选项。新候选可能从已有模型那里分走概率，
-   上线前按 ModelTrace 参考数据做交叉验证（口径同上游 `bank_builder.calibration_records`）。
+1. 在 fp-lab 补采数据并建库，先通过 `fp-lab/STRATEGY.md` 里的验收（交叉验证、跨批次留出、序贯模拟）。
+2. 把新库文件原样复制为 `backend/internal/service/kong_data/gpt_text_bank.json`，再更新本说明里的版本。
+3. 重算 golden：在工作区的 `fp-lab/` 下运行 `python export_golden.py --library <新库>`，它会重写
+   `testdata/kong_fingerprint_text_golden.json`（含库文件的摘要、各份回答的分段与得分、判定序列）。
+4. 在 `backend/` 下跑 `go test -tags=unit -run '^TestKong' ./internal/service/`：golden 测试先核对摘要与内置库一致，
+   再逐项比对 Go 与 Python 的分段、得分与判定。
+5. 换题就是换库：题目全文在库里，代码不存题目。网关默认 instructions 变了也要重建库。
+
+外部覆盖只用来换同一方法下的新样本：题目、推理强度、阈值、最多份数与难分的那一对都是方法的一部分，管理端弹窗
+与文档按它们写成了固定说明。要改其中任何一项，是改方法，要随代码一起发布并同步弹窗文案与设计文档。

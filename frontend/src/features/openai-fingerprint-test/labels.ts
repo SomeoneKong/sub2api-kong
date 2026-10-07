@@ -40,9 +40,10 @@ export function verdictLabel(result: Pick<FingerprintResult, 'execution' | 'verd
 
 const END_REASON_TEXT: Record<string, string> = {
   reported_model_mismatch: '上游回报的模型与目标模型对不上',
-  fingerprint_confident: '累计指纹归因达到 0.9，且各份归因一致',
-  parts_disagree: '累计归因已达到 0.9，但各份的归因不一致（各次请求可能被路由到不同模型）',
+  fingerprint_confident: '累计指纹归因达到 0.95，且各份归因一致',
+  parts_disagree: '累计归因已达到 0.95，但各份的归因不一致（各次请求可能被路由到不同模型）',
   parts_exhausted: '挑战份数用完，累计归因仍不够下结论',
+  pair_unresolved: '挑战份数用完，能确定是两个相近模型之一，但分不清是哪一个',
   client_cancelled: '测试被取消（弹窗关闭或连接断开）',
   proxy_unavailable: '账号的代理不可用',
   upstream_status: '上游返回了错误状态码',
@@ -58,9 +59,7 @@ export function endReasonText(reason: string): string {
 const INVALID_REASON_TEXT: Record<string, string> = {
   truncated: '正文不完整',
   request_failed: '请求失败',
-  insufficient_digits: '数字个数不足',
-  non_ascii_digits: '含非 ASCII 数字',
-  score_failed: '打分失败',
+  sections_missing: '拆出的题不足 7 道',
 }
 
 /** 一份挑战是否计入归因；不计入时带上原因。 */

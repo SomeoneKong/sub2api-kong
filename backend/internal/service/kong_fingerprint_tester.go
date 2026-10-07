@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -13,24 +14,20 @@ import (
 	"github.com/google/uuid"
 )
 
-// 账号指纹测试：管理员对单个 codex 协议的 OpenAI 账号主动发起，经账号自己的代理发 1～3 份挑战（不带任何
-// 票），用指纹库归因，并对照上游回报的模型给出结论。设计见 DESIGN-openai-fingerprint-test.md。
+// 账号指纹测试：管理员对单个 codex 协议的 OpenAI 账号主动发起，经账号自己的代理发 1～4 份合并挑战
+// （不带任何票），用文本指纹库两层归因，并对照上游回报的模型给出结论。设计见 DESIGN-openai-fingerprint-test.md。
 //
-// 结果回答的是"这几次挑战观察到了什么"，是相对可比的信号，不是绝对档位判定。每一份的原始证据与整次的
-// 结论都落库长期留存，事后只凭库里的记录就能解释当时为什么得出那个结论。
+// 结果回答的是"这几次挑战观察到了什么"，是相对可比的信号，不是绝对档位判定。每一份的原始回答与整次的
+// 结论都落库长期留存，事后只凭库里的记录就能解释当时为什么得出那个结论，换库后也能重算。
 
 const (
-	// kongFingerprintConfidence 是累计归因的最高者达到多少概率才下结论。
-	kongFingerprintConfidence = 0.9
-	kongFingerprintMaxParts   = 3
-	// kongFingerprintRuleVersion 是判定规则的版本，随每次测试落库；改动下面的判定顺序或条件时要加一。
-	kongFingerprintRuleVersion = "1"
+	// kongFingerprintRuleVersion 是判定规则的版本，随每次测试落库；改动判定顺序或条件时要加一。
+	kongFingerprintRuleVersion = "2"
+	// kongFingerprintMinSections 是一份合并回答至少要拆出几道题才计入归因。
+	kongFingerprintMinSections = 7
 	// kongFingerprintPersistTimeout 是一次落库的期限。落库用独立的 context：管理员断开时已经取得的证据
 	// 照样要留下。
 	kongFingerprintPersistTimeout = 10 * time.Second
-	// kongFingerprintTargetFamily 是可以作为挑战目标的模型家族。指纹库里的 Claude 候选只是归因的干扰项，
-	// 发不到 codex 端点。
-	kongFingerprintTargetFamily = "gpt"
 	// kongFingerprintCumulativeTop 是每份结果里附带的累计分布条数。
 	kongFingerprintCumulativeTop = 3
 )
@@ -58,6 +55,7 @@ const (
 	kongFingerprintEndConfident        = "fingerprint_confident"
 	kongFingerprintEndPartsDisagree    = "parts_disagree"
 	kongFingerprintEndPartsExhausted   = "parts_exhausted"
+	kongFingerprintEndPairUnresolved   = "pair_unresolved"
 	kongFingerprintEndCancelled        = "client_cancelled"
 	kongFingerprintEndProxyUnavailable = "proxy_unavailable"
 	kongFingerprintEndUpstreamStatus   = "upstream_status"
@@ -67,11 +65,9 @@ const (
 
 // 一份探测留档但不计入归因的原因。
 const (
-	KongProbeInvalidTruncated      = "truncated"
-	KongProbeInvalidRequestFailed  = "request_failed"
-	KongProbeInsufficientDigits    = "insufficient_digits"
-	KongProbeInvalidNonASCIIDigits = "non_ascii_digits"
-	KongProbeInvalidScoreFailed    = "score_failed"
+	KongProbeInvalidTruncated       = "truncated"
+	KongProbeInvalidRequestFailed   = "request_failed"
+	KongProbeInvalidSectionsMissing = "sections_missing"
 )
 
 // KongFingerprintProbe 是一份挑战的探测记录，写入 kong_fingerprint_probes。
@@ -83,15 +79,23 @@ type KongFingerprintProbe struct {
 	// VerifyEgress 是这份挑战走的出口：账号的代理（`proxy:<id>`）或直连（`direct`）。
 	VerifyEgress string
 	ChallengeID  string
-	// Digits 是归因算法的完整输入。存了它才能在换算法或换校准表之后重算历史结论。
-	Digits          []int
-	DigitCount      int
-	Scores          map[string]float64
+	// AnswerText 是这一份的完整回答正文，是归因的完整输入：换库或换规则后凭它重算。
+	AnswerText string
+	// Digits 是数字指纹时代的列，NOT NULL，文本指纹写空数组。
+	Digits []int
+	// DigitCount 记拆出的题数。
+	DigitCount int
+	// Scores 是这一份对各模型的得分（各题之和）。
+	Scores map[string]float64
+	// SectionScores 是 题名 → 模型 → 得分，说明是哪几道题把结论推向哪边。
+	SectionScores map[string]map[string]float64
+	// PartAttribution 是这一份自己的第一层归因。
 	PartAttribution *string
-	CumProbability  *float64
+	// CumProbability 是累计到这一份为止决定结论的那个概率：进入第二层后是第二层的，否则是第一层的。
+	CumProbability *float64
+	// TemperatureTier 记已计入的有效份数。
 	TemperatureTier *int
-	// LibraryVersion 标识当时用的挑战集、模型中心、环境方向与校准表：换了校准表，同一序列会算出不同
-	// 概率，没有版本标识就既不能复核也不能重算。
+	// LibraryVersion 标识当时用的指纹库与判定规则。
 	LibraryVersion   map[string]any
 	ParseValid       bool
 	CountedInAverage bool
@@ -134,7 +138,8 @@ type KongFingerprintTarget struct {
 	DisplayName string `json:"display_name"`
 }
 
-// KongFingerprintCandidateView 是一个候选模型与它的概率。
+// KongFingerprintCandidateView 是一个候选与它的概率。第一层里难分的一对合并成一个候选，
+// Model 写作 `<模型>|<模型>`。
 type KongFingerprintCandidateView struct {
 	Model       string  `json:"model"`
 	DisplayName string  `json:"display_name"`
@@ -159,24 +164,30 @@ type KongFingerprintTestPart struct {
 	StatusCode    int    `json:"status_code,omitempty"`
 	Error         string `json:"error,omitempty"`
 	ReportedModel string `json:"reported_model,omitempty"`
-	DigitCount    int    `json:"digit_count"`
+	// SectionCount 是从回答里拆出的题数。
+	SectionCount  int    `json:"section_count"`
 	Valid         bool   `json:"valid"`
 	InvalidReason string `json:"invalid_reason,omitempty"`
-	// Attribution 是这一份**自己**最像的模型；Cumulative 是累计到这一份为止的分布。
+	// Attribution 是这一份**自己**在第一层最像的候选；Cumulative 是累计到这一份为止的第一层分布（前几名）；
+	// Pair 是进入第二层后难分的一对各自的概率。
 	Attribution  string                         `json:"attribution,omitempty"`
 	Cumulative   []KongFingerprintCandidateView `json:"cumulative,omitempty"`
+	Pair         []KongFingerprintCandidateView `json:"pair,omitempty"`
 	LatencyMs    int                            `json:"latency_ms,omitempty"`
 	OutputTokens *int                           `json:"output_tokens,omitempty"`
 }
 
 // KongFingerprintTestResult 是整次测试的结论。
 type KongFingerprintTestResult struct {
-	Execution  string                         `json:"execution"`
-	EndReason  string                         `json:"end_reason"`
-	Detail     string                         `json:"detail,omitempty"`
-	Verdict    string                         `json:"verdict,omitempty"`
+	Execution string `json:"execution"`
+	EndReason string `json:"end_reason"`
+	Detail    string `json:"detail,omitempty"`
+	Verdict   string `json:"verdict,omitempty"`
+	// Decided 是指纹结论指向的候选；第二层分不清时是难分的那一对。
+	Decided    string                         `json:"decided,omitempty"`
 	Parts      int                            `json:"parts"`
 	Candidates []KongFingerprintCandidateView `json:"candidates,omitempty"`
+	Pair       []KongFingerprintCandidateView `json:"pair,omitempty"`
 	// PersistError 非空表示有证据没写进库：结论照常给出，但事后读库还原不全。
 	PersistError string `json:"persist_error,omitempty"`
 }
@@ -205,24 +216,13 @@ func NewKongFingerprintTester(accounts KongFingerprintAccountLoader, upstream Ko
 	}, nil
 }
 
-// Targets 返回可选的目标模型：指纹库里的 GPT 候选。
+// Targets 返回可选的目标模型：指纹库里的全部模型。
 func (t *KongFingerprintTester) Targets() []KongFingerprintTarget {
 	out := make([]KongFingerprintTarget, 0, len(t.bank.Models))
 	for _, m := range t.bank.Models {
-		if m.Family == kongFingerprintTargetFamily {
-			out = append(out, KongFingerprintTarget{Model: m.ID, DisplayName: t.bank.DisplayName(m.ID)})
-		}
+		out = append(out, KongFingerprintTarget{Model: m, DisplayName: t.bank.DisplayName(m)})
 	}
 	return out
-}
-
-func (t *KongFingerprintTester) isTarget(model string) bool {
-	for _, target := range t.Targets() {
-		if target.Model == model {
-			return true
-		}
-	}
-	return false
 }
 
 // KongFingerprintRun 是一次已通过校验、占住了账号的测试。必须调用 Execute，它会在结束时释放账号。
@@ -238,7 +238,7 @@ type KongFingerprintRun struct {
 // 请求都要现场签名，签名流程会登记或恢复 task、改动账号状态，所以不在测试范围内。
 func (t *KongFingerprintTester) Begin(ctx context.Context, accountID int64, model string) (*KongFingerprintRun, error) {
 	model = strings.TrimSpace(model)
-	if !t.isTarget(model) {
+	if !t.bank.HasModel(model) {
 		return nil, ErrKongFingerprintTarget
 	}
 	account, err := t.accounts.GetByID(ctx, accountID)
@@ -253,26 +253,27 @@ func (t *KongFingerprintTester) Begin(ctx context.Context, accountID int64, mode
 
 // kongFingerprintState 是一次执行过程中的累计状态。
 type kongFingerprintState struct {
-	answers      []KongFingerprintAnswer
-	result       *KongFingerprintResult
-	predictions  []string // 各份有效回答自己的归因
+	// valid 是各份有效回答的得分。
+	valid        []map[string]float64
+	decision     kongTextDecision
 	parts        int
 	persistError string
 }
 
-// Execute 逐份发挑战、落证据、推进度，直到命中判定规则、三份用完、失败或被取消。ctx 取消（管理员断开）
+// Execute 逐份发挑战、落证据、推进度，直到命中判定规则、份数用完、失败或被取消。ctx 取消（管理员断开）
 // 时正在进行的那一份立即中止，已完成的份已经落库。
 func (r *KongFingerprintRun) Execute(ctx context.Context, emit func(KongFingerprintTestEvent)) {
 	t := r.t
 	defer t.running.Delete(r.account.ID)
 
+	bank := t.bank
 	rec := &KongFingerprintTestRecord{
 		VerificationID: t.newID(), AccountID: r.account.ID, TargetModel: r.model,
 		ProxyID: kongCopyInt64Ptr(r.account.ProxyID), StartedAt: t.now(), RuleVersion: kongFingerprintRuleVersion,
 	}
 	st := &kongFingerprintState{}
 	st.notePersist(t.persist(func(pctx context.Context) error { return t.store.InsertFingerprintTest(pctx, rec) }))
-	emit(KongFingerprintTestEvent{Type: "started", TestID: rec.VerificationID, TargetModel: r.model, MaxParts: kongFingerprintMaxParts})
+	emit(KongFingerprintTestEvent{Type: "started", TestID: rec.VerificationID, TargetModel: r.model, MaxParts: bank.MaxParts()})
 
 	finish := func(execution, reason, detail, verdict string) {
 		rec.Execution, rec.EndReason, rec.Verdict, rec.FinishedAt = execution, reason, verdict, t.now()
@@ -280,12 +281,14 @@ func (r *KongFingerprintRun) Execute(ctx context.Context, emit func(KongFingerpr
 		result := &KongFingerprintTestResult{
 			Execution: execution, EndReason: reason, Detail: detail, Verdict: verdict,
 			Parts: st.parts, PersistError: st.persistError,
+			Candidates: t.candidates(st.decision.Level1, 0), Pair: t.candidates(st.decision.Pair, 0),
 		}
-		if st.result != nil {
-			result.Candidates = kongFingerprintCandidates(st.result, 0)
+		if execution == KongFingerprintExecCompleted && reason != kongFingerprintEndReportedMismatch {
+			result.Decided = st.decision.Decided
 		}
 		slog.Info("kong fingerprint: 指纹测试结束", "account_id", r.account.ID, "target_model", r.model,
-			"test_id", rec.VerificationID, "execution", execution, "end_reason", reason, "verdict", verdict, "parts", st.parts)
+			"test_id", rec.VerificationID, "execution", execution, "end_reason", reason, "verdict", verdict,
+			"decided", result.Decided, "parts", st.parts)
 		emit(KongFingerprintTestEvent{Type: "done", TestID: rec.VerificationID, Result: result})
 	}
 
@@ -300,29 +303,26 @@ func (r *KongFingerprintRun) Execute(ctx context.Context, emit func(KongFingerpr
 		return
 	}
 	egress := kongFingerprintEgress(r.account.ProxyID)
-	challenges := KongFingerprintChallenges()
-	for i := 0; i < kongFingerprintMaxParts && i < len(challenges); i++ {
+	challenge := bank.Challenge
+	for i := 0; i < bank.MaxParts(); i++ {
 		if ctx.Err() != nil {
 			finish(KongFingerprintExecCancelled, kongFingerprintEndCancelled, "", "")
 			return
 		}
-		challenge := challenges[i]
 		emit(KongFingerprintTestEvent{Type: "part_started", TestID: rec.VerificationID,
 			Part: &KongFingerprintTestPart{Index: i + 1, ChallengeID: challenge.ID}})
 		answer, runErr := t.upstream.RunChallenge(ctx, r.account, proxyURL, r.model, challenge)
 		st.parts++
 		probe := &KongFingerprintProbe{
 			VerificationID: rec.VerificationID, PartIndex: i + 1, AccountID: r.account.ID, TargetModel: r.model,
-			VerifyEgress: egress, ChallengeID: challenge.ID, LibraryVersion: t.bank.Version(),
+			VerifyEgress: egress, ChallengeID: challenge.ID, Digits: []int{}, LibraryVersion: bank.Version(),
 		}
 		part := &KongFingerprintTestPart{Index: i + 1, ChallengeID: challenge.ID}
 		if answer != nil {
+			// 即使这一份最终不可用，也先把原始回答留下来。
+			probe.AnswerText = answer.Text
 			probe.LatencyMs, probe.OutputTokens, probe.ReportedModel = kongIntPtr(answer.LatencyMs), answer.OutputTokens, answer.ReportedModel
 			part.StatusCode, part.LatencyMs, part.OutputTokens, part.ReportedModel = answer.StatusCode, answer.LatencyMs, answer.OutputTokens, answer.ReportedModel
-			// 即使这一份最终不可用，也先把原始数字序列留下来。
-			if numbers := kongFPParseNumbers(answer.Text); len(numbers) > 0 {
-				probe.Digits, probe.DigitCount = numbers, len(numbers)
-			}
 		}
 
 		// 规则 1：这一份请求失败（发送失败、上游非 2xx、超时）或被取消，测试到此为止。
@@ -335,7 +335,6 @@ func (r *KongFingerprintRun) Execute(ctx context.Context, emit func(KongFingerpr
 				part.Error = runErr.Error()
 			}
 			st.notePersist(t.persist(func(pctx context.Context) error { return t.store.InsertFingerprintProbe(pctx, probe) }))
-			part.DigitCount = probe.DigitCount
 			emit(KongFingerprintTestEvent{Type: "part", TestID: rec.VerificationID, Part: part})
 			switch {
 			case cancelled:
@@ -356,19 +355,24 @@ func (r *KongFingerprintRun) Execute(ctx context.Context, emit func(KongFingerpr
 			probe.InvalidReason = &reason
 			part.Error = runErr.Error()
 		} else {
-			t.takeAnswer(st, probe, answer.Text, challenge.ExpectedCount)
+			t.takeAnswer(st, probe, answer.Text)
+		}
+		// 无论这一份有没有计入，份数都用掉了：用完时要据此收尾。
+		st.decision = bank.Decide(st.valid, st.parts, r.model)
+		if n := len(st.valid); n > 0 {
+			probe.TemperatureTier = kongIntPtr(n)
+			probe.CumProbability = kongFingerprintDecidingProbability(st.decision)
 		}
 		st.notePersist(t.persist(func(pctx context.Context) error { return t.store.InsertFingerprintProbe(pctx, probe) }))
-		part.DigitCount, part.Valid = probe.DigitCount, probe.CountedInAverage
+		part.SectionCount, part.Valid = probe.DigitCount, probe.CountedInAverage
 		if probe.InvalidReason != nil {
 			part.InvalidReason = *probe.InvalidReason
 		}
 		if probe.PartAttribution != nil {
 			part.Attribution = *probe.PartAttribution
 		}
-		if st.result != nil {
-			part.Cumulative = kongFingerprintCandidates(st.result, kongFingerprintCumulativeTop)
-		}
+		part.Cumulative = t.candidates(st.decision.Level1, kongFingerprintCumulativeTop)
+		part.Pair = t.candidates(st.decision.Pair, 0)
 		emit(KongFingerprintTestEvent{Type: "part", TestID: rec.VerificationID, Part: part})
 
 		// 规则 2：上游回报了模型名且与目标对不上。没回报不算对不上，只是少一项证据。
@@ -377,60 +381,52 @@ func (r *KongFingerprintRun) Execute(ctx context.Context, emit func(KongFingerpr
 				fmt.Sprintf("上游回报 %s", answer.ReportedModel), KongFingerprintVerdictMismatch)
 			return
 		}
-		// 规则 3、4：累计归因够把握时，各份有效回答的单份归因都指向同一个候选才下结论——不带票的各份请求
-		// 不保证被路由到同一个模型，各份指向不同时只报告观察到了差异。
-		if st.result != nil && st.result.Probability >= kongFingerprintConfidence {
-			if !st.allPredict(st.result.Prediction) {
-				finish(KongFingerprintExecCompleted, kongFingerprintEndPartsDisagree, "", KongFingerprintVerdictInconclusive)
-				return
+		// 规则 3～8：两层判定（kongTextDecision）。
+		if d := st.decision; d.Verdict != "" {
+			detail := ""
+			if d.Reason == kongFingerprintEndPairUnresolved {
+				detail = fmt.Sprintf("%s 与 %s 之一，分不清是哪一个", bank.Group[0], bank.Group[1])
+			} else if d.Decided != "" {
+				detail = "指纹判为 " + bank.DisplayName(d.Decided)
 			}
-			verdict := KongFingerprintVerdictMismatch
-			if st.result.Prediction == r.model {
-				verdict = KongFingerprintVerdictMatch
-			}
-			finish(KongFingerprintExecCompleted, kongFingerprintEndConfident, "", verdict)
+			finish(KongFingerprintExecCompleted, d.Reason, detail, d.Verdict)
 			return
 		}
 	}
-	// 规则 5：份数用完仍未命中以上任何一条。
+	// 份数用完时 Decide 必然给出结论，走到这里说明判定规则有缺口，按判不准收尾。
 	finish(KongFingerprintExecCompleted, kongFingerprintEndPartsExhausted, "", KongFingerprintVerdictInconclusive)
 }
 
-// takeAnswer 把一份回答计入证据、回填该份的观测字段，并更新累计归因。
-func (t *KongFingerprintTester) takeAnswer(st *kongFingerprintState, probe *KongFingerprintProbe, text string, expected int) {
-	st.answers = append(st.answers, KongFingerprintAnswer{Text: text, ExpectedCount: expected})
-	attributed, err := KongFingerprintAttribute(st.answers, t.bank)
-	if attributed != nil && len(attributed.Parts) > 0 {
-		last := attributed.Parts[len(attributed.Parts)-1]
-		probe.Digits, probe.DigitCount = last.Numbers, last.ParsedNumbers
-		probe.ParseValid, probe.CountedInAverage = last.Accepted, last.Accepted
-		if last.Accepted {
-			probe.Scores = kongScoresByModel(last.Scores, t.bank)
-			if pred, ok := KongFingerprintPartPrediction(last, t.bank); ok {
-				probe.PartAttribution = &pred
-				st.predictions = append(st.predictions, pred)
-			}
-		} else if last.InvalidReason != "" {
-			reason := last.InvalidReason
-			probe.InvalidReason = &reason
-		}
+// takeAnswer 给一份完整回答打分、回填该份的观测字段；拆出的题够数时计入归因。
+func (t *KongFingerprintTester) takeAnswer(st *kongFingerprintState, probe *KongFingerprintProbe, text string) {
+	scored := t.bank.ScoreAnswer(text)
+	probe.DigitCount = scored.SectionCount
+	if scored.SectionCount > 0 {
+		probe.Scores, probe.SectionScores = scored.Scores, scored.Sections
 	}
-	if err != nil {
-		// 还没有任何可用回答：这一份照常留档，继续下一份。
+	if scored.SectionCount < kongFingerprintMinSections {
+		reason := KongProbeInvalidSectionsMissing
+		probe.InvalidReason = &reason
 		return
 	}
-	st.result = attributed
-	probe.CumProbability = &attributed.Probability
-	probe.TemperatureTier = kongIntPtr(kongTierToInt(attributed.CalibrationTier))
+	probe.ParseValid, probe.CountedInAverage = true, true
+	attribution := t.bank.PartAttribution(scored.Scores)
+	probe.PartAttribution = &attribution
+	st.valid = append(st.valid, scored.Scores)
 }
 
-func (st *kongFingerprintState) allPredict(model string) bool {
-	for _, p := range st.predictions {
-		if p != model {
-			return false
-		}
+// kongFingerprintDecidingProbability 是决定结论的那个概率：进入第二层后取这一对里较高的，否则取第一层最高者。
+func kongFingerprintDecidingProbability(d kongTextDecision) *float64 {
+	var p float64
+	switch {
+	case len(d.Pair) == 2:
+		p = math.Max(d.Pair[0].Probability, d.Pair[1].Probability)
+	case len(d.Level1) > 0:
+		p = kongTextTop(d.Level1).Probability
+	default:
+		return nil
 	}
-	return true
+	return &p
 }
 
 func (st *kongFingerprintState) notePersist(err error) {
@@ -453,43 +449,20 @@ func (t *KongFingerprintTester) persist(fn func(context.Context) error) error {
 	return nil
 }
 
-// kongFingerprintCandidates 按概率从高到低列出候选；limit 为 0 表示全部。
-func kongFingerprintCandidates(result *KongFingerprintResult, limit int) []KongFingerprintCandidateView {
-	out := make([]KongFingerprintCandidateView, 0, len(result.Candidates))
-	for _, c := range result.Candidates {
-		out = append(out, KongFingerprintCandidateView{Model: c.Model, DisplayName: c.DisplayName, Probability: c.Probability})
+// candidates 按概率从高到低列出候选；limit 为 0 表示全部。
+func (t *KongFingerprintTester) candidates(classes []kongTextClassProb, limit int) []KongFingerprintCandidateView {
+	if len(classes) == 0 {
+		return nil
+	}
+	out := make([]KongFingerprintCandidateView, 0, len(classes))
+	for _, c := range classes {
+		out = append(out, KongFingerprintCandidateView{Model: c.Class, DisplayName: t.bank.DisplayName(c.Class), Probability: c.Probability})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Probability > out[j].Probability })
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
 	return out
-}
-
-// kongScoresByModel 把按 model_order 排列的分数向量变成带模型名的映射。
-// 存名字而不是下标：换一份校准资料时 model_order 会变，靠下标读历史记录会读到别的模型上去。
-func kongScoresByModel(scores []float64, bank *KongFingerprintBank) map[string]float64 {
-	if bank == nil || len(scores) != len(bank.Robust.ModelOrder) {
-		return nil
-	}
-	out := make(map[string]float64, len(scores))
-	for i, id := range bank.Robust.ModelOrder {
-		out[id] = scores[i]
-	}
-	return out
-}
-
-func kongTierToInt(tier string) int {
-	switch tier {
-	case "1":
-		return 1
-	case "2":
-		return 2
-	case "3":
-		return 3
-	default:
-		return 0
-	}
 }
 
 // kongModelSnapshotMatch 判定 reported 是不是 base 这个模型（含它的快照版本）。

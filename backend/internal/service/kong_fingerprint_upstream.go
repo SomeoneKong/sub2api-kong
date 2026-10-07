@@ -78,7 +78,7 @@ func (u *kongFingerprintUpstream) ResolveProxyURL(ctx context.Context, proxyID *
 	return url, nil
 }
 
-// kongChallengeTimeout 是一份挑战的期限。生产上单份挑战 p95 约 82 秒。
+// kongChallengeTimeout 是一份挑战的期限。一份合并挑战通常 7～25 秒，期限给上游排队留足余量。
 const kongChallengeTimeout = 180 * time.Second
 
 // kongFingerprintAccessToken 取账号上存着的 access token，口径与"测试连接"相同。不经 token provider：
@@ -92,11 +92,13 @@ func kongFingerprintAccessToken(account *Account) (string, error) {
 	return token, nil
 }
 
-// buildCodexRequest 构造一个 codex responses 请求。
+// buildCodexRequest 构造一个 codex responses 请求。instructions 固定为网关的默认 instructions、推理强度取自
+// 挑战：两者都与建库时一致，否则请求经网关时会按模型注入不同的基础提示词、各模型按各自默认的强度作答，
+// 写法与库里的样本不可比。
 //
 // 头部照上游探测请求的口径补齐：originator 与 UA 首段必须配套、version 不得低于下限，否则上游直接
 // 404。这几条都由 applyOpenAICodexProbeHeaders / enforceCodexIdentityHeadersWithUA 收口。
-func (u *kongFingerprintUpstream) buildCodexRequest(ctx context.Context, account *Account, model, prompt string) (*http.Request, error) {
+func (u *kongFingerprintUpstream) buildCodexRequest(ctx context.Context, account *Account, model string, challenge KongFingerprintChallenge) (*http.Request, error) {
 	if account == nil {
 		return nil, fmt.Errorf("账号为空")
 	}
@@ -111,12 +113,13 @@ func (u *kongFingerprintUpstream) buildCodexRequest(ctx context.Context, account
 			"role": "user",
 			"content": []any{map[string]any{
 				"type": "input_text",
-				"text": prompt,
+				"text": challenge.Prompt,
 			}},
 		}},
 		"stream":       true,
 		"store":        false,
 		"instructions": openai.DefaultInstructions,
+		"reasoning":    map[string]any{"effort": challenge.Effort},
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -145,7 +148,7 @@ func (u *kongFingerprintUpstream) RunChallenge(ctx context.Context, account *Acc
 	ctx, cancel := context.WithTimeout(ctx, kongChallengeTimeout)
 	defer cancel()
 
-	req, err := u.buildCodexRequest(ctx, account, model, challenge.Prompt)
+	req, err := u.buildCodexRequest(ctx, account, model, challenge)
 	if err != nil {
 		return nil, err
 	}
@@ -204,8 +207,7 @@ func kongReadCodexSSEText(body io.Reader) (kongSSEAnswer, error) {
 	}
 
 	// 流首可能有一个 UTF-8 BOM。不吃掉它，第一行就变成 "\ufeffdata: {...}"，`data:` 前缀匹配不上
-	// ——那一整个事件被当作未知字段行忽略，正文少掉第一段。而归因只看「数字够不够」，少一段仍然够，
-	// 于是一份被静默截断的回答照样会被计入归因。
+	// ——那一整个事件被当作未知字段行忽略，正文少掉第一段，而少几道题的回答仍可能够数计入归因。
 	if head, err := reader.Peek(3); err == nil && bytes.Equal(head, []byte{0xEF, 0xBB, 0xBF}) {
 		_, _ = reader.Discard(3)
 	}
@@ -214,9 +216,9 @@ func kongReadCodexSSEText(body io.Reader) (kongSSEAnswer, error) {
 	// 按 SSE 的事件边界收集：**一个事件可以有多行 `data:`**，规范要求把它们用换行连起来再当成
 	// 一份载荷。逐行各自解码是错的——多行事件的每一行都不是完整 JSON，于是每一行都解码失败。
 	var dataLines []string
-	// 解码失败必须让**这一份挑战**失败，不能 continue。丢掉一个 delta 事件只会让正文少几个数字，
-	// 而归因只看「数字够不够」——217 个数字和 218 个数字都够，于是一份被静默损坏的回答照样能
-	// 计入归因。证据不完整时唯一正确的处置是不给结论。
+	// 解码失败必须让**这一份挑战**失败，不能 continue。丢掉一个 delta 事件只会让正文少几个词，
+	// 照样能拆出足够的题，于是一份被静默损坏的回答照样能计入归因。证据不完整时唯一正确的处置是
+	// 不给结论。
 	flush := func() error {
 		if len(dataLines) == 0 {
 			return nil
