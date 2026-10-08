@@ -39,7 +39,8 @@ FRONTEND_CRITICAL_VITEST := \
 	src/features/usage-latency/__tests__/outputSpeed.spec.ts \
 	src/features/openai-session-limit/__tests__/sessionLimit.spec.ts \
 	src/features/openai-session-limit/__tests__/EditAccountModal.sessionLimit.spec.ts \
-	src/features/openai-session-limit/__tests__/AccountCapacityCell.sessionLimit.spec.ts
+	src/features/openai-session-limit/__tests__/AccountCapacityCell.sessionLimit.spec.ts \
+	src/features/api-key-distribution/__tests__/ApiKeyDistributionChart.spec.ts
 
 # 一键编译前后端
 build: build-backend build-frontend
