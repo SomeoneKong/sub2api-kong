@@ -27,6 +27,7 @@
 - **请求存活续期**（并发槽与会话登记在请求进行中续期，设计见 `DESIGN-request-liveness.md`）
 - **账号选择与 credits**（计划输入生效时的定层、两轮排序、credits 层与容量视图，设计见
   `DESIGN-openai-plan-dispatch.md`）
+- **用量页的 API 密钥使用分布**（普通用户用量页按 API key 汇总的图表与它的查询端点，见下文挂点一节）
 - **OpenAI 账号降档哨兵**（上游不认服务分组里某个账号自己刚签发的票时关掉它的调度、测指纹确认，只止损不恢复，设计见
   `DESIGN-account-downgrade-guard.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
@@ -368,6 +369,19 @@ handler / routes 下的同名文件，另有几处在节奏与会话组件里（
   新增的等槽重试点、抢槽点要经 `KongWaitConcurrency`（否则排队中的请求按入队时的旧上限获准，限速在那条路径上放宽），新增的
   排队结束点要记限速挤压（HTTP 用 `kongHotNoteRequestWait`）；上游新增的"查额度并写缓存"路径要加账号锁（否则较早的查询可能
   晚于较新的落库，观测倒退）。
+
+### 用量页的 API 密钥使用分布
+
+- **后端只加文件，筛选条件照抄统计卡片**。查询端点 `GET /api/v1/usage/dashboard/kong-api-key-stats` 复用
+  `parseUserUsageFilters`（只统计当前用户），查询是 `UsageService` 经接口断言取的可选仓库方法，不加进上游的
+  `UsageLogRepository` 接口；碰上游的只有 `routes/user.go` 一行。
+- **rebase 时复核**：仓库里的 `kongUsageLogFilterConditions` 照抄 `GetStatsWithFilters` 的条件构造（上游没有可复用
+  的函数），上游若给统计卡片加了筛选项或改了条件写法，要同步过来——漏了不报错，只会让各 key 的合计与统计卡片对
+  不上。
+- **前端**（`features/api-key-distribution/`）碰上游的点分两类。**追加**：普通用户 `views/user/UsageView.vue` 两行
+  import、一行取数声明、`applyFilters` 与 `refreshData` 各一行加载，`i18n/locales/{en,zh}/dashboard.ts` 的
+  `usage` 段各一个键。**替换**：同一视图第二行图表里 `TokenUsageTrend` 换成新图表，趋势图移到下面单独占一行。管理
+  员用量页不接。
 
 ### OpenAI 账号降档哨兵
 
