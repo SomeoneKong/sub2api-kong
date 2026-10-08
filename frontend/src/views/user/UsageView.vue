@@ -62,8 +62,10 @@
             :start-date="startDate"
             :end-date="endDate"
           />
-          <TokenUsageTrend :trend-data="trendData" :loading="chartsLoading" />
+          <ApiKeyDistributionChart :stats="kongApiKeyStats" :loading="kongApiKeyStatsLoading" />
         </div>
+
+        <TokenUsageTrend :trend-data="trendData" :loading="chartsLoading" />
       </div>
 
       <div class="card p-6">
@@ -234,6 +236,8 @@ import ModelDistributionChart from '@/components/charts/ModelDistributionChart.v
 import GroupDistributionChart from '@/components/charts/GroupDistributionChart.vue'
 import EndpointDistributionChart from '@/components/charts/EndpointDistributionChart.vue'
 import TokenUsageTrend from '@/components/charts/TokenUsageTrend.vue'
+import ApiKeyDistributionChart from '@/features/api-key-distribution/ApiKeyDistributionChart.vue'
+import { useKongApiKeyStats } from '@/features/api-key-distribution/api'
 import Icon from '@/components/icons/Icon.vue'
 import UserErrorRequestsTable from '@/components/user/UserErrorRequestsTable.vue'
 import { getPersistedPageSize } from '@/composables/usePersistedPageSize'
@@ -269,6 +273,7 @@ const groupStats = ref<GroupStat[]>([])
 const inboundEndpointStats = ref<EndpointStat[]>([])
 const upstreamEndpointStats = ref<EndpointStat[]>([])
 const endpointPathStats = ref<EndpointStat[]>([])
+const { stats: kongApiKeyStats, loading: kongApiKeyStatsLoading, load: loadKongApiKeyStats } = useKongApiKeyStats()
 
 const loading = ref(false)
 const chartsLoading = ref(false)
@@ -546,6 +551,7 @@ const applyFilters = () => {
   void loadStats()
   void loadModelStats()
   void loadChartData()
+  void loadKongApiKeyStats(normalizedFilters.value)
   resetErrorRows()
 }
 
@@ -554,6 +560,7 @@ const refreshData = () => {
   void loadStats()
   void loadModelStats()
   void loadChartData()
+  void loadKongApiKeyStats(normalizedFilters.value)
   if (activeTab.value === 'errors') void loadErrors()
 }
 

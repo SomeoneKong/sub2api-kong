@@ -381,6 +381,7 @@ export default {
     requestedReasoningEffort: 'Requested reasoning effort',
     endpoint: 'Endpoint',
     endpointDistribution: 'Endpoint Distribution',
+    apiKeyDistribution: 'API Key Distribution',
     inbound: 'Inbound',
     upstream: 'Upstream',
     mapping: 'Mapping',
