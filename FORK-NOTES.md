@@ -8,7 +8,7 @@
 
 ## 定制的边界
 
-只碰十三类东西：**codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）、
+只碰十四类东西：**codex 票的被动观测**（收票与请求特征，设计见 `DESIGN-codex-ticket.md`）、
 **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）、
 **OpenAI 请求体快速路径**（跳过必然不改写的处理、复用顶层查找，设计见 `DESIGN-openai-request-body-fastpath.md`）、
 **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）、**OpenAI 账号消耗节奏**（旧版选号的重排，设计见
@@ -20,7 +20,8 @@
 可在列设置里隐藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会
 显示）、**账号计划执行端用到的管理端点**（按到期时间指定重置卡的用卡端点，设计见
 `DESIGN-openai-plan-reset-by-expiry.md`）、**账号选择与 credits**（计划输入生效时的定层、两轮排序、
-credits 层与容量视图，设计见 `DESIGN-openai-plan-dispatch.md`），以及
+credits 层与容量视图，设计见 `DESIGN-openai-plan-dispatch.md`）、**用量页的 API 密钥使用分布**（普通用户
+用量页按 API key 汇总的图表与它的查询端点，见下文维护约定），以及
 **fork 自身必须适配的部分**（版本检查、发布标识）。
 上游其余部分一律不动——定制面越窄，越能持续跟上上游的 bug 修复。
 
@@ -72,6 +73,7 @@ credits 层与容量视图，设计见 `DESIGN-openai-plan-dispatch.md`），以
 | **按到期时间指定重置卡的用卡端点只加文件，不改上游接口** | `kong-reset-quota` 的 handler 通过接口断言取服务层的 `KongResetCreditByExpiry`，不往上游的 `openAIQuotaService` 接口里加方法（那会连带改上游测试桩）。到期时间在服务层现查卡明细换成卡 ID，卡 ID 仍不出服务层；`redeem_request_id` 由调用方稳定生成、原样交上游做幂等。碰上游的只有 `routes/admin.go` 一行。设计见 `DESIGN-openai-plan-reset-by-expiry.md` |
 | 接转发链路用「可选依赖 + setter」 | `OpenAIGatewayService` 的构造函数参数表很长且是上游高频改动面。加字段 + `SetKongTicketObserver` 能把改动收在一处，未注入时所有接入点退化为空操作 |
 | 前端定制放 `frontend/src/features/<主题>/`，上游文件只做单行追加或单处替换 | 用量明细的请求特征列（`features/request-features/`）碰上游的点全是**追加**：`UsageTable.vue` 一行 import 与一个 `#cell-request_features` 插槽、`types/index.ts` 里 `AdminUsageLog` 的 `kong_request_features` 字段、管理员 `views/admin/UsageView.vue` 的列定义一项（标签用中文字面量，不加 i18n 键）。账号指纹测试（`features/openai-fingerprint-test/`，文案在 feature 内）碰上游的只有两处各两行：`AccountActionMenu.vue`「测试连接」下方的菜单项组件与它的 import，`AccountsView.vue` 的弹窗宿主与它的 import——弹窗不能挂在菜单里，菜单关闭时菜单组件随之卸载。前端展示调整（`features/openai-usage-window/`、`features/usage-latency/`）碰上游的点分两类：**追加**——`AccountUsageCell.vue` 与 `UsageTable.vue` 各一行 import，`UsageTable.vue` 延迟列网格里的「速度」一行（接在上游的「输出 TPS」之后：上游是输出 token ÷ 总耗时，含排队与首字等待；这里除以去掉首字的生成时长，口径不同，两行并存），`i18n/locales/{en,zh}/dashboard.ts` 的 `usage` 段各两个键；**替换**——`AccountUsageCell.vue` OpenAI OAuth 分支 5h 进度条的 `v-if` 条件、管理员 `views/admin/UsageView.vue` 的 `ALWAYS_VISIBLE` 去掉 `user`。会话数上限（`features/openai-session-limit/`）同样分两类：**追加**——`EditAccountModal.vue` 的两行 import、并发数网格里的输入框、`syncFormFromAccount` 里取值、提交前的 `applyOpenAISessionLimit`，`i18n/locales/{en,zh}/admin/accounts.ts` 的 `kongSessionLimit` 段；**替换**——`AccountCapacityCell.vue` 会话徽标的显示条件与满额提示。替换点在上游改到同一行时必然冲突，rebase 时先看这几处。定制的前端单测都要追加到根 `Makefile` 的 `FRONTEND_CRITICAL_VITEST`，CI 只跑这份清单 |
+| **用量页的 API 密钥使用分布：后端只加文件，筛选条件照抄统计卡片** | 查询端点 `GET /api/v1/usage/dashboard/kong-api-key-stats` 复用 `parseUserUsageFilters`（只统计当前用户），查询是 `UsageService` 经接口断言取的可选仓库方法，不加进上游的 `UsageLogRepository` 接口；碰上游的只有 `routes/user.go` 一行。仓库里的 `kongUsageLogFilterConditions` 照抄 `GetStatsWithFilters` 的条件构造（上游没有可复用的函数），**rebase 时上游若给统计卡片加了筛选项或改了条件写法，要同步过来**——漏了不报错，只会让各 key 的合计与统计卡片对不上。前端在 `features/api-key-distribution/`，碰上游的点：**追加**——普通用户 `views/user/UsageView.vue` 两行 import、一行取数声明、`applyFilters` 与 `refreshData` 各一行加载，`i18n/locales/{en,zh}/dashboard.ts` 的 `usage` 段各一个键；**替换**——同一视图第二行图表里 `TokenUsageTrend` 换成新图表，趋势图移到下面单独占一行。管理员用量页不接 |
 | 后端响应结构要显式写 `json` tag | 本功能的 handler 直接序列化 service 层结构体。上游那些结构多数也没 tag，但我们的响应里混着 `gin.H` 的 snake_case 字段——不写 tag 会让同一个响应里两种命名风格并存，前端类型也跟着别扭 |
 | `upstream` remote 禁止 push | `git remote set-url --push upstream DISABLED` |
 | `base/*` tag 必须 push 到 origin | push 后该 commit object 即归本仓库。上游会 force push、删 tag、撤 release，不这么做就得靠运气 |
