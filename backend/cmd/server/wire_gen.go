@@ -329,6 +329,8 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	concurrencyService.SetKongRequestLiveness(kongLiveness)
 	openAIGatewayService.SetKongRequestLiveness(kongLiveness)
 	kongLiveness.Start()
+	// [kong] Codex 目录的版本存档与多数对外（DESIGN-codex-catalog-consensus.md）：不预加载，客户端版本第一次被请求时才读库。
+	openAIGatewayService.SetKongCodexCatalog(service.NewKongCodexCatalog(repository.NewKongCodexCatalogRepository(db), openAIGatewayService))
 	usageRecordWorkerPool := service.NewUsageRecordWorkerPool(configConfig)
 	userMsgQueueCache := repository.NewUserMsgQueueCache(redisClient)
 	userMessageQueueService := service.ProvideUserMessageQueueService(userMsgQueueCache, rpmCache, configConfig)
@@ -699,6 +701,12 @@ func provideCleanup(
 			{"KongRequestLiveness", func() error {
 				if openAIGateway != nil {
 					openAIGateway.StopKongRequestLiveness()
+				}
+				return nil
+			}},
+			{"KongCodexCatalog", func() error {
+				if openAIGateway != nil {
+					openAIGateway.StopKongCodexCatalog()
 				}
 				return nil
 			}},
