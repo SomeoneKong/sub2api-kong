@@ -14,6 +14,8 @@
 - **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）
 - **OpenAI 账号消耗节奏**（旧版选号的重排，设计见 `DESIGN-openai-account-pace.md`）
 - **Codex 模型目录的上下文窗口折算**（见下文挂点一节）
+- **Codex 模型目录的版本存档与多数对外**（目录全文按版本存档，对外版本由分组内最高一档账号的观测计票决定，
+  设计见 `DESIGN-codex-catalog-consensus.md`）
 - **发往官方 ChatGPT 后端的请求体 zstd 压缩**（省出站流量，见下文挂点一节）
 - **前端展示调整**（账号页：OpenAI Pro 20x / Pro 5x 只有 7d 主窗口，不显示 5h；管理员用量页：用户列可在列设置里隐
   藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会显示）
@@ -152,10 +154,30 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
 
 - **挂在 `CodexModels` 的每个写出口**。上游目录的 `max_context_window` 在 codex 里是「配置覆盖允许的上限」，网关按
   它 × 比例抬高 `context_window`（只往上调），客户端就不必各自配 `model_context_window` 或钉本地目录。handler
-  的固定账号、分组配置、调度三条分支各自写响应，每处写出前都调 `KongFinalizeCodexModelsManifest`；传给上游构建
+  的固定账号、分组配置、调度三条分支与版本存档的出口各自写响应，每处写出前都调 `KongFinalizeCodexModelsManifest`；传给上游构建
   函数的 If-None-Match 一律为空串，304 由它按折算后的 ETag 判定——否则持有折算前 ETag 的客户端永远拿不到折算结
   果。rebase 时上游若新增写出分支，要一并接上。
 - **开关**：环境变量 `KONG_CODEX_CONTEXT_WINDOW_RATIO`，不设置为 1（取 max），0 关闭，写错则关闭并记错误日志。
+
+### Codex 模型目录的版本存档
+
+- **挂在 `CodexModels` 的调度器分支，四处**。函数开头一行记入口时刻（冷启动预算的起点）；循环之前一处 `kongServeCodexCatalog`：选得出对外版本就照原样合并、
+  折算、写出（`handler/kong_codex_catalog.go`），选不出就把回退句柄交给循环；循环里的拉取换成
+  `KongFetchCodexModelsManifest`，纳管账号（合格的 OAuth 账号）经组件的准入与任务，冷却中又没有观测时返回
+  "排除"，循环排除它继续选号、不计换号次数，其余账号照原样拉取。另有 `fetchCachedOpenAIModels` 函数头一行：
+  上下文带任务标记时直接调用拉取函数，不查不写账号级缓存，任务的超时与取消才管得到真实请求。
+- **资格口径复用旧版选号**：投票人与采样候选取 `listSchedulableAccounts` 经
+  `resolveFreshSchedulableOpenAIAccountBeforeProfit`（空模型名、额度自动暂停上下文），再补分组归属
+  （`openAIAccountMatchesSchedulingGroup`）与分组隐私要求两项，任务开始前用
+  `recheckSelectedOpenAIAccountFromDBBeforeProfit` 复核再 `hydrateSelectedAccount`。上游改这几处的过滤时自动跟随；
+  上游若在读库复核里新增检查项，候选筛选要同步补上，否则不合格账号会占据最高档。
+- **rebase 时复核**：上游若在调度器分支新增拉取点或改了换号计数，要经同一个挂点；若给 `fetchCachedOpenAIModels`
+  加了新的缓存层或后台刷新，确认任务标记仍让拉取直接打到上游；若开始改写 OAuth 账号的上游清单（现在是原样透传），
+  确认存档存的仍是上游原文；若给目录请求新增了需要按账号改写清单的情形，要同步收窄合格账号的判断
+  （`kongCodexCatalogEligible`）。漏接不报错，只会让那条路径绕过准入或存档。
+- **装配**（`wire_gen.go`）：建组件，`SetKongCodexCatalog` 注入网关服务；cleanup 里 `StopKongCodexCatalog`
+  取消并等待拉取任务，排在关库之前。
+- **开关**：环境变量 `KONG_CODEX_CATALOG_CONSENSUS`，不设置为开，false 关闭，写错则关闭并记错误日志。
 
 ### 发往官方 ChatGPT 后端的请求体 zstd 压缩
 
@@ -328,6 +350,10 @@ handler / routes 下的同名文件，另有几处在节奏与会话组件里（
 the CAS`）。**它在纯上游基线 tag 上同样失败**，与本 fork 的定制无关，CI（Linux）也是绿的——
 属平台或时序相关。遇到时不要顺着它排查，先在 `git worktree add <tmp> <base tag>` 的纯上游树上
 复现一次，确认是上游自带的再放过。
+
+`TestCommandCodeGatewayPassesThroughCatalogProtocols` 在 Windows 上时过时不过（纯上游代码上实测 40 次失败 31 次）：
+它用 `time.Now().UnixNano()` 拼唯一地址，Windows 时钟粒度粗，相邻两次调用会拿到同一个值、撞上同一个缓存键。
+遇到时同样先在纯上游树上复现。
 
 gjson 副本的 `TestJSONString` 在 Go 1.27 下失败，原版 v1.18.0 同样失败，与副本的改动无关。跑副本的测试时用
 `go test -skip TestJSONString ./...`。副本是嵌套 module，父模块的 `go test ./...` 不会跑到它，要单独跑。
