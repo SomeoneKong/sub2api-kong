@@ -21,6 +21,7 @@ import (
 // otherwise ChatGPT manifests are proxied verbatim and custom API key manifests
 // receive provider-compatibility normalization plus short-lived caching.
 func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
+	kongStart := service.KongCodexCatalogNow() // [kong] 版本存档冷启动的前台预算从这里起算
 	if c.Request.Context().Err() != nil {
 		return
 	}
@@ -95,6 +96,12 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 		}
 	}
 
+	// [kong] 版本存档：选得出对外版本就直接写出；选不出时纳管账号的拉取也经它的准入（DESIGN-codex-catalog-consensus.md）
+	kongCatalog, kongServed := h.kongServeCodexCatalog(c, apiKey.Group, ifNoneMatch, kongStart)
+	if kongServed {
+		return
+	}
+
 	maxAccountSwitches := h.maxAccountSwitches
 	if maxAccountSwitches <= 0 {
 		maxAccountSwitches = 3
@@ -121,7 +128,12 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 
 		// The client ETag represents the final group-specific body, so fetch the
 		// source manifest before applying local filtering and alias metadata.
-		manifest, err := h.gatewayService.FetchCodexModelsManifest(c.Request.Context(), account, c.Query("client_version"), "")
+		manifest, kongExcluded, err := h.gatewayService.KongFetchCodexModelsManifest(c.Request.Context(), kongCatalog, account, c.Query("client_version")) // [kong]
+		// [kong] 纳管账号冷却中又没有观测：排除后继续选号，不计换号次数
+		if kongExcluded {
+			failedAccountIDs[account.ID] = struct{}{}
+			continue
+		}
 		if err != nil {
 			if c.Request.Context().Err() != nil {
 				return
