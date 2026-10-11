@@ -528,7 +528,7 @@ func (r *accountRepository) updateLockedAccount(
 	}
 	account.Extra = extra
 
-	schedulable := account.Schedulable
+	schedulable := kongEditSchedulable(ctx, client, account, account.Schedulable) // [kong] 降档哨兵：开关期间被动过就沿用库里的值
 	if account.Status == service.StatusError {
 		schedulable = false
 	}
@@ -2673,6 +2673,9 @@ func (r *accountRepository) UpdateSessionWindowEnd(ctx context.Context, id int64
 }
 
 func (r *accountRepository) SetSchedulable(ctx context.Context, id int64, schedulable bool) error {
+	if err := kongExplicitSchedulable(ctx, r.sql, []int64{id}, &schedulable); err != nil { // [kong] 降档哨兵：显式的可调度操作撤销哨兵的所有权
+		return err
+	}
 	_, err := r.client.Account.Update().
 		Where(dbaccount.IDEQ(id)).
 		SetSchedulable(schedulable).
@@ -3248,6 +3251,9 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 		}
 	}
 
+	if err := kongExplicitSchedulable(ctx, exec, ids, updates.Schedulable); err != nil { // [kong] 降档哨兵：显式的可调度操作撤销哨兵的所有权（与写入同一事务）
+		return 0, err
+	}
 	result, err := exec.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
