@@ -259,6 +259,10 @@ func kongReadCodexSSEText(body io.Reader) (kongSSEAnswer, error) {
 			// strings.Builder.WriteString 的错误恒为 nil，但 errcheck 要求显式忽略。
 			_, _ = text.WriteString(str)
 		case "response.completed", "response.done":
+			// 事件名是"完成"不等于成功：终端对象里的失败状态或错误同样是失败。
+			if reason := kongTerminalFailure(event); reason != "" {
+				return fmt.Errorf("上游在完成事件里报告失败: %s", reason)
+			}
 			completed = true
 			if n, ok := kongExtractOutputTokens(event); ok {
 				outputTokens = &n
@@ -435,4 +439,80 @@ func kongExtractSSEError(event map[string]any, nested string) string {
 		}
 	}
 	return "未提供错误信息"
+}
+
+// kongTerminalFailure 读完成事件里终端对象的失败状态或错误；没有时返回空串。
+func kongTerminalFailure(event map[string]any) string {
+	resp, _ := event["response"].(map[string]any)
+	if resp == nil {
+		return ""
+	}
+	switch status, _ := resp["status"].(string); status {
+	case "failed", "incomplete", "cancelled", "canceled":
+		return status
+	}
+	if resp["error"] != nil {
+		return kongExtractSSEError(event, "response")
+	}
+	return ""
+}
+
+// KongTicketProbeAnswer 是一次带票探测请求的结果。
+type KongTicketProbeAnswer struct {
+	StatusCode int
+	// Issued 是上游在响应头里下发的票；空表示这一轮没有下发。
+	Issued string
+}
+
+// KongTicketProber 是降档哨兵主动探测对上游的依赖面：与指纹挑战共用代理解析、凭据、TLS 与请求头构造。
+type KongTicketProber interface {
+	ResolveProxyURL(ctx context.Context, proxyID *int64) (string, error)
+	// RunTicketProbe 发一个极小的请求；state 非空时带上这张票。取响应头里下发的票；非 2xx 或正文没有完整成功时报错。
+	RunTicketProbe(ctx context.Context, account *Account, proxyURL, model, state string) (KongTicketProbeAnswer, error)
+}
+
+// NewKongTicketProber 创建降档哨兵的探测访问层。
+func NewKongTicketProber(httpUpstream HTTPUpstream, proxyRepo ProxyRepository, tlsProfiles *TLSFingerprintProfileService) KongTicketProber {
+	return &kongFingerprintUpstream{httpUpstream: httpUpstream, proxyRepo: proxyRepo, tlsProfiles: tlsProfiles}
+}
+
+const (
+	// kongTicketProbeTimeout 是一个探测请求的期限。
+	kongTicketProbeTimeout = 30 * time.Second
+	// kongTicketProbeBodyLimit 是读弃正文的上限：回答只有一个词，读到上限还没完就是异常，不再读。
+	kongTicketProbeBodyLimit = 1 << 20
+)
+
+// kongTicketProbeChallenge 是探测请求的内容：一个词的回答，low 强度。
+var kongTicketProbeChallenge = KongFingerprintChallenge{ID: "ticket-probe", Prompt: "Reply with the single word OK.", Effort: "low"}
+
+func (u *kongFingerprintUpstream) RunTicketProbe(ctx context.Context, account *Account, proxyURL, model, state string) (KongTicketProbeAnswer, error) {
+	ctx, cancel := context.WithTimeout(ctx, kongTicketProbeTimeout)
+	defer cancel()
+	req, err := u.buildCodexRequest(ctx, account, model, kongTicketProbeChallenge)
+	if err != nil {
+		return KongTicketProbeAnswer{}, err
+	}
+	if state != "" {
+		req.Header.Set(openAICodexTurnStateHeader, state)
+	}
+	resp, err := u.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, u.tlsProfiles.ResolveTLSProfile(account))
+	if err != nil {
+		return KongTicketProbeAnswer{}, fmt.Errorf("探测请求失败: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	answer := KongTicketProbeAnswer{StatusCode: resp.StatusCode, Issued: strings.TrimSpace(resp.Header.Get(openAICodexTurnStateHeader))}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, kongTicketProbeBodyLimit))
+		return answer, fmt.Errorf("探测请求返回 %d", resp.StatusCode)
+	}
+	// 响应要完整成功、并且确实给了回答才算数：断流、失败事件、缺终端、超过上限、没有任何输出的空完成都不下结论。
+	sse, err := kongReadCodexSSEText(io.LimitReader(resp.Body, kongTicketProbeBodyLimit))
+	if err != nil {
+		return answer, fmt.Errorf("探测响应不完整: %w", err)
+	}
+	if strings.TrimSpace(sse.Text) == "" && (sse.OutputTokens == nil || *sse.OutputTokens <= 0) {
+		return answer, errors.New("探测响应没有回答内容")
+	}
+	return answer, nil
 }
