@@ -260,6 +260,9 @@ type kongFingerprintState struct {
 	persistError string
 }
 
+// Abort 不执行、放弃执行权（取得执行权之后发现不该测时用）。
+func (r *KongFingerprintRun) Abort() { r.t.running.Delete(r.account.ID) }
+
 // Execute 逐份发挑战、落证据、推进度，直到命中判定规则、份数用完、失败或被取消。ctx 取消（管理员断开）
 // 时正在进行的那一份立即中止，已完成的份已经落库。
 func (r *KongFingerprintRun) Execute(ctx context.Context, emit func(KongFingerprintTestEvent)) {
