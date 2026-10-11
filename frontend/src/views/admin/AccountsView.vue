@@ -290,6 +290,7 @@
           <template #cell-status="{ row }">
             <div class="flex items-center gap-1.5">
               <AccountStatusIndicator :account="row" @show-temp-unsched="handleShowTempUnsched" />
+              <DowngradeGuardBadge :account="row" />
             </div>
           </template>
           <template #cell-schedulable="{ row }">
@@ -518,6 +519,8 @@ import ImportDataModal from '@/components/admin/account/ImportDataModal.vue'
 import ReAuthAccountModal from '@/components/admin/account/ReAuthAccountModal.vue'
 import AccountTestModal from '@/components/admin/account/AccountTestModal.vue'
 import FingerprintTestHost from '@/features/openai-fingerprint-test/FingerprintTestHost.vue'
+import DowngradeGuardBadge from '@/features/openai-downgrade-guard/DowngradeGuardBadge.vue'
+import { dropDowngradeGuardHold } from '@/features/openai-downgrade-guard/guardHold'
 import AccountStatsModal from '@/components/admin/account/AccountStatsModal.vue'
 import ScheduledTestsPanel from '@/components/admin/account/ScheduledTestsPanel.vue'
 import type { SelectOption } from '@/components/common/Select.vue'
@@ -1954,6 +1957,7 @@ const updateSchedulableInList = (accountIds: number[], schedulable: boolean) => 
   if (accountIds.length === 0) return
   const idSet = new Set(accountIds)
   accounts.value = accounts.value.map((account) => (idSet.has(account.id) ? { ...account, schedulable } : account))
+  accounts.value = dropDowngradeGuardHold(accounts.value, idSet) // [kong] 降档哨兵：人动了开关，降智标记随之失效
 }
 const normalizeBulkSchedulableResult = (
   result: {
