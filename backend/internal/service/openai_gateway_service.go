@@ -534,6 +534,8 @@ type OpenAIGatewayService struct {
 	kongLiveness *KongRequestLiveness
 	// [kong] Codex 目录的版本存档（可选依赖，setter 在 kong_codex_catalog.go）。nil 即不启用。
 	kongCodexCatalog *KongCodexCatalog
+	// [kong] 降档哨兵（持有以便退出时停止，setter 在 kong_downgrade_guard_ws.go）。nil 即不启用。
+	kongDowngradeGuard *KongDowngradeGuard
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

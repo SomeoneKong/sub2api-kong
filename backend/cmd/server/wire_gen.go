@@ -306,6 +306,22 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 		log.Printf("kong fingerprint: 指纹库加载失败，指纹测试不可用: %v", kongFingerprintErr)
 	}
 	adminHandlers.KongFingerprint = admin.NewKongFingerprintHandler(kongFingerprintTester)
+	// [kong] 降档哨兵（DESIGN-account-downgrade-guard.md）：配置不合法或指纹测试不可用时不启动，管理端点返回 503。
+	var kongDowngradeGuard *service.KongDowngradeGuard
+	if kongGuardCfg, err := service.KongDowngradeGuardConfigFromEnv(); err != nil {
+		log.Printf("kong downgrade guard: 配置不合法，哨兵不启动: %v", err)
+	} else if kongGuardCfg.Mode != service.KongGuardModeOff {
+		kongDowngradeGuard, err = service.NewKongDowngradeGuard(kongGuardCfg, repository.NewKongDowngradeGuardRepository(db), accountRepository,
+			service.NewKongTicketProber(httpUpstream, proxyRepository, tlsFingerprintProfileService), kongFingerprintTester,
+			repository.KongGuardSnapshotSyncer(accountRepository))
+		if err != nil {
+			log.Printf("kong downgrade guard: 哨兵不启动: %v", err)
+		} else {
+			kongDowngradeGuard.Start()
+			openAIGatewayService.SetKongDowngradeGuard(kongDowngradeGuard)
+		}
+	}
+	adminHandlers.KongDowngradeGuard = admin.NewKongDowngradeGuardHandler(kongDowngradeGuard)
 	// [kong] 账号消耗节奏：同样手工装配。协程总是启动——配置文件（数据目录下的
 	// openai-account-pace.yaml）可以之后再放，放进去一分钟内生效；文件不存在时不重排，但下面接上的计划组件记账照常推进。
 	kongPace := service.NewKongOpenAIAccountPace(repository.NewKongPaceRepository(db), repository.NewKongPaceStore(redisClient), concurrencyService, service.KongPaceConfigPath(setup.GetDataDir()))
@@ -717,6 +733,12 @@ func provideCleanup(
 			{"KongCodexCatalog", func() error {
 				if openAIGateway != nil {
 					openAIGateway.StopKongCodexCatalog()
+				}
+				return nil
+			}},
+			{"KongDowngradeGuard", func() error {
+				if openAIGateway != nil {
+					openAIGateway.StopKongDowngradeGuard()
 				}
 				return nil
 			}},
