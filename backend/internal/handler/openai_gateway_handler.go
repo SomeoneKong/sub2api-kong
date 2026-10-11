@@ -3073,6 +3073,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if !h.gatewayService.KongPlanWSTurnAllowed(turnCtx, account, kongPlanWS) { // [kong] 额度资格与入层复核
 					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer eligible for this connection, please reconnect", nil)
 				}
+				if !h.gatewayService.KongWSTurnSchedulable(turnCtx, account) { // [kong] 降档哨兵：账号已关调度就要求重连
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is no longer eligible for this connection, please reconnect", nil)
+				}
 				turnPricing.freeze(turnAt)
 				if turn == 1 {
 					return nil
