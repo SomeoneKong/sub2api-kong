@@ -28,6 +28,8 @@
 - **账号选择与 credits**（计划输入生效时的定层、两轮排序、credits 层与容量视图，设计见
   `DESIGN-openai-plan-dispatch.md`）
 - **用量页的 API 密钥使用分布**（普通用户用量页按 API key 汇总的图表与它的查询端点，见下文挂点一节）
+- **OpenAI 账号降档哨兵**（上游不认服务分组里某个账号自己刚签发的票时关掉它的调度、测指纹确认，只止损不恢复，设计见
+  `DESIGN-account-downgrade-guard.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
 另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
@@ -337,6 +339,36 @@ handler / routes 下的同名文件，另有几处在节奏与会话组件里（
   import、一行取数声明、`applyFilters` 与 `refreshData` 各一行加载，`i18n/locales/{en,zh}/dashboard.ts` 的
   `usage` 段各一个键。**替换**：同一视图第二行图表里 `TokenUsageTrend` 换成新图表，趋势图移到下面单独占一行。管理
   员用量页不接。
+
+### OpenAI 账号降档哨兵
+
+设计见 `DESIGN-account-downgrade-guard.md`。新逻辑在 `kong_downgrade_guard*.go`（service、repository、handler、
+routes）与 `features/openai-downgrade-guard/`，主动探测加在 `kong_fingerprint_upstream.go`。碰上游的点：
+
+- **迁移 910 的触发器**：`accounts` 上一个 BEFORE UPDATE、一个 BEFORE INSERT。`extra` 里的 `kong_downgrade_guard_hold`
+  与 `kong_schedulable_rev` 只有设置了 `kong.guard_write` 的哨兵事务能写，其他写入还原成原值、新建时去掉；`schedulable`
+  变化或状态变为 error 时版本加一，不是哨兵的写入时同时删掉持有记录。上游改动 `schedulable` 的写入点靠它统一覆盖，
+  不逐个挂钩。
+- **账号仓储三处**（`account_repo.go`）：`SetSchedulable` 开头、`BulkUpdate` 执行更新语句之前（它自己的事务里，与写入
+  一起提交或回滚）各一处 3 行的 `kongExplicitSchedulable`，失败时让这次操作失败。它在一条语句里撤销哨兵的所有权并写入
+  人给的 `schedulable`（人把已关的账号再设一次 false 时 `schedulable` 不变，触发器察觉不到；连同值一起写，撤销与写入
+  之间没有空隙），上游随后的写入写的是同一个值；单个开关时它自己开事务，连调度变更通知一起提交；`updateLockedAccount`
+  的 `schedulable :=` 换成 `kongEditSchedulable`（编辑期间开关被动过就沿用库里的值）。
+- **WS 每轮复核**：`openai_gateway_handler.go` 的 `BeforeTurn` 在 `KongPlanWSTurnAllowed` 之后 `KongWSTurnSchedulable`，
+  账号已关调度就要求重连；`openai_gateway_service.go` 一个字段持有哨兵，只为退出时停止它。
+- **管理端点**：`handler.go` 一个字段（空行隔开，不重排上面的对齐），`routes/admin.go` 一行
+  `registerKongDowngradeGuardRoutes`。
+- **装配**（`wire_gen.go`）：模式不是 `off`、配置合法且指纹测试器可用时建哨兵并 `Start`，`SetKongDowngradeGuard` 交给网关
+  服务；直接给 `AdminHandlers` 赋 `KongDowngradeGuard` 字段（哨兵没启动时两个端点返回 503）；cleanup 里
+  `StopKongDowngradeGuard`。
+- **前端**（`features/openai-downgrade-guard/`）碰上游的只有 `AccountsView.vue`：状态列的一行组件、
+  `updateSchedulableInList` 里一行 `dropDowngradeGuardHold`（开关操作成功后去掉本地行里失效的标记），以及两行 import。
+- **rebase 时复核**：上游新增"显式设可调度"的入口（不经 `SetSchedulable` / `BulkUpdate`）时要接
+  `kongExplicitSchedulable`；上游改 `updateLockedAccount` 的 `schedulable` 写法时，挂钩要留在状态为 error 的覆盖之前；
+  上游的到期自动暂停若改为也扫已关调度的账号，哨兵每轮的到期接管（`TakeOverExpired`）可以去掉。新增的普通写入点不用管，
+  触发器覆盖。
+- **开关**：环境变量 `KONG_DOWNGRADE_GUARD`（缺省 `observe`：判定、探测、测指纹、记事件，不关调度；`on` 才关；`off` 不启动），
+  服务分组 `KONG_DOWNGRADE_GUARD_GROUP_ID` 不设时只判定、记录。其余参数见设计第 7 节。
 
 ## 本地验证的已知差异
 
