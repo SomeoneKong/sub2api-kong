@@ -5,12 +5,15 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 )
 
 // SSE 的一个事件可以有多行 `data:`，规范要求把它们连起来再当成一份载荷。
@@ -351,5 +354,82 @@ func TestKongFingerprintRequestUsesStoredToken(t *testing.T) {
 	account.Credentials = map[string]any{}
 	if _, err := u.buildCodexRequest(context.Background(), account, "gpt-5.6-sol", challenge); err == nil {
 		t.Fatal("没有 access token 时应报错")
+	}
+}
+
+// kongProbeUpstream 记录探测请求，按 reply 给出响应。
+type kongProbeUpstream struct {
+	HTTPUpstream
+	reqs  []*http.Request
+	reply func(req *http.Request) (*http.Response, error)
+}
+
+func (f *kongProbeUpstream) DoWithTLS(req *http.Request, _ string, _ int64, _ int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	f.reqs = append(f.reqs, req)
+	return f.reply(req)
+}
+
+// 降档哨兵的探测：state 非空时带上这张票；只读响应头里下发的票；非 2xx 与请求失败都报错。
+func TestKongRunTicketProbe(t *testing.T) {
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "tok-1"}}
+	completed := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+	body := completed
+	respond := func(status int, ticket string) func(*http.Request) (*http.Response, error) {
+		return func(*http.Request) (*http.Response, error) {
+			h := http.Header{}
+			if ticket != "" {
+				h.Set(openAICodexTurnStateHeader, ticket)
+			}
+			return &http.Response{StatusCode: status, Header: h, Body: io.NopCloser(strings.NewReader(body))}, nil
+		}
+	}
+	up := &kongProbeUpstream{reply: respond(200, "T1")}
+	prober := NewKongTicketProber(up, nil, nil)
+	got, err := prober.RunTicketProbe(context.Background(), account, "", "gpt-6.1-sol", "")
+	if err != nil || got.Issued != "T1" || got.StatusCode != 200 {
+		t.Fatalf("第 1 次: %+v, %v", got, err)
+	}
+	if up.reqs[0].Header.Get(openAICodexTurnStateHeader) != "" {
+		t.Fatal("不带票的请求带了票")
+	}
+
+	up.reply = respond(200, "")
+	got, err = prober.RunTicketProbe(context.Background(), account, "", "gpt-6.1-sol", "T1")
+	if err != nil || got.Issued != "" {
+		t.Fatalf("第 2 次: %+v, %v", got, err)
+	}
+	if up.reqs[1].Header.Get(openAICodexTurnStateHeader) != "T1" {
+		t.Fatal("带票的请求没有带上这张票")
+	}
+
+	up.reply = respond(429, "T2")
+	if got, err := prober.RunTicketProbe(context.Background(), account, "", "gpt-6.1-sol", "T1"); err == nil || got.StatusCode != 429 {
+		t.Fatalf("429 应报错: %+v, %v", got, err)
+	}
+
+	up.reply = func(*http.Request) (*http.Response, error) { return nil, errors.New("dial timeout") }
+	if _, err := prober.RunTicketProbe(context.Background(), account, "", "gpt-6.1-sol", ""); err == nil {
+		t.Fatal("请求失败应报错")
+	}
+
+	// 响应头到了但正文没有完整成功：都不算数。
+	for name, b := range map[string]string{
+		"失败事件":       "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"x\"}}}\n\n",
+		"缺完成事件":      "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n",
+		"断流":         "data: {\"type\":\"response.output_text.delta\",\"del",
+		"完成事件里是失败状态": "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"failed\"}}\n\n",
+		"完成事件里带错误":   "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"error\":{\"message\":\"x\"}}}\n\n",
+		"没有任何输出的空完成": "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+	} {
+		body = b
+		up.reply = respond(200, "")
+		if _, err := prober.RunTicketProbe(context.Background(), account, "", "gpt-6.1-sol", "T1"); err == nil {
+			t.Errorf("%s: 应报错", name)
+		}
+	}
+	body = completed
+	up.reply = respond(302, "")
+	if _, err := prober.RunTicketProbe(context.Background(), account, "", "gpt-6.1-sol", "T1"); err == nil {
+		t.Error("302 应报错")
 	}
 }

@@ -89,6 +89,7 @@ func RegisterAdminRoutes(
 		registerKongFingerprintRoutes(admin, h)
 		// 账号计划执行端用到的端点（本 fork 定制）
 		registerKongPlanRoutes(admin, h)
+		registerKongDowngradeGuardRoutes(admin, h) // [kong] 降档哨兵
 
 		// 系统管理
 		registerSystemRoutes(admin, h)
