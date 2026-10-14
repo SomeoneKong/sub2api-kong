@@ -1,6 +1,6 @@
 # OpenAI 请求体快速路径：跳过必然不改写的处理，复用顶层查找
 
-**状态**：已实现，待代码 review 与发布；只用于本 fork，不向上游提 PR。开关 `KONG_OPENAI_BODY_FASTPATH`，默认开启。仓库组织与发布流程见
+**状态**：已实现；只用于本 fork，不向上游提 PR。开关 `KONG_OPENAI_BODY_FASTPATH`，默认开启。仓库组织与发布流程见
 `FORK-NOTES.md`。
 
 本文是通用设计说明，§0 的剖析数据来自一个部署实例。
