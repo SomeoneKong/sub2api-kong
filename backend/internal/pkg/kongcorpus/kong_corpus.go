@@ -48,6 +48,13 @@ type Options struct {
 	ReasoningRaw string
 	// InputRaw 非空时替换整个 input 的值（原始 JSON），忽略其余与 input 有关的选项。
 	InputRaw string
+	// ItemIDs 为真时历史项带 codex 线上形态的 id：rs_、msg_、fc_、fco_、ctc_、ctco_。custom_tool_call_output 的 ctco_
+	// 前缀不是上游要求的 fc，这些 id 会被 item id 清洗删掉。
+	ItemIDs bool
+	// Images 张图片夹在对话里，每张是 ImageBytes 字节左右的 base64（随机字节，压不动），一半在用户消息里，一半在
+	// view_image 的工具输出里。
+	Images     int
+	ImageBytes int
 }
 
 func (o Options) model() string {
@@ -61,7 +68,10 @@ func (o Options) model() string {
 }
 
 type generator struct {
-	rng *rand.Rand
+	rng        *rand.Rand
+	itemIDs    bool
+	images     int
+	imageBytes int
 }
 
 func newGenerator(seed uint64) *generator {
@@ -71,6 +81,7 @@ func newGenerator(seed uint64) *generator {
 // Request 生成请求体。
 func Request(o Options) []byte {
 	g := newGenerator(o.Seed)
+	g.itemIDs, g.images, g.imageBytes = o.ItemIDs, o.Images, o.ImageBytes
 	var b strings.Builder
 	b.Grow(o.TargetBytes + 64<<10)
 
@@ -103,7 +114,7 @@ func Request(o Options) []byte {
 		for _, raw := range o.PrefixItems {
 			item(raw)
 		}
-		for turn := 0; !o.NoHistory && (turn == 0 || b.Len() < o.TargetBytes); turn++ {
+		for turn := 0; !o.NoHistory && (turn == 0 || b.Len() < o.TargetBytes || g.images > 0); turn++ {
 			for _, raw := range g.turn(turn) {
 				item(raw)
 			}
@@ -242,27 +253,56 @@ func Quote(s string) string {
 func (g *generator) turn(n int) []string {
 	var items []string
 	if n%4 == 0 {
-		items = append(items, `{"type":"message","role":"user","content":[{"type":"input_text","text":`+Quote(g.prose(40+g.rng.IntN(120)))+`}]}`)
+		items = append(items, `{"type":"message",`+g.itemID("msg_")+`"role":"user","content":[{"type":"input_text","text":`+Quote(g.prose(40+g.rng.IntN(120)))+`}]}`)
 	}
-	items = append(items, `{"type":"reasoning","summary":[{"type":"summary_text","text":`+Quote("**"+g.words(4)+"**\n\n"+g.prose(20+g.rng.IntN(40)))+`}],"encrypted_content":`+Quote(g.encrypted(1500+g.rng.IntN(4500)))+`}`)
+	items = append(items, `{"type":"reasoning",`+g.itemID("rs_")+`"summary":[{"type":"summary_text","text":`+Quote("**"+g.words(4)+"**\n\n"+g.prose(20+g.rng.IntN(40)))+`}],"encrypted_content":`+Quote(g.encrypted(1500+g.rng.IntN(4500)))+`}`)
 	callID := "call_" + g.alnum(24)
 	if n%5 == 3 {
 		patch := "*** Begin Patch\n*** Update File: src/" + g.word() + ".py\n@@\n-" + g.codeLine() + "\n+" + g.codeLine() + "\n*** End Patch"
 		items = append(items,
-			`{"type":"custom_tool_call","status":"completed","call_id":`+Quote(callID)+`,"name":"apply_patch","input":`+Quote(patch)+`}`,
-			`{"type":"custom_tool_call_output","call_id":`+Quote(callID)+`,"output":`+Quote("Success. Updated the following files:\nM src/"+g.word()+".py\n")+`}`,
+			`{"type":"custom_tool_call",`+g.itemID("ctc_")+`"status":"completed","call_id":`+Quote(callID)+`,"name":"apply_patch","input":`+Quote(patch)+`}`,
+			`{"type":"custom_tool_call_output",`+g.itemID("ctco_")+`"call_id":`+Quote(callID)+`,"output":`+Quote("Success. Updated the following files:\nM src/"+g.word()+".py\n")+`}`,
 		)
 	} else {
 		args := `{"command":["bash","-lc",` + Quote(g.command()) + `],"workdir":"/home/dev/project","timeout_ms":120000}`
 		items = append(items,
-			`{"type":"function_call","name":"shell","arguments":`+Quote(args)+`,"call_id":`+Quote(callID)+`}`,
-			`{"type":"function_call_output","call_id":`+Quote(callID)+`,"output":`+Quote(g.toolOutput(500+g.rng.IntN(14000)))+`}`,
+			`{"type":"function_call",`+g.itemID("fc_")+`"name":"shell","arguments":`+Quote(args)+`,"call_id":`+Quote(callID)+`}`,
+			`{"type":"function_call_output",`+g.itemID("fco_")+`"call_id":`+Quote(callID)+`,"output":`+Quote(g.toolOutput(500+g.rng.IntN(14000)))+`}`,
 		)
 	}
 	if n%6 == 5 {
-		items = append(items, `{"type":"message","role":"assistant","content":[{"type":"output_text","text":`+Quote(g.prose(30+g.rng.IntN(80)))+`}]}`)
+		items = append(items, `{"type":"message",`+g.itemID("msg_")+`"role":"assistant","content":[{"type":"output_text","text":`+Quote(g.prose(30+g.rng.IntN(80)))+`}]}`)
+	}
+	if g.images > 0 && n%3 == 1 {
+		g.images--
+		image := `{"type":"input_image","image_url":"data:image/png;base64,` + g.imageData() + `"}`
+		if g.images%2 == 0 {
+			items = append(items, `{"type":"message",`+g.itemID("msg_")+`"role":"user","content":[{"type":"input_text","text":`+Quote(g.prose(12))+`},`+image+`]}`)
+		} else {
+			viewID := "call_" + g.alnum(24)
+			items = append(items,
+				`{"type":"custom_tool_call",`+g.itemID("ctc_")+`"status":"completed","call_id":`+Quote(viewID)+`,"name":"view_image","input":"plots/`+g.word()+`.png"}`,
+				`{"type":"custom_tool_call_output",`+g.itemID("ctco_")+`"call_id":`+Quote(viewID)+`,"output":[`+image+`]}`,
+			)
+		}
 	}
 	return items
+}
+
+// itemID 在 ItemIDs 关闭时返回空串且不消耗随机数，保证不带 id 的语料逐字节不变。
+func (g *generator) itemID(prefix string) string {
+	if !g.itemIDs {
+		return ""
+	}
+	return `"id":` + Quote(prefix+g.hex(48)) + `,`
+}
+
+func (g *generator) imageData() string {
+	raw := make([]byte, g.imageBytes*3/4)
+	for i := range raw {
+		raw[i] = byte(g.rng.UintN(256))
+	}
+	return base64.StdEncoding.EncodeToString(raw)
 }
 
 func (g *generator) instructions() string {

@@ -34,6 +34,11 @@ const (
 	kongFastpathMetadata
 	kongFastpathItemIDs
 	kongFastpathImage
+	kongFastpathViewStrings
+	kongFastpathZstdOut
+	kongFastpathZstdIn
+	kongFastpathItemIDsSplice
+	kongFastpathIdentitySplice
 	kongFastpathItemCount
 )
 
@@ -48,6 +53,12 @@ var kongFastpathItemNames = [kongFastpathItemCount]string{
 	kongFastpathMetadata:   "metadata",
 	kongFastpathItemIDs:    "item_ids",
 	kongFastpathImage:      "image",
+	// 以下几项减的是内存（见 DESIGN-openai-request-body-memory.md）。
+	kongFastpathViewStrings:    "view_strings",
+	kongFastpathZstdOut:        "zstd_out",
+	kongFastpathZstdIn:         "zstd_in",
+	kongFastpathItemIDsSplice:  "item_ids_splice",
+	kongFastpathIdentitySplice: "identity_splice",
 }
 
 type kongFastpathSettings struct {

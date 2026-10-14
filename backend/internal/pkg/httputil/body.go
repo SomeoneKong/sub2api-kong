@@ -83,6 +83,9 @@ func ReadRequestBodyWithPrealloc(req *http.Request) ([]byte, error) {
 		}
 	}
 
+	if body, ok, err := kongReadZstdRequestBody(req, capHint); ok { // [kong] 见 DESIGN-openai-request-body-memory §2.3
+		return body, err
+	}
 	raw, err := readRequestBodyChunks(req.Body, capHint, req.ContentLength)
 	if err != nil {
 		return nil, err

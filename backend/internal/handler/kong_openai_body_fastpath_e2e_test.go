@@ -244,7 +244,104 @@ func kongFPCases() []kongFPCase {
 
 	truncated := kongcorpus.Request(sol(38, mid))
 	cases = append(cases, kongFPCase{name: "sol_truncated", body: truncated[:len(truncated)/2], headers: kongcorpus.Headers(sol(38, mid))})
+
+	// 线上形态：历史项带 id（custom_tool_call_output 的 ctco_ id 会被清洗）、夹 base64 图片、请求体经本地代理 zstd
+	// 压缩上来。
+	ids := func(o kongcorpus.Options) kongcorpus.Options {
+		o.ItemIDs = true
+		return o
+	}
+	images := func(o kongcorpus.Options) kongcorpus.Options {
+		o.Images, o.ImageBytes = 6, 200<<10
+		return o
+	}
+	cases = append(cases,
+		build("sol_ids_big", ids(sol(60, 1100<<10)), kongFPScriptOK),
+		build("lite_ids_big", ids(lite(61, 1100<<10)), kongFPScriptOK),
+		build("sol_ids_images", images(ids(sol(62, 2500<<10))), kongFPScriptOK),
+		kongFPZstdIn(build("sol_ids_images_zstd_in", images(ids(sol(63, 2500<<10))), kongFPScriptOK), kongFPZstdFrame),
+		kongFPZstdIn(build("lite_ids_zstd_in", ids(lite(64, mid)), kongFPScriptOK), kongFPZstdFrame),
+		kongFPZstdIn(build("sol_zstd_in_small", sol(65, 20<<10), kongFPScriptOK), kongFPZstdFrame),
+		kongFPZstdIn(build("sol_zstd_in_stream", images(ids(sol(66, 2500<<10))), kongFPScriptOK), kongFPZstdStream),
+		kongFPZstdIn(build("sol_zstd_in_multiframe", ids(sol(67, mid)), kongFPScriptOK), kongFPZstdMultiFrame),
+		kongFPZstdIn(build("sol_zstd_in_truncated", ids(sol(68, mid)), kongFPScriptOK), kongFPZstdTruncated),
+		kongFPZstdIn(build("sol_zstd_in_garbage", ids(sol(69, mid)), kongFPScriptOK), kongFPZstdGarbage),
+		kongFPZstdIn(build("sol_zstd_in_empty", sol(70, 0), kongFPScriptOK), kongFPZstdEmpty),
+		build("sol_ids_failover", images(ids(sol(71, mid))), kongFPScriptFailover),
+		build("sol_ids_zstd_reject", images(ids(sol(72, mid))), kongFPScriptZstdReject),
+		build("sol_ids_retry_max_output_tokens", with(ids(sol(73, mid)), func(o *kongcorpus.Options) {
+			o.TopLevelTail = []string{`"max_output_tokens":1000`}
+		}), kongFPScriptRetry400),
+		kongFPZstdIn(build("sol_ids_images_zstd_in_failover", images(ids(sol(74, 2500<<10))), kongFPScriptFailover), kongFPZstdFrame),
+		build("sol_ids_edges", with(ids(sol(75, mid)), func(o *kongcorpus.Options) {
+			o.SuffixItems = []string{
+				`{"id":"ctco_first","type":"custom_tool_call_output","call_id":"call_edge_1","output":"first"}`,
+				`{"type":"custom_tool_call_output","call_id":"call_edge_2","output":"last","id":"ctco_last"}`,
+				`{"type" : "custom_tool_call_output" , "id" : "ctco_spaced" ,` + "\n" + ` "call_id":"call_edge_3","output":"spaced"}`,
+				kongFPEsc(`{"type":"custom_tool_call_output","i%u0064":"ctco_escaped_key","call_id":"call_edge_4","output":"escaped"}`),
+				`{"type":"custom_tool_call_output","id":"ctco_dup","id":"fc_dup","call_id":"call_edge_5","output":"dup"}`,
+				`{"id":"bad-first","call_id":"call_stray_1","type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}`,
+				`{"type":"reasoning","call_id":"call_stray_2","id":"bad-mid","summary":[],"encrypted_content":"gAAAAA"}`,
+				`{"type":"message","role":"user","content":[{"type":"input_text","text":"no id"}],"call_id":"call_stray_3"}`,
+			}
+		}), kongFPScriptOK),
+	)
 	return cases
+}
+
+type kongFPZstdMode int
+
+const (
+	kongFPZstdFrame      kongFPZstdMode = iota // 本地代理的写法：EncodeAll，帧头带原始大小
+	kongFPZstdStream                           // 流式编码器，帧头不带原始大小
+	kongFPZstdMultiFrame                       // 前后两半各成一帧
+	kongFPZstdTruncated                        // 只发前三分之二
+	kongFPZstdGarbage                          // 帧后跟着不是 zstd 的字节
+	kongFPZstdEmpty                            // 带 Content-Encoding 的空请求体
+)
+
+// kongFPZstdIn 把用例的请求体换成 zstd 压缩后的字节，并带上 Content-Encoding。
+func kongFPZstdIn(tc kongFPCase, mode kongFPZstdMode) kongFPCase {
+	newEncoder := func() *zstd.Encoder {
+		encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(3)))
+		if err != nil {
+			panic(err)
+		}
+		return encoder
+	}
+	plain := tc.body
+	var wire []byte
+	switch mode {
+	case kongFPZstdFrame, kongFPZstdTruncated, kongFPZstdGarbage:
+		encoder := newEncoder()
+		wire = encoder.EncodeAll(plain, nil)
+		_ = encoder.Close()
+		if mode == kongFPZstdTruncated {
+			wire = wire[:len(wire)*2/3]
+		}
+		if mode == kongFPZstdGarbage {
+			wire = append(wire, []byte("not a zstd frame")...)
+		}
+	case kongFPZstdStream:
+		var buf bytes.Buffer
+		encoder := newEncoder()
+		encoder.Reset(&buf)
+		_, _ = encoder.Write(plain)
+		_ = encoder.Close()
+		wire = buf.Bytes()
+	case kongFPZstdMultiFrame:
+		encoder := newEncoder()
+		half := len(plain) / 2
+		wire = encoder.EncodeAll(plain[:half], nil)
+		wire = encoder.EncodeAll(plain[half:], wire)
+		_ = encoder.Close()
+	case kongFPZstdEmpty:
+		wire = []byte{}
+	}
+	tc.body = wire
+	tc.headers = tc.headers.Clone()
+	tc.headers.Set("Content-Encoding", "zstd")
+	return tc
 }
 
 // ── 假上游 ───────────────────────────────────────────────────────────────
@@ -567,7 +664,7 @@ func kongFPMarshal(t *testing.T, value any) []byte {
 	return raw
 }
 
-// TestKongOpenAIBodyFastpathGolden 对照原代码录下的基准：快速路径关、开各跑一遍，都必须与基准一致。
+// TestKongOpenAIBodyFastpathGolden 对照原代码录下的基准：快速路径全关、全开、请求体内存各项逐项关闭各跑一遍，都必须与基准一致。
 // 基准只能在改动前的原代码上重录（KONG_BODY_FASTPATH_GOLDEN=update），否则就失去了"原版本"的意义。
 func TestKongOpenAIBodyFastpathGolden(t *testing.T) {
 	path := filepath.FromSlash(kongFPGoldenPath)
@@ -583,12 +680,21 @@ func TestKongOpenAIBodyFastpathGolden(t *testing.T) {
 	var golden map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal(raw, &golden))
 
-	for _, mode := range []struct {
+	type goldenMode struct {
 		name string
-		on   bool
-	}{{"fastpath_off", false}, {"fastpath_on", true}} {
+		set  func() func()
+	}
+	modes := []goldenMode{
+		{"fastpath_off", func() func() { return service.KongSetOpenAIBodyFastpathForTest(false) }},
+		{"fastpath_on", func() func() { return service.KongSetOpenAIBodyFastpathForTest(true) }},
+	}
+	// 请求体内存的各项（DESIGN-openai-request-body-memory.md）逐项关掉各跑一遍：单独关掉任何一项都必须与基准一致。
+	for _, item := range []string{"view_strings", "zstd_out", "zstd_in", "item_ids_splice", "identity_splice"} {
+		modes = append(modes, goldenMode{"without_" + item, func() func() { return service.KongSetOpenAIBodyFastpathItemsOffForTest(item) }})
+	}
+	for _, mode := range modes {
 		t.Run(mode.name, func(t *testing.T) {
-			restore := service.KongSetOpenAIBodyFastpathForTest(mode.on)
+			restore := mode.set()
 			defer restore()
 			outcomes := kongFPRunAll(t)
 			if actualPath := os.Getenv("KONG_BODY_FASTPATH_ACTUAL"); actualPath != "" {
