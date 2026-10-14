@@ -22,6 +22,8 @@
 - **OpenAI 账号会话数上限**（软上限，设计见 `DESIGN-openai-session-limit.md`）
 - **codex 响应的 `x-reasoning-included`**（设计见 `DESIGN-codex-reasoning-included.md`）
 - **OpenAI 请求体快速路径**（跳过必然不改写的处理、复用顶层查找，设计见 `DESIGN-openai-request-body-fastpath.md`）
+- **OpenAI 请求体内存**（少留副本、少做复制：请求视图的字段不拖住请求体，出站 zstd 流式压缩并在上传完放掉正文，
+  入站 zstd 不拼接、复用解码器，item id 清洗与身份改写一次写出结果，设计见 `DESIGN-openai-request-body-memory.md`）
 - **账号计划执行端用到的管理端点**（按到期时间指定重置卡的用卡端点，设计见
   `DESIGN-openai-plan-reset-by-expiry.md`）
 - **请求存活续期**（并发槽与会话登记在请求进行中续期，设计见 `DESIGN-request-liveness.md`）
@@ -194,6 +196,10 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
 - **被拒时的回退**：上游像是不接受压缩（415，或 400 / 422 且错误正文是专指正文解码失败的写法）时用明文重发一次；明
   文通过了，才把该端点改发明文 24 小时，明文同样被拒说明与压缩无关、端点照旧压缩。普通业务错误不重发，错误正文
   原样交给调用方。每 10 分钟一行 `kong zstd: 周期计数` 日志给出压缩前后字节数。
+- **压缩正文由持有者提供**（快速路径开关里的 `zstd_out` 项，见 `DESIGN-openai-request-body-memory.md` §2.2）：不再
+  经 `GetBody` 复制一份明文；`Body` 与每次 `GetBody` 给出的 reader 读完或被 Close 就放掉正文，
+  `kongSendOpenAIUpstreamCompressed` 返回时释放持有者，此后 `GetBody` 报错，明文重发用压缩前的 `GetBody`。rebase 时
+  若 `HTTPUpstream` 或调用方开始在 `Do` 返回之后重读 `GetBody`（像 Grok 的回退那样），这条前提就不成立了。
 - **开关**：环境变量 `KONG_OPENAI_REQUEST_ZSTD`，不设置为开，false 关闭，写错则关闭并记错误日志。
 
 ### 前端展示调整
@@ -264,6 +270,29 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
   `go mod download` 之前复制 `third_party/`：本地 `replace` 的模块在下载依赖时就要读得到。
 - **开关**：环境变量 `KONG_OPENAI_BODY_FASTPATH`（不设置为开，false 全关，写错则全关并记错误日志）与
   `KONG_OPENAI_BODY_FASTPATH_OFF`（逗号分隔的项名，只关这几项）。
+
+### OpenAI 请求体内存
+
+- **接入点都是单行或函数头 3 行**：`newOpenAIRequestView` 返回前；`sanitizeOpenAIResponsesInputItemIDs` 的判否门之
+  后；`applyCodexAccountIdentityClientMetadataRaw` 两处 sjson 调用的同行替换（原来的 sjson 函数作为回落传进去，
+  import 不动）；`httputil.ReadRequestBodyWithPrealloc` 里 `capHint` 算完之后。出站 zstd 的改动全在 fork 自己的文件里。
+- **rebase 时复核**：
+  - 请求视图新增了字符串字段，要加进 `kongDetachOpenAIRequestView`，否则改写后的中间版本又会被子串拖住；
+  - item id 清洗的快路径照抄原函数的遍历与取值、`replaceOpenAIRawInput` 的拼法，判定调用上游的两个函数。上游改了
+    删除的字段、拼法或遍历方式要同步，`TestKongSpliceInputItemIDs*` 会对照原函数报错；
+  - 身份改写：第二处原地写回的前提是 `changed` 为真时 `next` 是本函数刚分配的副本。两处调用的顺序或 `changed` 的
+    含义变了，要重新确认；
+  - `httputil`：`kongReadRequestBodyChunkList` 照抄 `readRequestBodyChunks`，`kongReadZstdRequestBody` 照抄解压之后
+    的请求头处理。上游改了这几处或 `decompressRequestBody` 要同步，`TestKongReadZstdRequestBodyMatchesOriginal`
+    对照原读法；
+  - 依赖升级：`kongSJSONDeleteTailItem`、`kongSJSONMustMarshalString` 照抄 sjson v1.2.5，`go.mod` 里 sjson 的版本变了
+    要重新对照源码（`TestKongSJSONDeleteRangeMatchesSJSON`、`TestKongSetIdentity*` 守着）；klauspost 升级后跑
+    `TestKongZstdStreamingMatchesOriginal`（`ReadFrom` 与整份 `Write` 的切块必须相同）与 `TestKongReadZstd*`。
+- **开关**：快速路径的 `KONG_OPENAI_BODY_FASTPATH_OFF` 新增五个名字：`view_strings`、`zstd_out`、`zstd_in`、
+  `item_ids_splice`、`identity_splice`。`httputil` 不能引用 `service`，它的开关由 `service` 包初始化时注入。端到端
+  对照除全关、全开之外，还把这五项逐项关掉各跑一遍。
+- **内存量法**：`handler` 包的 `TestKongOpenAIBodyMemory` 断言请求持有的存活与预热后的分配，池子的保留只打印，
+  量法见设计 §4。
 
 ### 按到期时间指定重置卡的用卡端点
 
@@ -394,9 +423,9 @@ gjson 副本的 `TestJSONString` 在 Go 1.27 下失败，原版 v1.18.0 同样�
 **必须在不含快速路径的代码上录制**，否则就失去了"原版本"的意义。步骤：
 `git worktree add <tmp> <功能后端提交>^`；把 `kong_openai_body_fastpath_e2e_test.go` 与 `internal/pkg/kongcorpus/`
 复制过去，再放一份测试构建的桩 `internal/service/kong_testhooks_unit.go`（`KongSwapOpenAIRequestZstdForTest` 照抄，
-`KongSetOpenAIBodyFastpathForTest` 写成空操作）；在那里用 `KONG_BODY_FASTPATH_GOLDEN=update` 跑
-`TestKongOpenAIBodyFastpathGolden`，把生成的基准拷回来；回到当前代码不带这个变量再跑一遍，快速路径关、开两个子测试
-都要通过。新增 e2e 用例之后也要这样重录。
+`KongSetOpenAIBodyFastpathForTest` 与 `KongSetOpenAIBodyFastpathItemsOffForTest` 写成空操作）；在那里用
+`KONG_BODY_FASTPATH_GOLDEN=update` 跑 `TestKongOpenAIBodyFastpathGolden`，把生成的基准拷回来；回到当前代码不带这个
+变量再跑一遍，全关、全开与五项逐项关闭这七个子测试都要通过。新增 e2e 用例之后也要这样重录。
 
 **`-race` 下上游测试套整体不干净**，这不是本 fork 的问题：每次都报十几个竞态、几十个连带失败的用例，
 并且每次不一样。竞态全在上游的测试写法上——测试桩不加锁、并行用例各自 `gin.SetMode`、改包级变量时上一个
