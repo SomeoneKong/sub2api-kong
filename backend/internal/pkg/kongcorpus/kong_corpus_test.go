@@ -5,6 +5,7 @@ package kongcorpus
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -47,4 +48,15 @@ func TestSSEResponseEndsWithCompleted(t *testing.T) {
 	sse := SSEResponse(1, "gpt-6-sol", 20)
 	require.Contains(t, string(sse), "event: response.completed\n")
 	require.True(t, bytes.HasSuffix(sse, []byte("\n\n")))
+}
+
+func TestRequestPlacesAllImages(t *testing.T) {
+	for _, shape := range []Shape{ShapeSol, ShapeLite} {
+		for _, images := range []int{1, 2, 5} {
+			o := Options{Shape: shape, Seed: 3, TargetBytes: 0, ItemIDs: true, Images: images, ImageBytes: 1 << 10}
+			if got := strings.Count(string(Request(o)), `"type":"input_image"`); got != images {
+				t.Fatalf("shape=%d images=%d：只生成了 %d 张", shape, images, got)
+			}
+		}
+	}
 }

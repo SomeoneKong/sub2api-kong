@@ -34,6 +34,30 @@ func KongSetOpenAIBodyFastpathForTest(on bool) func() {
 	return func() { kongFastpathSettingsCurrent = previous }
 }
 
+// KongSetOpenAIBodyFastpathItemsOffForTest 打开请求体快速路径的全部项，只关掉 names 这几项（名字同
+// KONG_OPENAI_BODY_FASTPATH_OFF），返回恢复函数；名字不认识时 panic，免得测试静默地什么都没关。
+func KongSetOpenAIBodyFastpathItemsOffForTest(names ...string) func() {
+	previous := kongFastpathSettingsCurrent
+	var settings kongFastpathSettings
+	for i := range settings.enabled {
+		settings.enabled[i] = true
+	}
+	for _, name := range names {
+		found := false
+		for i, known := range kongFastpathItemNames {
+			if name == known {
+				settings.enabled[i] = false
+				found = true
+			}
+		}
+		if !found {
+			panic("unknown fastpath item " + name)
+		}
+	}
+	kongFastpathSettingsCurrent = func() kongFastpathSettings { return settings }
+	return func() { kongFastpathSettingsCurrent = previous }
+}
+
 // KongInstallCodexCatalogForTest 给网关服务装上目录存档组件：候选账号取自 candidates，拉取交给 fetch，
 // 不读写数据库，复核原样放行。返回停止函数。
 func KongInstallCodexCatalogForTest(

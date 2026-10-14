@@ -1119,6 +1119,7 @@ func newOpenAIRequestView(body []byte) openAIRequestView {
 		}
 		return seen != allRequestViewFields
 	})
+	kongDetachOpenAIRequestView(&view) // [kong] 字段不再是请求体的子串，免得拖住改写前的版本，见 DESIGN-openai-request-body-memory §2.1
 	return view
 }
 

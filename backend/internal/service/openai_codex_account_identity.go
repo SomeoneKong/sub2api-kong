@@ -223,7 +223,7 @@ func applyCodexAccountIdentityClientMetadataRaw(body []byte, account *Account, a
 				return body, false, fmt.Errorf("encode account-scoped client_metadata: %w", err)
 			}
 			var setErr error
-			next, setErr = sjson.SetRawBytes(next, "client_metadata", raw)
+			next, setErr = kongSetIdentityRaw(sjson.SetRawBytes, next, "client_metadata", raw) // [kong] 见 DESIGN-openai-request-body-memory §2.5
 			if setErr != nil {
 				return body, false, fmt.Errorf("splice account-scoped client_metadata: %w", setErr)
 			}
@@ -238,7 +238,7 @@ func applyCodexAccountIdentityClientMetadataRaw(body []byte, account *Account, a
 		}
 		scoped := scopeCodexAccountIdentityValue(account, apiKeyID, kind, raw)
 		if scoped != raw {
-			rewritten, err := sjson.SetBytes(next, "prompt_cache_key", scoped)
+			rewritten, err := kongSetIdentityString(sjson.SetBytes, next, changed, "prompt_cache_key", scoped) // [kong] changed 说明 next 是本函数刚分配的副本
 			if err != nil {
 				return body, false, fmt.Errorf("splice account-scoped prompt_cache_key: %w", err)
 			}

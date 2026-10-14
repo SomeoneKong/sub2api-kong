@@ -66,6 +66,9 @@ func sanitizeOpenAIResponsesInputItemIDs(body []byte) ([]byte, bool, error) {
 	if kongInputItemIDsClean(body) { // [kong] 见 DESIGN §3.10
 		return body, false, nil
 	}
+	if out, changed, ok := kongSpliceInputItemIDs(body); ok { // [kong] 一次拼出结果，见 DESIGN-openai-request-body-memory §2.4
+		return out, changed, nil
+	}
 	input := parseRawJSONView(body).Get("input")
 	if !input.IsArray() {
 		return body, false, nil
