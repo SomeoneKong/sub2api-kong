@@ -252,10 +252,10 @@ func (s *SettingService) GetAntigravityUserAgentVersion(ctx context.Context) str
 	}
 
 	result, _, _ := s.antigravityUAVersionSF.Do("antigravity_user_agent_version", func() (any, error) {
-		if cached, ok := s.antigravityUAVersionCache.Load().(*cachedAntigravityUserAgentVersion); ok && cached != nil {
-			if time.Now().UnixNano() < cached.expiresAt {
-				return cached.version, nil
-			}
+		prevRaw := s.antigravityUAVersionCache.Load()
+		prev, _ := prevRaw.(*cachedAntigravityUserAgentVersion)
+		if prev != nil && time.Now().UnixNano() < prev.expiresAt {
+			return prev.version, nil
 		}
 		if ctx == nil {
 			ctx = context.Background()
@@ -265,21 +265,23 @@ func (s *SettingService) GetAntigravityUserAgentVersion(ctx context.Context) str
 		value, err := s.settingRepo.GetValue(dbCtx, SettingKeyAntigravityUserAgentVersion)
 		if err != nil && !errors.Is(err, ErrSettingNotFound) {
 			slog.Warn("failed to get antigravity user agent version setting", "error", err)
-			s.antigravityUAVersionCache.Store(&cachedAntigravityUserAgentVersion{
-				version:   fallback,
+			version := fallback
+			if prev != nil {
+				version = prev.version
+			}
+			return publishSettingCache(&s.antigravityUAVersionCache, prevRaw, &cachedAntigravityUserAgentVersion{
+				version:   version,
 				expiresAt: time.Now().Add(antigravityUserAgentVersionErrorTTL).UnixNano(),
-			})
-			return fallback, nil
+			}).version, nil
 		}
 		version := antigravity.NormalizeUserAgentVersion(value)
 		if version == "" {
 			version = fallback
 		}
-		s.antigravityUAVersionCache.Store(&cachedAntigravityUserAgentVersion{
+		return publishSettingCache(&s.antigravityUAVersionCache, prevRaw, &cachedAntigravityUserAgentVersion{
 			version:   version,
 			expiresAt: time.Now().Add(antigravityUserAgentVersionCacheTTL).UnixNano(),
-		})
-		return version, nil
+		}).version, nil
 	})
 	if version, ok := result.(string); ok && version != "" {
 		return version
@@ -301,10 +303,10 @@ func (s *SettingService) GetOpenAICodexUserAgent(ctx context.Context) string {
 	}
 
 	result, _, _ := s.openAICodexUASF.Do("openai_codex_user_agent", func() (any, error) {
-		if cached, ok := s.openAICodexUACache.Load().(*cachedOpenAICodexUserAgent); ok && cached != nil {
-			if time.Now().UnixNano() < cached.expiresAt {
-				return cached.value, nil
-			}
+		prevRaw := s.openAICodexUACache.Load()
+		prev, _ := prevRaw.(*cachedOpenAICodexUserAgent)
+		if prev != nil && time.Now().UnixNano() < prev.expiresAt {
+			return prev.value, nil
 		}
 		if ctx == nil {
 			ctx = context.Background()
@@ -314,22 +316,24 @@ func (s *SettingService) GetOpenAICodexUserAgent(ctx context.Context) string {
 		value, err := s.settingRepo.GetValue(dbCtx, SettingKeyOpenAICodexUserAgent)
 		if err != nil && !errors.Is(err, ErrSettingNotFound) {
 			slog.Warn("failed to get openai codex user agent setting", "error", err)
-			s.openAICodexUACache.Store(&cachedOpenAICodexUserAgent{
-				value:     fallback,
+			ua := fallback
+			if prev != nil {
+				ua = prev.value
+			}
+			return publishSettingCache(&s.openAICodexUACache, prevRaw, &cachedOpenAICodexUserAgent{
+				value:     ua,
 				expiresAt: time.Now().Add(openAICodexUserAgentErrorTTL).UnixNano(),
-			})
-			return fallback, nil
+			}).value, nil
 		}
 		// Preserve invalid header bytes for canonical identity validation.
 		ua := strings.Trim(value, " \t")
 		if ua == "" {
 			ua = fallback
 		}
-		s.openAICodexUACache.Store(&cachedOpenAICodexUserAgent{
+		return publishSettingCache(&s.openAICodexUACache, prevRaw, &cachedOpenAICodexUserAgent{
 			value:     ua,
 			expiresAt: time.Now().Add(openAICodexUserAgentCacheTTL).UnixNano(),
-		})
-		return ua, nil
+		}).value, nil
 	})
 	if ua, ok := result.(string); ok && ua != "" {
 		return ua
@@ -353,10 +357,10 @@ func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string
 	}
 
 	result, _, _ := s.openAICodexVersionSF.Do(openAICodexClientVersionSFKey, func() (any, error) {
-		if cached, ok := s.openAICodexVersionCache.Load().(*cachedOpenAICodexClientVersion); ok && cached != nil {
-			if time.Now().UnixNano() < cached.expiresAt {
-				return cached.version, nil
-			}
+		prevRaw := s.openAICodexVersionCache.Load()
+		prev, _ := prevRaw.(*cachedOpenAICodexClientVersion)
+		if prev != nil && time.Now().UnixNano() < prev.expiresAt {
+			return prev.version, nil
 		}
 		if ctx == nil {
 			ctx = context.Background()
@@ -369,11 +373,15 @@ func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string
 		})
 		if err != nil {
 			slog.Warn("failed to get openai codex client version setting", "error", err)
-			s.openAICodexVersionCache.Store(&cachedOpenAICodexClientVersion{
-				version:   fallback,
+			// 读不到时沿用上一次的版本：内置常量往往已落后于官方发布，上游会按版本拒绝部分模型。
+			version := fallback
+			if prev != nil {
+				version = prev.version
+			}
+			return publishSettingCache(&s.openAICodexVersionCache, prevRaw, &cachedOpenAICodexClientVersion{
+				version:   version,
 				expiresAt: time.Now().Add(openAICodexClientVersionErrorTTL).UnixNano(),
-			})
-			return fallback, nil
+			}).version, nil
 		}
 		version := NormalizeCodexClientVersion(values[SettingKeyOpenAICodexClientVersion])
 		if version == "" {
@@ -382,11 +390,10 @@ func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string
 		if version == "" {
 			version = fallback
 		}
-		s.openAICodexVersionCache.Store(&cachedOpenAICodexClientVersion{
+		return publishSettingCache(&s.openAICodexVersionCache, prevRaw, &cachedOpenAICodexClientVersion{
 			version:   version,
 			expiresAt: time.Now().Add(openAICodexClientVersionCacheTTL).UnixNano(),
-		})
-		return version, nil
+		}).version, nil
 	})
 	if version, ok := result.(string); ok && version != "" {
 		return version
@@ -394,14 +401,21 @@ func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string
 	return fallback
 }
 
-// InvalidateOpenAICodexClientVersionCache 丢弃版本号缓存，下次读取回源。
+// InvalidateOpenAICodexClientVersionCache 让版本号缓存过期，下次读取回源；回源失败时仍沿用失效前的版本。
 // 面板保存与自动同步写入后调用。
 func (s *SettingService) InvalidateOpenAICodexClientVersionCache() {
 	if s == nil {
 		return
 	}
+	expireSettingCache(&s.openAICodexVersionCache, func(prev *cachedOpenAICodexClientVersion) *cachedOpenAICodexClientVersion {
+		version := codexCLIVersion
+		if prev != nil {
+			version = prev.version
+		}
+		return &cachedOpenAICodexClientVersion{version: version}
+	})
+	// 先让缓存过期再 Forget：失效返回之后的读取不会再并进失效之前开始的那次回源。
 	s.openAICodexVersionSF.Forget(openAICodexClientVersionSFKey)
-	s.openAICodexVersionCache.Store((*cachedOpenAICodexClientVersion)(nil))
 }
 
 // NormalizeClaudeCodeClientVersion 校验并归一化 Claude Code 客户端版本号，非法值返回空串。
@@ -440,10 +454,10 @@ func (s *SettingService) GetClaudeCodeClientVersion(ctx context.Context) string 
 	}
 
 	result, _, _ := s.claudeCodeVersionSF.Do(claudeCodeClientVersionSFKey, func() (any, error) {
-		if cached, ok := s.claudeCodeVersionCache.Load().(*cachedClaudeCodeClientVersion); ok && cached != nil {
-			if time.Now().UnixNano() < cached.expiresAt {
-				return cached.version, nil
-			}
+		prevRaw := s.claudeCodeVersionCache.Load()
+		prev, _ := prevRaw.(*cachedClaudeCodeClientVersion)
+		if prev != nil && time.Now().UnixNano() < prev.expiresAt {
+			return prev.version, nil
 		}
 		if ctx == nil {
 			ctx = context.Background()
@@ -456,11 +470,14 @@ func (s *SettingService) GetClaudeCodeClientVersion(ctx context.Context) string 
 		})
 		if err != nil {
 			slog.Warn("failed to get claude code client version setting", "error", err)
-			s.claudeCodeVersionCache.Store(&cachedClaudeCodeClientVersion{
-				version:   fallback,
+			version := fallback
+			if prev != nil {
+				version = prev.version
+			}
+			return publishSettingCache(&s.claudeCodeVersionCache, prevRaw, &cachedClaudeCodeClientVersion{
+				version:   version,
 				expiresAt: time.Now().Add(claudeCodeClientVersionErrorTTL).UnixNano(),
-			})
-			return fallback, nil
+			}).version, nil
 		}
 		version := NormalizeClaudeCodeClientVersion(values[SettingKeyClaudeCodeClientVersion])
 		if version == "" {
@@ -477,11 +494,10 @@ func (s *SettingService) GetClaudeCodeClientVersion(ctx context.Context) string 
 		if version == "" {
 			version = fallback
 		}
-		s.claudeCodeVersionCache.Store(&cachedClaudeCodeClientVersion{
+		return publishSettingCache(&s.claudeCodeVersionCache, prevRaw, &cachedClaudeCodeClientVersion{
 			version:   version,
 			expiresAt: time.Now().Add(claudeCodeClientVersionCacheTTL).UnixNano(),
-		})
-		return version, nil
+		}).version, nil
 	})
 	if version, ok := result.(string); ok && version != "" {
 		return version
@@ -489,14 +505,46 @@ func (s *SettingService) GetClaudeCodeClientVersion(ctx context.Context) string 
 	return fallback
 }
 
-// InvalidateClaudeCodeClientVersionCache 丢弃版本号缓存，下次读取回源。
+// InvalidateClaudeCodeClientVersionCache 让版本号缓存过期，下次读取回源；回源失败时仍沿用失效前的版本。
 // 面板保存与自动同步写入后调用。
 func (s *SettingService) InvalidateClaudeCodeClientVersionCache() {
 	if s == nil {
 		return
 	}
+	expireSettingCache(&s.claudeCodeVersionCache, func(prev *cachedClaudeCodeClientVersion) *cachedClaudeCodeClientVersion {
+		version := claude.CLIVersion()
+		if prev != nil {
+			version = prev.version
+		}
+		return &cachedClaudeCodeClientVersion{version: version}
+	})
+	// 先让缓存过期再 Forget：失效返回之后的读取不会再并进失效之前开始的那次回源。
 	s.claudeCodeVersionSF.Forget(claudeCodeClientVersionSFKey)
-	s.claudeCodeVersionCache.Store((*cachedClaudeCodeClientVersion)(nil))
+}
+
+// publishSettingCache 把回源结果发布进缓存，前提是缓存仍是回源开始时那一份（prevRaw 是当时 Load() 的原始返回值，
+// 缓存从没写过时是无类型 nil）。回源期间缓存被保存直写或失效改写过时不覆盖，返回缓存里的当前条目：
+// 那次回源可能读到的是改写之前的值。每次写入都是新分配的条目，指针不同即表示被改写过。
+func publishSettingCache[T any](cache *atomic.Value, prevRaw any, next *T) *T {
+	if cache.CompareAndSwap(prevRaw, next) {
+		return next
+	}
+	if current, ok := cache.Load().(*T); ok && current != nil {
+		return current
+	}
+	return next
+}
+
+// expireSettingCache 把缓存换成 expired 返回的新条目（调用方保证已过期）：下一次读取照常回源，回源失败时仍有值可沿用；
+// 新分配的指针让失效之前开始的回源发布时能看出缓存已被改写。
+func expireSettingCache[T any](cache *atomic.Value, expired func(prev *T) *T) {
+	for {
+		prevRaw := cache.Load()
+		prev, _ := prevRaw.(*T)
+		if cache.CompareAndSwap(prevRaw, expired(prev)) {
+			return
+		}
+	}
 }
 
 // GetOpenAICodexCanonicalUserAgent 返回出站规范 Codex User-Agent。
