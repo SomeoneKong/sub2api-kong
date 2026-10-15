@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -231,75 +232,107 @@ func (r *dashboardAggregationRepository) CleanupAggregates(ctx context.Context, 
 }
 
 func (r *dashboardAggregationRepository) CleanupUsageLogs(ctx context.Context, cutoff time.Time) error {
+	deletedThrough, deleteErr := r.deleteExpiredUsageLogs(ctx, cutoff)
+	// 这一轮即使没删完（出错或超时），已提交的删除也要反映到日桶上；清理的 ctx 可能已经到期，对账另给时限。
+	// 进程在两者之间退出时，重启后的第一轮清理会再对账。r.sql 是调用方的事务时对账也在其中执行，
+	// 出错后由调用方整体回滚。
+	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageLogsRetentionReconcileTimeout)
+	defer cancel()
+	todayStart := service.GroupUsageTodayStart(r.now())
+	if err := r.reconcileGroupUsageRollupsWithRetention(reconcileCtx, todayStart, deletedThrough); err != nil {
+		return errors.Join(deleteErr, err)
+	}
+	if deleteErr != nil {
+		return deleteErr
+	}
+	return r.SyncGroupUsageRollups(ctx, todayStart)
+}
+
+// deleteExpiredUsageLogs 删掉早于 cutoff 的明细，返回这一轮的删除可能涉及的最晚时刻，作为对账的重算右端：
+// 全部删完时是 cutoff；没删完时是已整月删除的分区里最晚的上界（默认分区或未按月命名的分区里可能还留着更早的行，
+// 剩下的最早一行未必晚于这些分区），没有删分区则为零值——批次删除删的是剩下明细里最早的一段，只需重算最早一天。
+func (r *dashboardAggregationRepository) deleteExpiredUsageLogs(ctx context.Context, cutoff time.Time) (time.Time, error) {
 	isPartitioned, err := r.isUsageLogsPartitioned(ctx)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
+	var droppedThrough time.Time
 	if isPartitioned {
-		if err := r.dropUsageLogsPartitions(ctx, cutoff); err != nil {
-			return err
+		if droppedThrough, err = r.dropUsageLogsPartitions(ctx, cutoff); err != nil {
+			return droppedThrough, err
 		}
 	}
 	// Remove the expired part of the boundary partition as well, so a retention
 	// window measured in days does not silently round up to a whole month.
 	if err := r.cleanupUsageLogsBatches(ctx, cutoff); err != nil {
-		return err
+		return droppedThrough, err
 	}
-	return r.SyncGroupUsageRollups(ctx, service.GroupUsageTodayStart(r.now()))
+	return cutoff, nil
 }
 
-func (r *dashboardAggregationRepository) cleanupUsageLogsBatches(ctx context.Context, cutoff time.Time) error {
-	db, transactional := r.sql.(*sql.DB)
-	for {
-		if transactional {
-			affected, err := cleanupUsageLogsBatchWithRollupInvalidation(ctx, db, cutoff)
-			if err != nil {
-				return err
-			}
-			if affected < usageLogsCleanupBatchSize {
-				return nil
-			}
-			continue
-		}
+// usageLogsRetentionReconcileTimeout 是保留清理之后对账的时限，独立于清理本身的 ctx。
+const usageLogsRetentionReconcileTimeout = 30 * time.Second
 
-		res, err := r.sql.ExecContext(ctx, `
-			WITH victims AS (
-				SELECT tableoid, ctid
-				FROM usage_logs
-				WHERE created_at < $1
-				ORDER BY created_at ASC, id ASC
-				LIMIT $2
-			)
-			DELETE FROM usage_logs
-			WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM victims)
-		`, cutoff.UTC(), usageLogsCleanupBatchSize)
-		if err != nil {
-			return err
+// 保留清理的批次事务里设置这个开关，删除触发器 invalidate_group_usage_rollup_state()（迁移 243）
+// 见到它就不读、不锁、不改 usage_group_rollup_state：被删的是明细最早的一段，日桶由之后的
+// reconcileGroupUsageRollupsWithRetention 跟上，不需要逐行失效。否则每批删除都要持有状态行的锁，
+// 挡住插入触发器、进而挡住新明细的写入。
+const (
+	usageLogsRetentionCleanupOn  = `SET LOCAL sub2api.usage_logs_retention_cleanup = 'on'`
+	usageLogsRetentionCleanupOff = `SET LOCAL sub2api.usage_logs_retention_cleanup = 'off'`
+)
+
+func (r *dashboardAggregationRepository) cleanupUsageLogsBatches(ctx context.Context, cutoff time.Time) error {
+	db, ownTx := r.sql.(*sql.DB)
+	for {
+		var affected int64
+		var err error
+		if ownTx {
+			affected, err = cleanupUsageLogsRetentionBatchInTx(ctx, db, cutoff)
+		} else {
+			affected, err = deleteUsageLogsRetentionBatch(ctx, r.sql, cutoff)
 		}
-		affected, err := res.RowsAffected()
 		if err != nil {
 			return err
 		}
 		if affected < usageLogsCleanupBatchSize {
-			return nil
+			// 不足一批不等于删完：另一轮并发的清理可能先删掉了同一批行。
+			var remaining bool
+			if err := scanSingleRow(ctx, r.sql, `
+				SELECT EXISTS (SELECT 1 FROM usage_logs WHERE created_at < $1)
+			`, []any{cutoff.UTC()}, &remaining); err != nil {
+				return err
+			}
+			if !remaining {
+				return nil
+			}
 		}
 	}
 }
 
-func cleanupUsageLogsBatchWithRollupInvalidation(ctx context.Context, db *sql.DB, cutoff time.Time) (int64, error) {
+func cleanupUsageLogsRetentionBatchInTx(ctx context.Context, db *sql.DB, cutoff time.Time) (int64, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	rollback := func(err error) (int64, error) {
+	affected, err := deleteUsageLogsRetentionBatch(ctx, tx, cutoff)
+	if err != nil {
 		_ = tx.Rollback()
 		return 0, err
 	}
-
-	if err := lockGroupUsageRollupState(ctx, tx); err != nil {
-		return rollback(err)
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
-	rows, err := tx.QueryContext(ctx, `
+	return affected, nil
+}
+
+// deleteUsageLogsRetentionBatch 在调用方的事务里删一批过期明细。开关只在这条删除期间打开：
+// 调用方若是更大的事务，之后的删除仍照常失效日桶。
+func deleteUsageLogsRetentionBatch(ctx context.Context, exec sqlExecutor, cutoff time.Time) (int64, error) {
+	if _, err := exec.ExecContext(ctx, usageLogsRetentionCleanupOn); err != nil {
+		return 0, err
+	}
+	res, err := exec.ExecContext(ctx, `
 		WITH victims AS (
 			SELECT tableoid, ctid
 			FROM usage_logs
@@ -309,41 +342,14 @@ func cleanupUsageLogsBatchWithRollupInvalidation(ctx context.Context, db *sql.DB
 		)
 		DELETE FROM usage_logs
 		WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM victims)
-		RETURNING created_at
 	`, cutoff.UTC(), usageLogsCleanupBatchSize)
 	if err != nil {
-		return rollback(err)
-	}
-
-	var affected int64
-	var earliestDeletedAt time.Time
-	for rows.Next() {
-		var deletedAt time.Time
-		if err := rows.Scan(&deletedAt); err != nil {
-			_ = rows.Close()
-			return rollback(err)
-		}
-		affected++
-		if earliestDeletedAt.IsZero() || deletedAt.Before(earliestDeletedAt) {
-			earliestDeletedAt = deletedAt
-		}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return rollback(err)
-	}
-	if err := rows.Close(); err != nil {
-		return rollback(err)
-	}
-	if affected > 0 {
-		if err := invalidateGroupUsageRollupsAt(ctx, tx, earliestDeletedAt); err != nil {
-			return rollback(err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return affected, nil
+	if _, err := exec.ExecContext(ctx, usageLogsRetentionCleanupOff); err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (r *dashboardAggregationRepository) CleanupUsageBillingDedup(ctx context.Context, cutoff time.Time) error {
@@ -583,7 +589,10 @@ func (r *dashboardAggregationRepository) isUsageLogsPartitioned(ctx context.Cont
 	return partitioned, nil
 }
 
-func (r *dashboardAggregationRepository) dropUsageLogsPartitions(ctx context.Context, cutoff time.Time) error {
+// dropUsageLogsPartitions 按月份先后整月删除早于 cutoff 所在月份的分区，返回已删分区里最晚的上界（按分区名的月份，
+// 没有删则为零值）。
+func (r *dashboardAggregationRepository) dropUsageLogsPartitions(ctx context.Context, cutoff time.Time) (time.Time, error) {
+	var droppedThrough time.Time
 	rows, err := r.sql.QueryContext(ctx, `
 		SELECT c.relname
 		FROM pg_inherits
@@ -592,7 +601,7 @@ func (r *dashboardAggregationRepository) dropUsageLogsPartitions(ctx context.Con
 		WHERE p.relname = 'usage_logs'
 	`)
 	if err != nil {
-		return err
+		return droppedThrough, err
 	}
 	cutoffMonth := truncateToMonthUTC(cutoff)
 	type usageLogsPartition struct {
@@ -604,7 +613,7 @@ func (r *dashboardAggregationRepository) dropUsageLogsPartitions(ctx context.Con
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			_ = rows.Close()
-			return err
+			return droppedThrough, err
 		}
 		if !strings.HasPrefix(name, "usage_logs_") {
 			continue
@@ -621,51 +630,24 @@ func (r *dashboardAggregationRepository) dropUsageLogsPartitions(ctx context.Con
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return err
+		return droppedThrough, err
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return droppedThrough, err
 	}
 
 	sort.Slice(partitions, func(i, j int) bool {
 		return partitions[i].month.Before(partitions[j].month)
 	})
-	if db, ok := r.sql.(*sql.DB); ok {
-		for _, partition := range partitions {
-			if err := dropUsageLogsPartitionWithRollupInvalidation(ctx, db, partition.name, partition.month); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
+	// 整月分区删掉之后，日桶由清理末尾的 reconcileGroupUsageRollupsWithRetention 对上剩下的明细，
+	// 不必降低汇总水位、也就不会触发整个保留期的重建。
 	for _, partition := range partitions {
 		if _, err := r.sql.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", pq.QuoteIdentifier(partition.name))); err != nil {
-			return err
+			return droppedThrough, err
 		}
+		droppedThrough = partition.month.AddDate(0, 1, 0)
 	}
-	return nil
-}
-
-func dropUsageLogsPartitionWithRollupInvalidation(ctx context.Context, db *sql.DB, name string, monthStart time.Time) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	rollback := func(err error) error {
-		_ = tx.Rollback()
-		return err
-	}
-
-	if err := lockGroupUsageRollupState(ctx, tx); err != nil {
-		return rollback(err)
-	}
-	if err := invalidateGroupUsageRollupsAt(ctx, tx, monthStart); err != nil {
-		return rollback(err)
-	}
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", pq.QuoteIdentifier(name))); err != nil {
-		return rollback(err)
-	}
-	return tx.Commit()
+	return droppedThrough, nil
 }
 
 func (r *dashboardAggregationRepository) createUsageLogsPartition(ctx context.Context, month time.Time) error {
