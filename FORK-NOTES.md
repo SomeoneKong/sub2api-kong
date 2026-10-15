@@ -14,7 +14,7 @@
 - **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
-另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
+另有四个可提给上游的修复，排在定制清单最前面（见下文挂点一节的前两小节），上游合并后在 rebase 时丢掉。
 
 有三处是**结构性的、不随上游版本变化的约束**，值得写在这里而不是只留在 commit 里：
 
@@ -78,6 +78,24 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
   落库映射（`buildCodexUsageExtraUpdates`）必须共用同一份：各自归一化会对同一个账号算出不同水位，而
   `codex_5h_used_percent` / `codex_7d_used_percent` 是调度阈值的输入，不一致不报错、只会让调度照两个矛盾的数做
   决定。
+
+### 可提给上游的保留清理与出站身份两个修复
+
+明细保留清理不挡住明细写入（设计见 `DESIGN-usage-retention-cleanup.md`）、读设置失败时沿用上一次的出站客户端身份
+（设计见 `DESIGN-settings-client-identity-stale-on-error.md`）。这两个提交只改上游文件、不引用任何 fork 符号；上游合并后
+rebase 时丢掉，这一小节随之删除。
+
+- **迁移 243 重定义了 `invalidate_group_usage_rollup_state()`**，加了保留清理开关 `sub2api.usage_logs_retention_cleanup`
+  的分支。上游以后若有迁移再次重定义这个函数（或改 222 / 223 的触发器），新装按文件名顺序全部执行、升级只执行新增的，
+  两条路径上函数的最终定义可能不同：跟进基线时查上游新迁移里有没有这个函数，有就追加一个后置迁移把开关分支补回，
+  并按两条路径核对最终定义。已发布的 243 不改。
+- **保留清理之后，分组日桶只靠清理末尾的对账跟上**（`reconcileGroupUsageRollupsWithRetention`，不论删除成败都跑）。
+  上游改 `CleanupUsageLogs`、批次删除，或改日桶的发布规则（`closed_before` / `retained_from` 的含义、读取取日桶的范围）
+  时，对照设计第 3 节复核；上游新增别的批量删除 `usage_logs` 的路径时，不要让它设这个开关。
+- **出站身份四个读取的发布规则**（Codex 版本号与 UA、Claude Code 版本号、Antigravity 版本号）：回源结果经
+  `publishSettingCache` 按 `Load()` 的原始返回值 CAS 发布，失效经 `expireSettingCache` 发布新的已过期条目，保存设置时的直写
+  保持无条件 `Store`。上游新增出站身份类的设置读取，或改这四个读取、两个失效函数时，保持"读库出错沿用上一次的值、
+  回源不覆盖期间的保存与失效"。
 
 ### codex 票的被动观测
 
