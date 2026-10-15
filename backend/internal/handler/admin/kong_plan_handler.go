@@ -175,14 +175,22 @@ func (h *KongPlanHandler) GetCaller(c *gin.Context) {
 	kongPlanRespond(c, data, err)
 }
 
-// Accounts 返回网关此刻对每个 OpenAI OAuth 账号的定层、credits 资格、窗口状态与未结算的入层。
+// Accounts 返回网关此刻对每个 OpenAI OAuth 账号的定层、credits 资格、窗口状态、未结算的入层与实时占用。
 // GET /api/v1/admin/kong-plan/accounts
 func (h *KongPlanHandler) Accounts(c *gin.Context) {
 	if !h.ready(c) {
 		return
 	}
-	data, err := service.KongPlanAccounts(c.Request.Context(), h.accounts)
+	data, err := service.KongPlanAccounts(c.Request.Context(), h.accounts, h.liveReader())
 	kongPlanRespond(c, data, err)
+}
+
+// liveReader 是 GET /accounts 读实时占用用的读取器；没装配网关服务时为 nil——直接把 nil 指针放进接口会得到一个不为 nil 的接口值。
+func (h *KongPlanHandler) liveReader() service.KongPlanLiveReader {
+	if h.gateway == nil {
+		return nil
+	}
+	return h.gateway
 }
 
 // GetHot 返回热账号限速的转换记录（序号大于 since 的）、近 48 小时的限速挤压与余额刷新状态。

@@ -376,6 +376,8 @@ type KongPlanAccountView struct {
 	MaxConcurrency int `json:"max_concurrency"`
 	// Hot 是热账号限速的状态（kong_plan_hot.go）；节奏快照里还没有这个账号时为 nil。
 	Hot *KongHotAccountView `json:"hot"`
+	// Live 是此刻的并发、排队与活跃会话（kong_plan_live.go）；读不到时为 nil。
+	Live *KongPlanLiveView `json:"live"`
 }
 
 func kongPlanWindowState(extra map[string]any, window string, now time.Time) KongPlanWindowView {
@@ -408,7 +410,8 @@ func kongPlanWindowState(extra map[string]any, window string, now time.Time) Kon
 
 // KongPlanAccounts 返回网关此刻对每个 OpenAI OAuth 账号的判断：定层、credits 资格与窗口状态用的是选号时的
 // 同一份读数与同一个函数，边车据此清除暂停标记（DESIGN-account-selection.md 第 3.3 节），不必自己重算。
-func KongPlanAccounts(ctx context.Context, repo AccountRepository) ([]KongPlanAccountView, error) {
+// live 不为 nil 时每一项再带上实时占用（额度服务读它，DESIGN-quota-gateway-reads.md）。
+func KongPlanAccounts(ctx context.Context, repo AccountRepository, live KongPlanLiveReader) ([]KongPlanAccountView, error) {
 	rt := kongPlanRuntimeNow()
 	if rt == nil || repo == nil {
 		return nil, infraerrors.ServiceUnavailable(KongPlanReasonUnavailable, "计划组件未启用")
@@ -419,11 +422,13 @@ func KongPlanAccounts(ctx context.Context, repo AccountRepository) ([]KongPlanAc
 	}
 	now := rt.now()
 	out := make([]KongPlanAccountView, 0, len(accounts))
+	byID := make(map[int64]*Account, len(accounts))
 	for i := range accounts {
 		a := &accounts[i]
 		if !a.IsOpenAIOAuth() {
 			continue
 		}
+		byID[a.ID] = a
 		// 一行里的定层、上限与热度用同一份计划状态、入层记录与节奏状态，换发布或推进发生在中途也不会拼出两份各一半；
 		// 先读入层记录、后读节奏状态（与定层同一顺序，推进者先发布快照、后移出结算的入层）
 		var st *kongPlanState
@@ -464,5 +469,6 @@ func KongPlanAccounts(ctx context.Context, repo AccountRepository) ([]KongPlanAc
 		out = append(out, v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	kongPlanAttachLive(ctx, live, out, byID)
 	return out, nil
 }

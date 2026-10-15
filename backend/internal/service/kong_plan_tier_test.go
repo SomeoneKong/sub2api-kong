@@ -203,7 +203,7 @@ func TestKongPlanAccountsView(t *testing.T) {
 	unknown.Extra = map[string]any{"codex_7d_window_minutes": 10080}
 	relay := &Account{ID: 4, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 	repo := &stubQuotaAccountRepo{accounts: map[int64]*Account{}}
-	views, err := KongPlanAccounts(context.Background(), &kongPlanListRepo{stubQuotaAccountRepo: repo, list: []Account{*plus, *pro, *unknown, *relay}})
+	views, err := KongPlanAccounts(context.Background(), &kongPlanListRepo{stubQuotaAccountRepo: repo, list: []Account{*plus, *pro, *unknown, *relay}}, nil)
 	require.NoError(t, err)
 	require.Len(t, views, 3)
 	require.Equal(t, int64(1), views[0].ID)
@@ -215,7 +215,9 @@ func TestKongPlanAccountsView(t *testing.T) {
 	require.Equal(t, "unknown", views[2].Windows["7d"].State)
 	require.Equal(t, []KongPlanTierEntry{}, views[1].OpenEntries)
 
-	_, err = KongPlanAccounts(context.Background(), nil)
+	require.Nil(t, views[0].Live, "没有读取器时不带实时占用")
+
+	_, err = KongPlanAccounts(context.Background(), nil, nil)
 	require.Error(t, err)
 }
 
