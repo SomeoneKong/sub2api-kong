@@ -451,6 +451,7 @@ func createGroupUsageRollupTriggerTestSchema(t *testing.T, ctx context.Context, 
 	for _, migrationName := range []string{
 		"222_group_usage_daily_rollups.sql",
 		"223_group_usage_rollup_timezone.sql",
+		"243_usage_logs_retention_cleanup_skips_rollup_invalidation.sql",
 	} {
 		migrationSQL, readErr := migrations.FS.ReadFile(migrationName)
 		require.NoError(t, readErr)
@@ -469,6 +470,8 @@ func beginGroupUsageRollupTriggerTestTx(t *testing.T, ctx context.Context, schem
 
 	tx, err := integrationDB.BeginTx(ctx, nil)
 	require.NoError(t, err)
+	// 断言中途失败时也要先回滚，否则 schema 清理的 DROP SCHEMA 会一直等这个事务的锁。
+	t.Cleanup(func() { _ = tx.Rollback() })
 	require.NoError(t, setGroupUsageRollupTriggerSearchPath(ctx, tx, pq.QuoteIdentifier(schema)))
 	return tx
 }
