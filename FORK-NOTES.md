@@ -366,6 +366,9 @@ handler / routes 下的同名文件，另有几处在节奏与会话组件里（
 - **装配**（`wire_gen.go`）：存储与决策记录各自 `Start`，直接给 `AdminHandlers` 赋 `KongPlan` 字段，记账接到节奏组
   件与额度服务（`SetKongPlanLedger`），`SetKongPlanRuntime` 装上运行时，一行 `NewKongPlanBalanceRefresher(...).Start()`
   启动余额刷新协程。节奏组件的 `Start` 先同步跑一拍、读回热度名单，要在开始接请求之前调用（现有位置即是）。
+- **实时占用**（`DESIGN-quota-gateway-reads.md`）：`GET /kong-plan/accounts` 每项带 `live`（并发、排队、活跃会话），给额度服务
+  读；代码在 `kong_plan_live.go`，只改 fork 文件。负载走 `ConcurrencyService.GetAccountsLoadBatch`、会话走会话上限组件的
+  `GetActiveSessionCountBatch`，上游改这两个函数的口径（计入哪些槽位、批量读取失败时返回什么）时要同步复核。
 - **rebase 时复核**：定层的"已到 7d 阈值"（`kongPlanReached7d`）与阈值（`windowThresholdPercent`）复刻了 A、B 两条
   暂停路径的判定，上游改这两处时要同步；上游新增的会话绑定写入要经那个共用函数、不经两轮排序、也不是续接命中的
   选号，不得在计划生效时写新绑定、新增的响应绑定写入点要先写续接标记、新增的选号循环要消费 `next` /
