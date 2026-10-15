@@ -14,7 +14,7 @@
 - **OpenAI 账号指纹测试**（设计见 `DESIGN-openai-fingerprint-test.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
-另有两个可提给上游的修复，排在定制清单最前面（见下文挂点一节的第一小节），上游合并后在 rebase 时丢掉。
+另有三个可提给上游的修复，排在定制清单最前面（见下文挂点一节的前两小节），上游合并后在 rebase 时丢掉。
 
 有三处是**结构性的、不随上游版本变化的约束**，值得写在这里而不是只留在 commit 里：
 
@@ -78,6 +78,16 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
   落库映射（`buildCodexUsageExtraUpdates`）必须共用同一份：各自归一化会对同一个账号算出不同水位，而
   `codex_5h_used_percent` / `codex_7d_used_percent` 是调度阈值的输入，不一致不报错、只会让调度照两个矛盾的数做
   决定。
+
+### 可提给上游的出站身份修复
+
+读设置失败时沿用上一次的出站客户端身份（设计见 `DESIGN-settings-client-identity-stale-on-error.md`）。这个提交只改上游
+文件、不引用任何 fork 符号；上游合并后 rebase 时丢掉，这一小节随之删除。
+
+- **出站身份四个读取的发布规则**（Codex 版本号与 UA、Claude Code 版本号、Antigravity 版本号）：回源结果经
+  `publishSettingCache` 按 `Load()` 的原始返回值 CAS 发布，失效经 `expireSettingCache` 发布新的已过期条目，保存设置时的直写
+  保持无条件 `Store`。上游新增出站身份类的设置读取，或改这四个读取、两个失效函数时，保持"读库出错沿用上一次的值、
+  回源不覆盖期间的保存与失效"。
 
 ### codex 票的被动观测
 
