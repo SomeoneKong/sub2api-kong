@@ -3,6 +3,7 @@
 package migrations
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -49,4 +50,26 @@ func TestMigration223TracksConfiguredTimezone(t *testing.T) {
 	require.Contains(t, sql, "current_setting('TimeZone')")
 	require.Contains(t, sql, "CREATE OR REPLACE FUNCTION invalidate_group_usage_rollup_state")
 	require.Contains(t, sql, "CREATE OR REPLACE FUNCTION invalidate_group_usage_rollup_state_after_insert")
+}
+
+func TestMigration243RetentionCleanupSkipsDeleteInvalidation(t *testing.T) {
+	content, err := FS.ReadFile("243_usage_logs_retention_cleanup_skips_rollup_invalidation.sql")
+	require.NoError(t, err)
+	sql := string(content)
+	require.Contains(t, sql, "CREATE OR REPLACE FUNCTION invalidate_group_usage_rollup_state()")
+	require.Contains(t, sql, "current_setting('sub2api.usage_logs_retention_cleanup', true) = 'on'")
+	require.NotContains(t, sql, "invalidate_group_usage_rollup_state_after_insert")
+
+	// 开关分支之后的函数体必须与 223 定稿的版本一致，只多出开头那一段放行。
+	previous, err := FS.ReadFile("223_group_usage_rollup_timezone.sql")
+	require.NoError(t, err)
+	body := func(src, from string) string {
+		start := strings.Index(src, from)
+		require.GreaterOrEqual(t, start, 0)
+		end := strings.Index(src[start:], "$$;")
+		require.GreaterOrEqual(t, end, 0)
+		return src[start : start+end]
+	}
+	const deleteBranch = "    IF TG_OP = 'DELETE' THEN\n        affected_date"
+	require.Equal(t, body(string(previous), deleteBranch), body(sql, deleteBranch))
 }

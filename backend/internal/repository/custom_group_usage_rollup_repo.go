@@ -249,23 +249,8 @@ func (r *dashboardAggregationRepository) syncGroupUsageRollupsInTx(ctx context.C
 		return fmt.Errorf("清理分组用量日桶: %w", err)
 	}
 
-	if _, err := r.sql.ExecContext(ctx, `
-		INSERT INTO usage_group_daily_rollups (bucket_date, group_id, actual_cost, computed_at)
-		SELECT
-			(created_at AT TIME ZONE $3::text)::date AS bucket_date,
-			group_id,
-			COALESCE(SUM(actual_cost), 0) AS actual_cost,
-			NOW()
-		FROM usage_logs
-		WHERE group_id IS NOT NULL
-			AND created_at >= $1
-			AND created_at < $2
-		GROUP BY 1, 2
-		ON CONFLICT (bucket_date, group_id)
-		DO UPDATE SET
-			actual_cost = EXCLUDED.actual_cost,
-			computed_at = EXCLUDED.computed_at
-	`, rebuildStart.UTC(), todayStart.UTC(), timezoneName); err != nil {
+	if _, err := r.sql.ExecContext(ctx, groupUsageDailyRollupsRebuildSQL,
+		rebuildStart.UTC(), todayStart.UTC(), timezoneName); err != nil {
 		return fmt.Errorf("重建分组用量日桶: %w", err)
 	}
 
@@ -280,6 +265,164 @@ func (r *dashboardAggregationRepository) syncGroupUsageRollupsInTx(ctx context.C
 		return fmt.Errorf("更新分组用量汇总水位: %w", err)
 	}
 	return nil
+}
+
+// groupUsageDailyRollupsRebuildSQL 按服务端时区把 [$1, $2) 的明细聚合成分组日桶并写入（覆盖已有的桶）。
+const groupUsageDailyRollupsRebuildSQL = `
+	INSERT INTO usage_group_daily_rollups (bucket_date, group_id, actual_cost, computed_at)
+	SELECT
+		(created_at AT TIME ZONE $3::text)::date AS bucket_date,
+		group_id,
+		COALESCE(SUM(actual_cost), 0) AS actual_cost,
+		NOW()
+	FROM usage_logs
+	WHERE group_id IS NOT NULL
+		AND created_at >= $1
+		AND created_at < $2
+	GROUP BY 1, 2
+	ON CONFLICT (bucket_date, group_id)
+	DO UPDATE SET
+		actual_cost = EXCLUDED.actual_cost,
+		computed_at = EXCLUDED.computed_at
+`
+
+// reconcileGroupUsageRollupsWithRetention 在保留清理之后让日桶跟上剩下的明细：删掉最早一条明细那天之前的日桶，
+// 重算从那天到 deletedThrough 那天（取较晚者）之间已发布的日桶，并把 retained_from 推进到最早一条明细；
+// closed_before 不动。
+//
+// 保留清理删的是早于 cutoff 的最早一段明细，之后的日桶没有变化，不需要像降低水位那样把整个保留期重建一遍。
+// deletedThrough 是这一轮的删除可能涉及的最晚时刻（见 deleteExpiredUsageLogs）：全部删完时是 cutoff，这时
+// 保留边界之前的迟到写入会让最早一条明细早于实际的删除边界，而这段范围里只剩这些迟到写入与 cutoff 那天剩下的
+// 明细；没删完时不延伸到 cutoff，避免把尚未删除的旧明细整段重算。零值表示只重算最早一天。
+//
+// 状态行只加 FOR NO KEY UPDATE：与同步、迟到写入降水位互斥，但与插入触发器的 FOR KEY SHARE 兼容，
+// 对账期间新明细照常写入。
+func (r *dashboardAggregationRepository) reconcileGroupUsageRollupsWithRetention(ctx context.Context, todayStart, deletedThrough time.Time) error {
+	if db, ok := r.sql.(*sql.DB); ok {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		txRepo := newDashboardAggregationRepositoryWithSQL(tx)
+		if err := txRepo.reconcileGroupUsageRollupsWithRetentionInTx(ctx, todayStart, deletedThrough); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		return tx.Commit()
+	}
+	return r.reconcileGroupUsageRollupsWithRetentionInTx(ctx, todayStart, deletedThrough)
+}
+
+func (r *dashboardAggregationRepository) reconcileGroupUsageRollupsWithRetentionInTx(ctx context.Context, todayStart, deletedThrough time.Time) error {
+	var closedBefore string
+	var previousRetainedFrom time.Time
+	var stateTimezoneName string
+	if err := scanSingleRow(ctx, r.sql, `
+		SELECT closed_before::text, retained_from, timezone_name
+		FROM usage_group_rollup_state
+		WHERE id = 1
+		FOR NO KEY UPDATE
+	`, nil, &closedBefore, &previousRetainedFrom, &stateTimezoneName); err != nil {
+		return fmt.Errorf("读取分组用量汇总水位: %w", err)
+	}
+	timezoneName := service.GroupUsageTimezoneName()
+	if stateTimezoneName != timezoneName {
+		// 时区变了，同步会整体重建日桶，这里不动。
+		return nil
+	}
+
+	var earliest sql.NullTime
+	if err := scanSingleRow(ctx, r.sql, "SELECT MIN(created_at) FROM usage_logs", nil, &earliest); err != nil {
+		return fmt.Errorf("读取最早用量记录: %w", err)
+	}
+	retainedFrom := service.GroupUsageTodayStart(todayStart)
+	if earliest.Valid {
+		retainedFrom = earliest.Time.UTC()
+	}
+
+	// 重算 [最早一天, min(lastDate 的次日, closed_before))；closed_before 及以后的用量由读取端直接汇总明细。
+	// 日期都是 YYYY-MM-DD，可直接按字符串比较。
+	retainedDate := service.GroupUsageDate(retainedFrom)
+	lastDate := retainedDate
+	if !deletedThrough.IsZero() {
+		if throughDate := service.GroupUsageDate(deletedThrough); throughDate > lastDate {
+			lastDate = throughDate
+		}
+	}
+	rebuildStart, err := groupUsageDayStart(retainedDate)
+	if err != nil {
+		return err
+	}
+	rebuildEndDate, err := nextGroupUsageDate(lastDate)
+	if err != nil {
+		return err
+	}
+	var rebuildEnd time.Time
+	if closedBefore < rebuildEndDate {
+		// 截在 closed_before 时与读取端一样按它解析出的时刻切开日桶与尾段，避免两边重复或遗漏。
+		rebuildEndDate = closedBefore
+		rebuildEnd, err = service.ParseGroupUsageDate(closedBefore)
+		if err != nil {
+			return fmt.Errorf("解析分组用量汇总水位 %q: %w", closedBefore, err)
+		}
+	} else if rebuildEnd, err = groupUsageDayStart(rebuildEndDate); err != nil {
+		return err
+	}
+
+	if _, err := r.sql.ExecContext(ctx, `
+		DELETE FROM usage_group_daily_rollups
+		WHERE bucket_date < $1::date
+	`, retainedDate); err != nil {
+		return fmt.Errorf("清理最早一天之前的分组用量日桶: %w", err)
+	}
+	if retainedDate < rebuildEndDate {
+		if _, err := r.sql.ExecContext(ctx, `
+			DELETE FROM usage_group_daily_rollups
+			WHERE bucket_date >= $1::date AND bucket_date < $2::date
+		`, retainedDate, rebuildEndDate); err != nil {
+			return fmt.Errorf("清理待重算的分组用量日桶: %w", err)
+		}
+		if _, err := r.sql.ExecContext(ctx, groupUsageDailyRollupsRebuildSQL,
+			rebuildStart.UTC(), rebuildEnd.UTC(), timezoneName); err != nil {
+			return fmt.Errorf("重算最早一天起的分组用量日桶: %w", err)
+		}
+	}
+
+	if !retainedFrom.Equal(previousRetainedFrom) {
+		if _, err := r.sql.ExecContext(ctx, `
+			UPDATE usage_group_rollup_state
+			SET retained_from = $1,
+				updated_at = NOW()
+			WHERE id = 1
+		`, retainedFrom); err != nil {
+			return fmt.Errorf("更新分组用量保留起点: %w", err)
+		}
+	}
+	return nil
+}
+
+// nextGroupUsageDate 返回日历上的下一天（YYYY-MM-DD）。按日期算，不经过时区里的时刻，免得夏令时把结果落回同一天。
+func nextGroupUsageDate(date string) (string, error) {
+	day, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return "", err
+	}
+	return day.AddDate(0, 0, 1).Format("2006-01-02"), nil
+}
+
+// groupUsageDayStart 返回配置时区里 date 那一天的第一个时刻。零点因夏令时被跳过时，time.Date 会把它落到前一天，
+// 这时取那次切换的时刻。
+func groupUsageDayStart(date string) (time.Time, error) {
+	start, err := service.ParseGroupUsageDate(date)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if service.GroupUsageDate(start) != date {
+		if _, end := start.ZoneBounds(); !end.IsZero() {
+			start = end
+		}
+	}
+	return start, nil
 }
 
 func lockGroupUsageRollupState(ctx context.Context, tx *sql.Tx) error {
