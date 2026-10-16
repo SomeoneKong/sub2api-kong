@@ -62,11 +62,16 @@ func kongEffectiveMaxSessions(account *Account) int {
 
 // kongEffectiveLoadFactor 是负载率的分母：账号设了负载因子就用它，否则取生效并发上限（同 Account.EffectiveLoadFactor）。
 func kongEffectiveLoadFactor(account *Account) int {
+	return kongLoadFactorWith(account, KongEffectiveConcurrency(account))
+}
+
+// kongLoadFactorWith 是给定生效并发上限时的负载率分母，口径同 kongEffectiveLoadFactor。
+func kongLoadFactorWith(account *Account, concurrency int) int {
 	if account != nil && account.LoadFactor != nil && *account.LoadFactor > 0 {
 		return *account.LoadFactor
 	}
-	if c := KongEffectiveConcurrency(account); c > 0 {
-		return c
+	if concurrency > 0 {
+		return concurrency
 	}
 	return 1
 }

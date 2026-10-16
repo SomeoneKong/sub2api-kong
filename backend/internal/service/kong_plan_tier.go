@@ -378,6 +378,63 @@ type KongPlanAccountView struct {
 	Hot *KongHotAccountView `json:"hot"`
 	// Live 是此刻的并发、排队与活跃会话（kong_plan_live.go）；读不到时为 nil。
 	Live *KongPlanLiveView `json:"live"`
+	// Routing 是选号安排（优先承接新会话）此刻是否生效。
+	Routing *KongPlanRoutingView `json:"routing"`
+}
+
+// KongPlanRoutingView 是账号的选号安排（DESIGN-routing-priority.md 第 4.1 节）。FirstUntil 是网关此刻所用快照条目里的
+// 优先承接截止，没有为 null；FirstInEffect 是此刻是否满足前置准入，不满足时 FirstReason 给出原因：expired 截止已过、
+// layer 定层不是第一层或 credits 层、held 计划暂停或热度暂停、standby 备用档、sessions_unknown 有会话上限而计数读不到、
+// sessions_full 会话已满、busy 并发已满或负载读不到；网关用的不是快照时为 fallback 或 legacy（兜底与现状调度不带优先）。
+// 会话数与负载取这一项的实时占用，与选号读的同一份读数，负载率的分母与选号相同（负载因子或生效并发上限）；JudgedAt 是判断时刻。
+type KongPlanRoutingView struct {
+	FirstUntil    *time.Time `json:"first_until"`
+	FirstInEffect bool       `json:"first_in_effect"`
+	FirstReason   string     `json:"first_reason,omitempty"`
+	JudgedAt      time.Time  `json:"judged_at"`
+}
+
+// kongPlanRouting 按选号同一个前置准入判定给出账号此刻的选号安排。
+func kongPlanRouting(res kongPlanTierResult, v *KongPlanAccountView, account *Account, now time.Time) *KongPlanRoutingView {
+	r := &KongPlanRoutingView{JudgedAt: now.UTC()}
+	if res.Input != KongPlanInUseSnapshot {
+		r.FirstReason = res.Input
+		return r
+	}
+	if res.Entry.FirstUntil == nil {
+		return r
+	}
+	until := res.Entry.FirstUntil.UTC()
+	r.FirstUntil = &until
+	f := kongPlanFacts{ID: v.ID, Tier: res, SessionLimit: v.MaxSessions, First: now.Before(until)}
+	if l := v.Live; l != nil {
+		f.LoadKnown = true
+		f.ConcurrencyFull = (l.Concurrency+l.Waiting)*100/kongLoadFactorWith(account, v.MaxConcurrency) >= 100
+		if l.Sessions != nil {
+			f.Sessions, f.SessionsKnown = *l.Sessions, true
+		}
+	}
+	if kongPlanNaturalSeg(&f) == kongPlanSegFirst {
+		r.FirstInEffect = true
+		return r
+	}
+	switch {
+	case !f.First:
+		r.FirstReason = "expired"
+	case res.Layer != kongPlanLayerSubscription && res.Layer != kongPlanLayerCredits:
+		r.FirstReason = "layer"
+	case res.Entry.Paused:
+		r.FirstReason = "held"
+	case res.Entry.Tier == KongPlanTierStandby:
+		r.FirstReason = "standby"
+	case f.SessionLimit > 0 && !f.SessionsKnown:
+		r.FirstReason = "sessions_unknown"
+	case f.SessionLimit > 0 && f.Sessions >= f.SessionLimit:
+		r.FirstReason = "sessions_full"
+	default:
+		r.FirstReason = "busy"
+	}
+	return r
 }
 
 func kongPlanWindowState(extra map[string]any, window string, now time.Time) KongPlanWindowView {
@@ -423,6 +480,7 @@ func KongPlanAccounts(ctx context.Context, repo AccountRepository, live KongPlan
 	now := rt.now()
 	out := make([]KongPlanAccountView, 0, len(accounts))
 	byID := make(map[int64]*Account, len(accounts))
+	tiers := make(map[int64]kongPlanTierResult, len(accounts))
 	for i := range accounts {
 		a := &accounts[i]
 		if !a.IsOpenAIOAuth() {
@@ -466,9 +524,13 @@ func KongPlanAccounts(ctx context.Context, repo AccountRepository, live KongPlan
 		}
 		v.MaxConcurrency, v.MaxSessions = kongEffectiveLimitsOf(st, h, a.ID, a.Concurrency, a.GetMaxSessions(), now)
 		v.Hot = rt.hotView(st, ps, h, a, now)
+		tiers[a.ID] = res
 		out = append(out, v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	kongPlanAttachLive(ctx, live, out, byID)
+	for i := range out {
+		out[i].Routing = kongPlanRouting(tiers[out[i].ID], &out[i], byID[out[i].ID], now)
+	}
 	return out, nil
 }
