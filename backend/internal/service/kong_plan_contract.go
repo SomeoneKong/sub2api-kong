@@ -81,7 +81,8 @@ type KongPlanCredits struct {
 // KongPlanEntry 是兜底或快照里一个账号的条目。省略的 active / imminent 解析时补成 true / false，
 // 所以同一份内容不论写法都得到同一个指纹。Paused 是计划暂停（只在快照里）：两轮排序把账号排进计划暂停段，
 // 别的候选都接不住时才用它；为假时不写出，没有暂停的内容指纹与不认这个字段的版本相同。Grace 是第一层的会话宽限（只在
-// 快照里）：给了就与人工约束里的宽限取小，只能更严；热账号限速时执行端写 0，没给时不写出，指纹同样不变。
+// 快照里）：给了就与人工约束里的宽限取小，只能更严；热账号限速时执行端写 0，没给时不写出，指纹同样不变。FirstUntil 是
+// 优先承接新会话的截止（只在快照里）：选号开始时刻早于它、满足前置准入时，账号的有余量位置排在所有段之前；没给时不写出。
 type KongPlanEntry struct {
 	ID             int64               `json:"id"`
 	Tier           string              `json:"tier"`
@@ -93,6 +94,7 @@ type KongPlanEntry struct {
 	Credits        *KongPlanCredits    `json:"credits"`
 	Paused         bool                `json:"paused,omitempty"`
 	Grace          *int                `json:"grace,omitempty"`
+	FirstUntil     *time.Time          `json:"first_until,omitempty"`
 }
 
 // KongPlanSnapshot 是快照：在兜底之上加入边车的实时决定，带有效期。
@@ -322,6 +324,7 @@ type kongPlanEntryJSON struct {
 	Credits        *kongPlanCreditsJSON    `json:"credits"`
 	Paused         *bool                   `json:"paused"`
 	Grace          *int                    `json:"grace"`
+	FirstUntil     *string                 `json:"first_until"`
 }
 
 type kongPlanDispatchJSON struct {
@@ -458,6 +461,16 @@ func kongPlanParseEntries(raw []kongPlanEntryJSON, field string, fallback bool) 
 			}
 			g := *r.Grace
 			e.Grace = &g
+		}
+		if r.FirstUntil != nil {
+			if fallback {
+				return nil, kongPlanInvalid(f+".first_until", "兜底条目不能带 first_until")
+			}
+			at, err := kongPlanParseTime(r.FirstUntil, f+".first_until")
+			if err != nil {
+				return nil, err
+			}
+			e.FirstUntil = &at
 		}
 		if e.Tier == KongPlanTierAsap {
 			if r.AdmitBelow == nil || r.AdmitBelow.H6 == nil || r.AdmitBelow.H24 == nil {

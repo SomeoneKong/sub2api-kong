@@ -16,12 +16,14 @@ import (
 // 序列由桶组成，一个桶是四个键都相同的一组账号：轮次与段、第一层的档位组、组内的健康状态、健康子集里的临期。
 // 桶的先后不可跨越。桶内沿用旧版选号这一轮的顺序（原优先级、负载、最近使用，节奏重排、低倍率优先、compact 分层都只在
 // 桶内起作用）；credits 层的桶严格按（级别，作废时刻，账号编号）。会话数已经由段分开，组内的健康只看其余几项：
-// 未到软线 full、负载已知且并发未满、不视同到线。
+// 未到软线 full、负载已知且并发未满、不视同到线。条目给了优先承接新会话（first_until）的账号，满足前置准入时它的
+// 有余量位置换成排在所有段之前的前置段（DESIGN-routing-priority.md 第 4.2 节）。
 
 type kongPlanSeg int
 
 const (
-	kongPlanSegRoom            kongPlanSeg = iota + 1 // 余量轮：第一层，会话数低于上限
+	kongPlanSegFirst           kongPlanSeg = iota + 1 // 前置：优先承接新会话、有余量的第一层与 credits 层账号
+	kongPlanSegRoom                                   // 余量轮：第一层，会话数低于上限
 	kongPlanSegGrace                                  // 余量轮：第一层，会话数到上限、低于上限 + 宽限
 	kongPlanSegCreditsRoom                            // 余量轮：credits 层，会话数低于上限
 	kongPlanSegOverflow                               // 溢出轮：第一层
@@ -33,6 +35,8 @@ const (
 
 func (s kongPlanSeg) String() string {
 	switch s {
+	case kongPlanSegFirst:
+		return "first"
 	case kongPlanSegRoom:
 		return "room"
 	case kongPlanSegGrace:
@@ -59,6 +63,19 @@ func (s kongPlanSeg) credits() bool {
 
 func (s kongPlanSeg) subscription() bool {
 	return s == kongPlanSegRoom || s == kongPlanSegGrace || s == kongPlanSegOverflow
+}
+
+// kongPlanSegLayer 是段所属的层：前置段随账号所在的层，其余段各有其层；计划暂停、按现状暂停与中转为 0。
+func kongPlanSegLayer(seg kongPlanSeg, layer kongPlanLayer) kongPlanLayer {
+	switch {
+	case seg == kongPlanSegFirst:
+		return layer
+	case seg.credits():
+		return kongPlanLayerCredits
+	case seg.subscription():
+		return kongPlanLayerSubscription
+	}
+	return 0
 }
 
 type kongPlanGroup int
@@ -103,6 +120,8 @@ type kongPlanFacts struct {
 	PaceFull    bool
 	// Priority 是账号的原优先级（小的先），同一桶里两个降段重试位置之间按它排。
 	Priority int
+	// First 是条目的优先承接新会话在选号开始时刻仍有效（截止晚于它）；其余准入条件见 kongPlanFirstAdmitted。
+	First bool
 }
 
 func (f *kongPlanFacts) limited() bool { return f.SessionLimit > 0 && f.SessionsKnown }
@@ -142,11 +161,23 @@ type kongPlanSlot struct {
 	Ghost bool
 }
 
+// kongPlanFirstAdmitted 是前置段的准入（唯一的判定，与推演内核同一口径）：时段有效、不是备用档；会话上限不限时不需要
+// 计数，有限上限时计数已知且低于上限；负载已知且并发未满。定层与计划暂停由调用方先判（计划暂停优先于前置）。
+func kongPlanFirstAdmitted(f *kongPlanFacts) bool {
+	return f.First && f.Tier.Entry.Tier != KongPlanTierStandby &&
+		(f.SessionLimit == 0 || (f.SessionsKnown && f.Sessions < f.SessionLimit)) &&
+		f.LoadKnown && !f.ConcurrencyFull
+}
+
 // kongPlanNaturalSeg 按本次选号开始时的会话数给出账号所在的段。计划暂停的第一层与 credits 层账号不论会话数都在计划暂停段：
-// 排在所有正常候选之后，不降段、不受会话上限约束；第一层的复核时改判为 credits 层的，改判位置也在这一段。
+// 排在所有正常候选之后，不降段、不受会话上限约束；第一层的复核时改判为 credits 层的，改判位置也在这一段。前置准入的
+// 账号在前置段（取代它的有余量位置）。
 func kongPlanNaturalSeg(f *kongPlanFacts) kongPlanSeg {
 	if f.Tier.Entry.Paused && (f.Tier.Layer == kongPlanLayerSubscription || f.Tier.Layer == kongPlanLayerCredits) {
 		return kongPlanSegHeld
+	}
+	if (f.Tier.Layer == kongPlanLayerSubscription || f.Tier.Layer == kongPlanLayerCredits) && kongPlanFirstAdmitted(f) {
+		return kongPlanSegFirst
 	}
 	switch f.Tier.Layer {
 	case kongPlanLayerSubscription:
@@ -171,16 +202,20 @@ func kongPlanNaturalSeg(f *kongPlanFacts) kongPlanSeg {
 // kongPlanSegWith 是账号此刻所在的段：按会话数的段与本次选号里已降到的段中靠后的那个（同一层之内）。
 func kongPlanSegWith(f *kongPlanFacts, minSeg map[int64]kongPlanSeg) kongPlanSeg {
 	seg := kongPlanNaturalSeg(f)
-	if m, ok := minSeg[f.ID]; ok && m > seg && m.credits() == seg.credits() && m.subscription() == seg.subscription() {
+	if m, ok := minSeg[f.ID]; ok && m > seg && kongPlanSegLayer(m, f.Tier.Layer) == kongPlanSegLayer(seg, f.Tier.Layer) {
 		seg = m
 	}
 	return seg
 }
 
-// kongPlanDemote 给出确认登记失败后向后降到的段：余量段 → 宽限段（宽限为 0 时跳过）→ 溢出轮。
+// kongPlanDemote 给出确认登记失败后向后降到的段：余量段（含前置段）→ 宽限段（宽限为 0 时跳过）→ 溢出轮；credits 层的
+// 余量段与前置段 → credits 溢出段。前置段按账号所在的层降。
 func kongPlanDemote(f *kongPlanFacts, seg kongPlanSeg) (kongPlanSeg, bool) {
+	if seg == kongPlanSegFirst && f.Tier.Layer == kongPlanLayerCredits {
+		return kongPlanSegCreditsOverflow, true
+	}
 	switch seg {
-	case kongPlanSegRoom:
+	case kongPlanSegFirst, kongPlanSegRoom:
 		if f.Grace > 0 {
 			return kongPlanSegGrace, true
 		}
@@ -226,7 +261,7 @@ func kongPlanSlotFor(f *kongPlanFacts, seg kongPlanSeg) kongPlanSlot {
 		return s
 	}
 	switch seg {
-	case kongPlanSegRoom, kongPlanSegCreditsRoom:
+	case kongPlanSegFirst, kongPlanSegRoom, kongPlanSegCreditsRoom:
 		s.Limit = f.SessionLimit
 	case kongPlanSegGrace:
 		s.Limit = f.SessionLimit + f.Grace
@@ -240,7 +275,7 @@ func kongPlanSlotFor(f *kongPlanFacts, seg kongPlanSeg) kongPlanSlot {
 // 失败后降到的段，账号不再回到更前的段。每个受会话上限约束的账号在它之后的各段各有一个降段重试的位置，排在目标桶
 // 本来的成员之后；重试位置之间按原优先级排（它们来自不同的桶，输入里的先后是来源桶的先后）。第一层的账号若条目给了
 // credits，另在 credits 段预留改判的位置：确认时复核读数已到阈值、改判为 credits 层（confirm），就在这些位置上试，
-// 仍在中转之前。
+// 仍在中转之前；前置的账号改判后仍在前置段（排在前置段成员之后），登记失败再降到 credits 溢出段。
 func kongPlanOrder(facts []kongPlanFacts, minSeg map[int64]kongPlanSeg) []kongPlanSlot {
 	slots := make([]kongPlanSlot, 0, len(facts)*2)
 	credits := make(map[int64]*KongPlanCredits, len(facts))
@@ -249,7 +284,7 @@ func kongPlanOrder(facts []kongPlanFacts, minSeg map[int64]kongPlanSeg) []kongPl
 		f := &facts[i]
 		priority[f.ID] = f.Priority
 		seg := kongPlanSegWith(f, minSeg)
-		if seg.credits() {
+		if kongPlanSegLayer(seg, f.Tier.Layer) == kongPlanLayerCredits {
 			credits[f.ID] = f.Tier.Entry.Credits
 		}
 		slots = append(slots, kongPlanSlotFor(f, seg))
@@ -334,6 +369,8 @@ type kongPlanSelection struct {
 	now    time.Time
 	facts  map[int64]kongPlanFacts
 	minSeg map[int64]kongPlanSeg
+	// lostFirst 是在前置位置登记失败、已失去本次选号余量机会的账号，跨轮保留：之后确认时改判为 credits 层也只到 credits 溢出段
+	lostFirst map[int64]bool
 	// keys 是本轮各账号的位置（未降段时的那一个），节奏重排按它分桶。
 	keys   map[int64]kongPlanBucketKey
 	slots  []kongPlanSlot
@@ -374,10 +411,19 @@ func (s *OpenAIGatewayService) kongPlanBegin(ctx context.Context, candidates []*
 			cfg = &loaded.cfg
 		}
 	}
-	p := &kongPlanSelection{now: now, facts: make(map[int64]kongPlanFacts, len(candidates)), minSeg: map[int64]kongPlanSeg{}}
+	p := &kongPlanSelection{now: now, facts: make(map[int64]kongPlanFacts, len(candidates)), minSeg: map[int64]kongPlanSeg{},
+		lostFirst: map[int64]bool{}}
 	p.attachStats(rt, st, now)
 	for _, acc := range candidates {
-		f := kongPlanFacts{ID: acc.ID, Tier: rt.tier(ctx, acc, now), Priority: acc.Priority}
+		// 全部候选按开始时同一份计划状态定层：选号途中换了发布，本次也不拼两份
+		tr := rt.tier(ctx, acc, now)
+		if acc.IsOpenAIOAuth() {
+			tr = rt.tierWith(ctx, st, rt.hotEffect(st, acc.ID, now), acc, now)
+		}
+		f := kongPlanFacts{ID: acc.ID, Tier: tr, Priority: acc.Priority}
+		if fu := f.Tier.Entry.FirstUntil; fu != nil {
+			f.First = now.Before(*fu)
+		}
 		if f.Tier.Layer != 0 {
 			f.SessionLimit = kongPlanEffectiveMaxSessions(f.Tier.Entry, acc)
 			f.Grace = kongPlanEntryGrace(kongPlanGrace(st.control, acc.ID), f.Tier.Entry)
@@ -589,12 +635,13 @@ func (p *kongPlanSelection) confirm(ctx context.Context, g *kongSessionGate, acc
 		now := rt.now()
 		if res := rt.tier(ctx, account, now); res.Layer == kongPlanLayerCredits {
 			if f.Tier.Layer == kongPlanLayerSubscription {
-				// 改判位置是按选号开始时的计划暂停排的：选号途中快照换了也沿用开始时的，降到的段才对得上预留的位置
-				res.Entry.Paused = f.Tier.Entry.Paused
+				// 改判位置是按选号开始时的计划暂停、档位与前置排的：选号途中快照换了也沿用开始时的，降到的段才对得上预留的位置，
+				// 之后的轮次也按开始时的前置准入排它
+				res.Entry.Paused, res.Entry.Tier = f.Tier.Entry.Paused, f.Tier.Entry.Tier
 				f.Tier = res
 				p.facts[account.ID] = f
 				p.retierRound(account.ID, res)
-				p.minSeg[account.ID] = kongPlanNaturalSeg(&f) // 激活序列里为它预留的 credits 段位置
+				p.minSeg[account.ID] = p.retierSeg(&f) // 激活序列里为它预留的 credits 段位置
 				return false
 			}
 			if rt.enterCredits(ctx, account, res, now) != nil {
@@ -615,10 +662,40 @@ func (p *kongPlanSelection) confirm(ctx context.Context, g *kongSessionGate, acc
 		return true
 	}
 	p.recordConfirmFailed(account.ID, s)
+	if s.Key.Seg == kongPlanSegFirst {
+		if p.lostFirst == nil {
+			p.lostFirst = map[int64]bool{}
+		}
+		p.lostFirst[account.ID] = true
+	}
 	if next, ok := kongPlanDemote(&f, s.Key.Seg); ok {
 		p.minSeg[account.ID] = next
 	}
 	return false
+}
+
+// retierSeg 是第一层账号确认时改判为 credits 层后要激活的位置。本次选号里已在前置位置登记失败的（可能是更早的一轮），
+// 降到 credits 溢出段；本轮它在前置段里有改判位置时：还在游标之后就用它，已经过去（在前置段之后的位置才改判）同样降到
+// credits 溢出段——跨层不重新获得本次选号里已失去的余量机会。不在前置时按选号开始时的会话数取 credits 层的段。f 已是
+// 改判后的定层。
+func (p *kongPlanSelection) retierSeg(f *kongPlanFacts) kongPlanSeg {
+	if p.lostFirst[f.ID] {
+		next, _ := kongPlanDemote(f, kongPlanSegFirst)
+		return next
+	}
+	for i := range p.slots {
+		s := &p.slots[i]
+		if s.ID == f.ID && s.Ghost && s.Key.Seg == kongPlanSegFirst {
+			if i >= p.cursor {
+				return kongPlanSegFirst
+			}
+			next, _ := kongPlanDemote(f, kongPlanSegFirst)
+			return next
+		}
+	}
+	g := *f
+	g.First = false
+	return kongPlanNaturalSeg(&g)
 }
 
 // kongPlanLoadBatch 读取第 2 层的负载。计划生效、而旧版选号本该走非批量分支（没有并发服务或关闭了批量负载）时，

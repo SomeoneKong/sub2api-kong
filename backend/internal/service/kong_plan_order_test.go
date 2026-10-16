@@ -20,6 +20,7 @@ import (
 // 两轮排序的共用夹具（testdata/kong_plan/order_cases.json）与选号各分支的调用链。
 
 type kongPlanOrderFile struct {
+	Now      time.Time      `json:"now"`
 	Defaults map[string]any `json:"defaults"`
 	Cases    []struct {
 		Name     string            `json:"name"`
@@ -47,7 +48,7 @@ func kongPlanMerge(dst, src map[string]any) {
 }
 
 func kongPlanSegNamed(t *testing.T, name string) kongPlanSeg {
-	for s := kongPlanSegRoom; s <= kongPlanSegRelay; s++ {
+	for s := kongPlanSegFirst; s <= kongPlanSegRelay; s++ {
 		if s.String() == name {
 			return s
 		}
@@ -56,7 +57,7 @@ func kongPlanSegNamed(t *testing.T, name string) kongPlanSeg {
 	return 0
 }
 
-func kongPlanCaseFacts(t *testing.T, raw map[string]any) kongPlanFacts {
+func kongPlanCaseFacts(t *testing.T, raw map[string]any, now time.Time) kongPlanFacts {
 	t.Helper()
 	b, err := json.Marshal(raw)
 	require.NoError(t, err)
@@ -71,6 +72,7 @@ func kongPlanCaseFacts(t *testing.T, raw map[string]any) kongPlanFacts {
 			MaxSessions *int                `json:"max_sessions"`
 			Credits     *KongPlanCredits    `json:"credits"`
 			Paused      bool                `json:"paused"`
+			FirstUntil  *time.Time          `json:"first_until"`
 		}
 		Used7d          float64 `json:"used_7d"`
 		Threshold7d     float64 `json:"threshold_7d"`
@@ -90,8 +92,10 @@ func kongPlanCaseFacts(t *testing.T, raw map[string]any) kongPlanFacts {
 	}
 	require.NoError(t, json.Unmarshal(b, &a))
 	entry := KongPlanEntry{ID: a.ID, Tier: a.Entry.Tier, Active: a.Entry.Active, Imminent: a.Entry.Imminent,
-		AdmitBelow: a.Entry.AdmitBelow, MaxSessions: a.Entry.MaxSessions, Credits: a.Entry.Credits, Paused: a.Entry.Paused}
-	f := kongPlanFacts{ID: a.ID, Tier: kongPlanTierResult{Entry: entry, AtLine: a.OpenEntry || a.UnknownActive}}
+		AdmitBelow: a.Entry.AdmitBelow, MaxSessions: a.Entry.MaxSessions, Credits: a.Entry.Credits, Paused: a.Entry.Paused,
+		FirstUntil: a.Entry.FirstUntil}
+	f := kongPlanFacts{ID: a.ID, Tier: kongPlanTierResult{Entry: entry, AtLine: a.OpenEntry || a.UnknownActive},
+		First: entry.FirstUntil != nil && now.Before(*entry.FirstUntil)}
 	if a.Type != "relay" {
 		switch {
 		case a.Used7d < a.Threshold7d:
@@ -162,7 +166,7 @@ func TestKongPlanOrderCases(t *testing.T) {
 				kongPlanMerge(merged, file.Defaults)
 				kongPlanMerge(merged, c.All)
 				kongPlanMerge(merged, raw)
-				facts = append(facts, kongPlanCaseFacts(t, merged))
+				facts = append(facts, kongPlanCaseFacts(t, merged, file.Now))
 			}
 			minSeg := map[int64]kongPlanSeg{}
 			for id, seg := range c.Demoted {
@@ -196,7 +200,7 @@ func TestKongPlanOrderCases(t *testing.T) {
 				out := make([]string, len(bs))
 				for i, b := range bs {
 					ids := append([]string(nil), b.ids...)
-					if !strings.HasPrefix(b.key, "credits") {
+					if !strings.HasPrefix(b.key, "credits") && b.key != "first" {
 						sort.Strings(ids)
 					}
 					out[i] = b.key + " " + strings.Join(ids, ",")
