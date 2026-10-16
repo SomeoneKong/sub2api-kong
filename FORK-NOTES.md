@@ -369,6 +369,9 @@ handler / routes 下的同名文件，另有几处在节奏与会话组件里（
 - **实时占用**（`DESIGN-quota-gateway-reads.md`）：`GET /kong-plan/accounts` 每项带 `live`（并发、排队、活跃会话），给额度服务
   读；代码在 `kong_plan_live.go`，只改 fork 文件。负载走 `ConcurrencyService.GetAccountsLoadBatch`、会话走会话上限组件的
   `GetActiveSessionCountBatch`，上游改这两个函数的口径（计入哪些槽位、批量读取失败时返回什么）时要同步复核。
+- **优先承接新会话**（工作区 `DESIGN-routing-priority.md`）：快照条目的 `first_until`、两轮排序的前置段与确认时改判、`/kong-plan/accounts` 的
+  `routing`，只改 fork 文件（`kong_plan_contract.go`、`kong_plan_order.go`、`kong_plan_tier.go`，排序与 Rust 推演内核共用夹具）。`routing`
+  的负载率分母与选号同为 `kongLoadFactorWith`，上游改负载率的口径时要同步复核。
 - **rebase 时复核**：定层的"已到 7d 阈值"（`kongPlanReached7d`）与阈值（`windowThresholdPercent`）复刻了 A、B 两条
   暂停路径的判定，上游改这两处时要同步；上游新增的会话绑定写入要经那个共用函数、不经两轮排序、也不是续接命中的
   选号，不得在计划生效时写新绑定、新增的响应绑定写入点要先写续接标记、新增的选号循环要消费 `next` /
