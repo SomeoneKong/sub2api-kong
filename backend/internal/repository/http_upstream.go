@@ -116,6 +116,8 @@ type poolSettings struct {
 	maxConnsPerHost       int           // 每主机最大连接数（含活跃）
 	idleConnTimeout       time.Duration // 空闲连接超时时间
 	responseHeaderTimeout time.Duration // 等待响应头超时时间
+
+	kongDisableCompression bool // [kong] transport 不自动声明 gzip，见 kong_http_upstream_compression.go
 }
 
 type openAIHTTP2Settings struct {
@@ -563,6 +565,7 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 	settings = s.applyProfilePoolSettings(settings, upstreamProfile)
 	// TLS 指纹客户端使用独立的缓存键，加 "tls:" 前缀
 	cacheKey := "tls:" + buildCacheKey(isolation, proxyKey, accountID, upstreamProtocolModeDefault)
+	cacheKey += kongPoolKeySuffix(settings) // [kong] 缓存键不含 profile，压缩策略不同的连接池要并存而不是互相替换
 	poolKey := buildPoolKey(settings, upstreamProtocolModeDefault) + ":tls"
 
 	now := time.Now()
@@ -970,6 +973,7 @@ func (s *httpUpstreamService) resolvePoolSettings(isolation string, accountConcu
 func (s *httpUpstreamService) applyProfilePoolSettings(settings poolSettings, profile service.HTTPUpstreamProfile) poolSettings {
 	switch profile {
 	case service.HTTPUpstreamProfileOpenAI:
+		settings.kongDisableCompression = true // [kong] 与官方 Codex 一致，不带 Accept-Encoding
 		settings.responseHeaderTimeout = 0
 		if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIResponseHeaderTimeout > 0 {
 			settings.responseHeaderTimeout = time.Duration(s.cfg.Gateway.OpenAIResponseHeaderTimeout) * time.Second
@@ -996,6 +1000,7 @@ func buildPoolKey(settings poolSettings, protocolMode string) string {
 		settings.idleConnTimeout,
 		settings.responseHeaderTimeout,
 	)
+	base += kongPoolKeySuffix(settings) // [kong]
 	if protocolMode == "" || protocolMode == upstreamProtocolModeDefault {
 		return base
 	}
@@ -1387,6 +1392,7 @@ func buildUpstreamTransport(settings poolSettings, proxyURL *url.URL, protocolMo
 		IdleConnTimeout:       settings.idleConnTimeout,
 		ResponseHeaderTimeout: settings.responseHeaderTimeout,
 	}
+	transport.DisableCompression = settings.kongDisableCompression // [kong]
 	switch protocolMode {
 	case upstreamProtocolModeLongStreamH2, upstreamProtocolModeOpenAIH2:
 		transport.ForceAttemptHTTP2 = true
@@ -1455,6 +1461,7 @@ func buildUpstreamTransportWithTLSFingerprint(settings poolSettings, proxyURL *u
 		// 禁用默认的 TLS，我们使用自定义的 DialTLSContext
 		ForceAttemptHTTP2: false,
 	}
+	transport.DisableCompression = settings.kongDisableCompression // [kong]
 
 	// 根据代理类型选择合适的 TLS 指纹 Dialer
 	if proxyURL == nil {
