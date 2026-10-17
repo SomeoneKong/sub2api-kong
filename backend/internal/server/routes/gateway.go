@@ -30,8 +30,8 @@ func RegisterGatewayRoutes(
 	compositeResolver *service.CompositeRouteResolver,
 	cfg *config.Config,
 ) {
-	bodyLimit := middleware.RequestBodyLimit(cfg.Gateway.MaxBodySize)
-	textBodyLimit := middleware.RequestBodyLimit(cfg.Gateway.TextMaxBodySize)
+	bodyLimit := kongCountRequestBytes(middleware.RequestBodyLimit(cfg.Gateway.MaxBodySize))         // [kong] 逐请求字节数
+	textBodyLimit := kongCountRequestBytes(middleware.RequestBodyLimit(cfg.Gateway.TextMaxBodySize)) // [kong] 逐请求字节数
 	clientRequestID := middleware.ClientRequestID()
 	opsErrorLogger := handler.OpsErrorLoggerMiddleware(opsService)
 	endpointNorm := handler.InboundEndpointMiddleware()
