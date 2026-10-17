@@ -34,6 +34,8 @@ type KongRequestFeatures struct {
 	// ReissuedFP / ReissuedLen 是上游在这一轮响应里下发的票；一轮里下发了多张时是最后一张。
 	ReissuedFP  string `json:"reissued_fp,omitempty"`
 	ReissuedLen *int   `json:"reissued_len,omitempty"`
+	// Bytes 是这个请求的上下行字节数（kong_request_bytes.go），在提交用量之前合并进来。
+	Bytes *KongRequestBytesFeature `json:"bytes,omitempty"`
 }
 
 // IsEmpty 报告这份特征一项都没有——那时不该往库里写一个空对象。
@@ -41,7 +43,7 @@ func (f *KongRequestFeatures) IsEmpty() bool {
 	if f == nil {
 		return true
 	}
-	return f.StateFP == "" && f.StateLen == nil && f.ReissuedFP == "" && f.ReissuedLen == nil
+	return f.StateFP == "" && f.StateLen == nil && f.ReissuedFP == "" && f.ReissuedLen == nil && f.Bytes == nil
 }
 
 // KongFeatureRecorder 是一轮的特征容器，所有方法对 nil 接收者安全。
