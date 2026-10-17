@@ -307,6 +307,7 @@ func doUpstreamRequest(client *http.Client, req *http.Request) (*http.Response, 
 		cancel()
 		return resp, err
 	}
+	service.KongCountUpstreamResponseBody(req.Context(), resp) // [kong] 逐请求字节数：在解压之前计原始字节
 	decompressResponseBody(resp)
 	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
 	return resp, nil
