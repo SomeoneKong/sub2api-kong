@@ -30,8 +30,8 @@ func RegisterGatewayRoutes(
 	cfg *config.Config,
 ) {
 	bodyMemoryBudget := pkghttputil.NewBodyMemoryBudget(cfg.Gateway.RequestBodyMemoryBudgetBytes)
-	bodyLimit := middleware.RequestBodyLimit(cfg.Gateway.MaxBodySize, bodyMemoryBudget)
-	textBodyLimit := middleware.RequestBodyLimit(cfg.Gateway.TextMaxBodySize, bodyMemoryBudget)
+	bodyLimit := kongCountRequestBytes(middleware.RequestBodyLimit(cfg.Gateway.MaxBodySize, bodyMemoryBudget))         // [kong] 逐请求字节数
+	textBodyLimit := kongCountRequestBytes(middleware.RequestBodyLimit(cfg.Gateway.TextMaxBodySize, bodyMemoryBudget)) // [kong] 逐请求字节数
 	clientRequestID := middleware.ClientRequestID()
 	opsErrorLogger := handler.OpsErrorLoggerMiddleware(opsService)
 	endpointNorm := handler.InboundEndpointMiddleware()
