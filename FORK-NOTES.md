@@ -17,6 +17,10 @@
 - **Codex 模型目录的版本存档与多数对外**（目录全文按版本存档，对外版本由分组内最高一档账号的观测计票决定，
   设计见 `DESIGN-codex-catalog-consensus.md`）
 - **发往官方 ChatGPT 后端的请求体 zstd 压缩**（省出站流量，见下文挂点一节）
+- **OpenAI 上游不声明压缩**（OpenAI profile 的连接池不让 Go 自动加 `Accept-Encoding: gzip`，与官方 Codex 一致，见下文
+  挂点一节）
+- **OpenAI 请求的逐请求字节数**（用量行请求特征里的 `bytes`：客户端一侧与经各账号、各出口的上游消息体字节，用于核算
+  带宽，设计见 `DESIGN-openai-request-bytes.md`）
 - **前端展示调整**（账号页：OpenAI Pro 20x / Pro 5x / Pro Max 只有 7d 主窗口，不显示 5h；管理员用量页：用户列可在列设置里隐
   藏；延迟列的生成速度估计在共用的 `UsageTable.vue` 里，管理员与普通用户的用量页都会显示）
 - **OpenAI 账号会话数上限**（软上限，设计见 `DESIGN-openai-session-limit.md`）
@@ -219,6 +223,38 @@ rebase 时丢掉，这一小节随之删除。
   `kongSendOpenAIUpstreamCompressed` 返回时释放持有者，此后 `GetBody` 报错，明文重发用压缩前的 `GetBody`。rebase 时
   若 `HTTPUpstream` 或调用方开始在 `Do` 返回之后重读 `GetBody`（像 Grok 的回退那样），这条前提就不成立了。
 - **开关**：环境变量 `KONG_OPENAI_REQUEST_ZSTD`，不设置为开，false 关闭，写错则关闭并记错误日志。
+
+### OpenAI 上游不声明压缩
+
+- **为什么**：官方 Codex 发 `/responses` 不带 `Accept-Encoding`，Go 的 transport 却会在请求没有这个头时自动加 `gzip`
+  并透明解压。chatgpt.com 的 SSE 不论声明什么都不压缩，去掉它对带宽没有影响（设计与实测见
+  `DESIGN-openai-request-bytes.md` §6）。net/http 没有按单个请求关掉自动压缩的办法，所以做在按 profile 的连接池设置上。
+- **挂点**：`repository/http_upstream.go` 六处单行——`poolSettings` 的 `kongDisableCompression` 字段；
+  `applyProfilePoolSettings` 对 OpenAI profile 打开它；`buildPoolKey` 与 TLS 指纹路径的 `cacheKey` 追加
+  `kongPoolKeySuffix`；两个 transport 构建函数设 `DisableCompression`。
+- **覆盖范围是标了 `HTTPUpstreamProfileOpenAI` 的请求**（Responses 透传与转换、alpha search 等）。上游新增的 OpenAI
+  请求不标这个 profile 就照旧带 gzip——不追求全部对齐，WS 握手、OAuth 账号拉模型目录（共享客户端）、刷新令牌等都不在
+  范围内。
+- **复核**：上游改了按 profile 取连接池的方式（`getClientEntry` / `getClientEntryWithTLS` 的缓存键与配置键）或新增
+  transport 构建函数时，看开关是否仍然生效。TLS 指纹路径的缓存键不含 profile，后缀让两种压缩策略的连接池并存而不是
+  互相替换；上游若把 profile 加进这个缓存键，这个后缀可以去掉。
+
+### OpenAI 请求的逐请求字节数
+
+- **挂点**（上游文件九处单行）：`server/routes/gateway.go` 定义 `bodyLimit`、`textBodyLimit` 的两行包上
+  `kongCountRequestBytes`（建计数容器、计入站原始字节）；`service/openai_plugin_transport.go` 的 `sendOpenAIUpstream`
+  末行换成 `kongDoUpstreamCounted`、`handled` 分支加 `kongCountPluginSend`；`repository/http_upstream.go` 的
+  `doUpstreamRequest` 在 `decompressResponseBody` 之前加 `KongCountUpstreamResponseBody`；`handler/openai_gateway_handler.go`
+  的 `Responses` 读体之后 `KongRecordRequestBodyLen`、`submitResponsesUsage` 里 `KongMergeRequestBytes`；
+  `handler/openai_alpha_search.go` 同样两处。压缩发送（`kong_openai_request_zstd.go`）在压缩之前取明文长度，`send()`
+  也走 `kongDoUpstreamCounted`。
+- **复核**：
+  - 上游新增的 OpenAI 上游发送点要经 `doOpenAIUpstream`，直接调 `httpUpstream.Do` 的不计。
+  - 新增的 OpenAI 用量提交点要合并字节数，且必须在异步提交之前同步取 `c.Writer.Size()`——handler 返回后 gin context
+    会被回收复用。Messages、chat completions、图片、WS、cyber 拒绝行现在都不接（设计 §7）。
+  - `bodyLimit` / `textBodyLimit` 改名、拆分或新增同类限制中间件时，要一并包上；中间件是幂等的，重复包不会重复计。
+  - 上游改了 `doUpstreamRequest` 里解压的位置，或 `httpUpstream.Do` 的重放方式，复核 `down` 与 `up_wire` 的口径（设计 §3.3）。
+  - `KongRequestFeatures.IsEmpty` 要连 `Bytes` 一起看，否则只有字节数的特征在写库与回读时会被当成空丢掉。
 
 ### 前端展示调整
 
