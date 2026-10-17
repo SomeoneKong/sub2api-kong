@@ -431,6 +431,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, status, "invalid_request_error", message)
 		return
 	}
+	service.KongRecordRequestBodyLen(c.Request.Context(), len(body)) // [kong] 逐请求字节数
 
 	if len(body) == 0 {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
@@ -840,6 +841,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				return
 			}
 			stampOpenAIRequestedReasoningEffort(res, c)
+			service.KongMergeRequestBytes(c.Request.Context(), res, account, c.Writer.Size()) // [kong] 逐请求字节数，须在异步提交之前
 			userAgent := c.GetHeader("User-Agent")
 			clientIP := ip.GetClientIP(c)
 			inboundEndpoint := GetInboundEndpoint(c)
