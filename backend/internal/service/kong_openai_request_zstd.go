@@ -114,6 +114,8 @@ func kongParseOpenAIRequestZstd(value string, present bool) (bool, error) {
 func (s *OpenAIGatewayService) kongSendOpenAIUpstreamCompressed(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
 	routedToPlugin := s.pluginManager != nil && s.pluginManager.ShouldRouteOpenAIOAuth(account)
 	z := kongOpenAIRequestZstdInstance()
+	// 逐请求字节数要的明文长度：compress 会把 ContentLength 换成压缩后的长度，在它之前取。
+	plainLen := request.ContentLength
 	sent, endpoint, compressed := z.compress(request, routedToPlugin)
 	if !compressed {
 		return s.sendOpenAIUpstream(request, proxyURL, account)
@@ -121,7 +123,7 @@ func (s *OpenAIGatewayService) kongSendOpenAIUpstreamCompressed(request *http.Re
 	// 返回之后不会再有人要重放压缩正文：net/http 的连接级重试与重定向都在 Do 返回之前，明文重发在下面。
 	defer sent.release()
 	send := func() (*http.Response, error) {
-		return s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+		return s.kongDoUpstreamCounted(request, proxyURL, account, plainLen)
 	}
 	response, err := send()
 	if err != nil || response == nil || !kongZstdRejected(response) {

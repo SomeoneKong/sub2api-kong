@@ -29,8 +29,8 @@ func RegisterGatewayRoutes(
 	cfg *config.Config,
 ) {
 	bodyMemoryBudget := pkghttputil.NewBodyMemoryBudget(cfg.Gateway.RequestBodyMemoryBudgetBytes)
-	bodyLimit := middleware.RequestBodyLimit(cfg.Gateway.MaxBodySize, bodyMemoryBudget)
-	textBodyLimit := middleware.RequestBodyLimit(cfg.Gateway.TextMaxBodySize, bodyMemoryBudget)
+	bodyLimit := kongCountRequestBytes(middleware.RequestBodyLimit(cfg.Gateway.MaxBodySize, bodyMemoryBudget))         // [kong] 逐请求字节数
+	textBodyLimit := kongCountRequestBytes(middleware.RequestBodyLimit(cfg.Gateway.TextMaxBodySize, bodyMemoryBudget)) // [kong] 逐请求字节数
 	// 分组链上的中间件（白名单、字段歧义检查、合成路由）会在 handler 之前读完
 	// 请求体，路由级的上限来不及生效；纯文本入口的上限必须在分组层按路由选择。
 	textBodyRoutes := map[string]bool{

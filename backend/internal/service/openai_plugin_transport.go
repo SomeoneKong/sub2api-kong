@@ -26,10 +26,11 @@ func (s *OpenAIGatewayService) sendOpenAIUpstream(request *http.Request, proxyUR
 	if s.pluginManager != nil {
 		response, handled, err := s.pluginManager.RoundTripOpenAIOAuth(request.Context(), request, proxyURL, account)
 		if handled {
+			kongCountPluginSend(request.Context(), account) // [kong] 逐请求字节数：插件发送只计次数
 			return response, err
 		}
 	}
-	return s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+	return s.kongDoUpstreamCounted(request, proxyURL, account, request.ContentLength) // [kong] 逐请求字节数
 }
 
 // doOpenAIAccountTestUpstream 让 OpenAI OAuth 账号测试与真实转发使用同一插件路径。
