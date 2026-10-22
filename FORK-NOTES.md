@@ -38,7 +38,7 @@
   `DESIGN-account-downgrade-guard.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
 
-另有三个可提给上游的修复，排在定制清单最前面（见下文挂点一节的前两小节），上游合并后在 rebase 时丢掉。
+另有五个可提给上游的修复，排在定制清单最前面（见下文挂点一节的前三小节），上游合并后在 rebase 时丢掉。
 
 有三处是**结构性的、不随上游版本变化的约束**，值得写在这里而不是只留在 commit 里：
 
@@ -112,6 +112,26 @@ codex turn-state 按账号隔离（含 WebSocket）、按 WS 的 `codex.rate_lim
   `publishSettingCache` 按 `Load()` 的原始返回值 CAS 发布，失效经 `expireSettingCache` 发布新的已过期条目，保存设置时的直写
   保持无条件 `Store`。上游新增出站身份类的设置读取，或改这四个读取、两个失效函数时，保持"读库出错沿用上一次的值、
   回源不覆盖期间的保存与失效"。
+
+### 可提给上游的两个流式心跳修复
+
+- **跨重试记账**：`/v1/responses` 透传的每次尝试（同账号重试、换号）都会重新启动 SSE 心跳（`startOpenAISSEKeepalive`），
+  新心跳器停掉上一个实例、接过它已写出的心跳字节与响应头提交状态（`inheritFrom`）。
+- **合成终止帧前停拍**：上游只发裸 `error` 就 EOF 时，透传合成 `response.failed` 之前先停心跳。
+
+这两个提交只改上游文件、不引用任何 fork 符号；上游合并后 rebase 时丢掉，这一小节随之删除。
+
+- **心跳字节按整个请求记账**。handler 与透传主循环靠 `OpenAICompactKeepaliveAdjustedWrittenSize` 判断"是否已向客户端写出
+  语义输出"，它扣掉的是上下文里当前心跳器记的字节；新实例若从零记账，前几次尝试的心跳会被当成输出，同一请求在首个可见
+  输出前第二次遇到过载就不再换号，改向客户端发失败事件。`StopOpenAICompactSSEKeepaliveCommitted` 同理要继承"响应头已由心跳
+  提交"。上游改心跳器的生命周期（例如改成整个请求只启动一次）或新增调用 `startOpenAISSEKeepalive` 的通路时，保持同一请求
+  只有一份累计记账；compact 的 handler 级心跳与透传心跳目前不会出现在同一请求上，若以后会，停掉前一个实例要重新评估。
+- **扣除的心跳字节有两份**：心跳器自己（含继承来的）与转发的上游 keepalive 事件（`openai_stream_keepalive_bytes`），每次写出只
+  登记在其中一份里。handler 等并发槽时写出的 ping（`gateway_stream_heartbeat_bytes`）有意不扣：上游多个错误出口按"语义输出是否
+  已开始"来选写 SSE 还是 HTTP JSON，扣掉它会让这些出口在已提交的事件流里写 JSON。代价是排队时收到过 ping 的请求，首个输出前
+  遇到过载不再换号（上游一直如此）。要改得先让这些出口改看响应是否已提交。
+- **透传主循环经心跳安装前取得的 writer（`w`）写出**，这种写法不会自动停拍：不经 `c.Writer` 的写出之前都要先 `stopKeepalive()`。
+  上游在透传里新增这类写出点时照此处理。
 
 ### codex 票的被动观测
 
