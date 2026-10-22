@@ -29,7 +29,8 @@ type openAICompactSSEKeepalive struct {
 	writer  gin.ResponseWriter
 	started bool
 	stopped bool
-	// bytes 是心跳已写出的注释字节数。心跳不构成语义响应，handler 的
+	// bytes 是本请求心跳已写出的注释字节数，含同一请求前几次尝试的（见
+	// inheritFrom）。心跳不构成语义响应，handler 的
 	// "Forward 期间是否已写响应"判定（failover 放弃换号的依据）必须扣除
 	// 这部分字节，见 OpenAICompactKeepaliveAdjustedWrittenSize。
 	bytes int
@@ -64,6 +65,7 @@ func startOpenAISSEKeepalive(c *gin.Context, interval time.Duration) func() {
 		writer: originalWriter,
 		stop:   make(chan struct{}),
 	}
+	k.inheritFrom(c)
 	c.Set(openAICompactSSEKeepaliveKey, k)
 	wrappedWriter := &openAICompactKeepaliveWriter{ResponseWriter: originalWriter, k: k}
 	c.Writer = wrappedWriter
@@ -97,6 +99,27 @@ func startOpenAISSEKeepalive(c *gin.Context, interval time.Duration) func() {
 			c.Writer = originalWriter
 		}
 	}
+}
+
+// inheritFrom 接管同一请求上一个心跳器的记账：停掉它，并接过它已写出的心跳
+// 字节数与响应头提交状态。透传的每次尝试都会重新启动心跳，若新实例从零记账，
+// 前几次尝试写出的心跳会被 OpenAICompactKeepaliveAdjustedWrittenSize 算成语义
+// 输出，之后的 pre-output 失败就不再换号重试；StopOpenAICompactSSEKeepaliveCommitted
+// 也会在新实例尚未打拍时漏报响应头已提交。
+func (k *openAICompactSSEKeepalive) inheritFrom(c *gin.Context) {
+	value, ok := c.Get(openAICompactSSEKeepaliveKey)
+	if !ok {
+		return
+	}
+	prev, ok := value.(*openAICompactSSEKeepalive)
+	if !ok || prev == nil {
+		return
+	}
+	prev.mu.Lock()
+	prev.markStoppedLocked()
+	k.bytes = prev.bytes
+	k.started = prev.started
+	prev.mu.Unlock()
 }
 
 // beat 在锁内提交（首次）响应头并写出一条 SSE 注释行；返回 false 表示心跳已

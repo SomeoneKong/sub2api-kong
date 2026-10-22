@@ -1,12 +1,15 @@
 package service
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -74,6 +77,106 @@ func TestPassthroughKeepaliveDoesNotBlockPreOutputFailover(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, openAIStreamClientOutputStarted(c, false),
 		"真实语义输出之后应当判定为已输出")
+}
+
+// beatKeepaliveNow 让 c 上当前的心跳器同步打一拍,不依赖定时器。
+func beatKeepaliveNow(t *testing.T, c *gin.Context) {
+	t.Helper()
+	value, ok := c.Get(openAICompactSSEKeepaliveKey)
+	require.True(t, ok)
+	k, ok := value.(*openAICompactSSEKeepalive)
+	require.True(t, ok)
+	require.True(t, k.beat())
+}
+
+// 同一请求的每次重试都会重新启动心跳。新心跳器必须接过前几次尝试的心跳字节与
+// 响应头提交状态，否则前一次的心跳会被算成语义输出，下一次 pre-output 失败就不再换号。
+func TestPassthroughKeepaliveRestartKeepsEarlierHeartbeats(t *testing.T) {
+	c, rec := newPassthroughKeepaliveTestContext(t)
+	stop := startOpenAISSEKeepalive(c, time.Hour)
+	beatKeepaliveNow(t, c)
+	stop()
+	require.Equal(t, ": keepalive\n\n", rec.Body.String(), "前提:第一次尝试写出了一拍心跳")
+	require.Equal(t, -1, OpenAICompactKeepaliveAdjustedWrittenSize(c))
+
+	// 第二次尝试:新心跳器还没打拍。
+	stop = startOpenAISSEKeepalive(c, time.Hour)
+	require.Equal(t, -1, OpenAICompactKeepaliveAdjustedWrittenSize(c), "前一次的心跳仍不构成语义输出")
+	require.False(t, openAIStreamClientOutputStarted(c, false))
+	require.True(t, StopOpenAICompactSSEKeepaliveCommitted(c), "响应头已由前一次的心跳提交")
+	stop()
+
+	// 第三次尝试照常打拍,记账累计。
+	stop = startOpenAISSEKeepalive(c, time.Hour)
+	beatKeepaliveNow(t, c)
+	stop()
+	require.Equal(t, 2, strings.Count(rec.Body.String(), ": keepalive\n\n"))
+	require.Equal(t, -1, OpenAICompactKeepaliveAdjustedWrittenSize(c))
+
+	_, err := c.Writer.Write([]byte("data: real\n\n"))
+	require.NoError(t, err)
+	require.Equal(t, len("data: real\n\n"), OpenAICompactKeepaliveAdjustedWrittenSize(c))
+}
+
+// keepaliveSignalRecorder 在每拍心跳写出后计数并发出通知,让上游在心跳之后才报错。
+type keepaliveSignalRecorder struct {
+	*httptest.ResponseRecorder
+	beats    atomic.Int32
+	beatSeen chan struct{}
+}
+
+func (r *keepaliveSignalRecorder) Write(p []byte) (int, error) {
+	n, err := r.ResponseRecorder.Write(p)
+	if strings.HasPrefix(string(p), ":") {
+		r.beats.Add(1)
+		select {
+		case r.beatSeen <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+// 端到端:两次透传尝试都在心跳之后、首个可见输出之前收到过载,两次都应当可以换号重试,
+// 下游只收到心跳,收不到失败事件。
+func TestPassthroughOverloadAfterKeepaliveFailsOverOnEveryAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := &keepaliveSignalRecorder{ResponseRecorder: httptest.NewRecorder(), beatSeen: make(chan struct{}, 1)}
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
+		MaxLineSize:             defaultMaxLineSize,
+		StreamKeepaliveInterval: 1,
+	}}}
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		beatsBefore := rec.beats.Load()
+		body, pw := io.Pipe()
+		t.Cleanup(func() { _ = body.Close() })
+		go func() {
+			_, _ = io.WriteString(pw, "event: response.created\n"+
+				`data: {"type":"response.created","response":{"id":"resp_1"}}`+"\n\n"+
+				"event: response.metadata\n"+
+				`data: {"type":"response.metadata","response_id":"resp_1","metadata":{}}`+"\n\n")
+			// 这一次尝试打过一拍心跳之后再报过载。
+			select {
+			case <-rec.beatSeen:
+			case <-time.After(10 * time.Second):
+			}
+			_, _ = io.WriteString(pw, "event: error\n"+
+				`data: {"type":"error","error":{"type":"service_unavailable_error","message":"Our servers are currently overloaded. Please try again later."}}`+"\n\n")
+			_ = pw.Close()
+		}()
+		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}
+
+		_, err := svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
+		require.Greater(t, rec.beats.Load(), beatsBefore, "前提:第 %d 次尝试写出了心跳", attempt)
+		var failoverErr *UpstreamFailoverError
+		require.ErrorAs(t, err, &failoverErr, "第 %d 次尝试应当可以重试", attempt)
+	}
+
+	require.Empty(t, stripKeepaliveComments(rec.Body.String()), "下游不应收到任何事件")
 }
 
 // 停拍之后不得再有心跳字节写出 —— 主循环接管 ResponseWriter 的前提。
