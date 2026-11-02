@@ -208,7 +208,7 @@ func TestKongFingerprintTextBankRejects(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstCount := func(b map[string]any) map[string]any {
-		return b["counts"].(map[string]any)["pk-email"].(map[string]any)["word"].(map[string]any)["gpt-5.5"].(map[string]any)
+		return b["counts"].(map[string]any)["pk-email"].(map[string]any)["word"].(map[string]any)["gpt-5.6-luna"].(map[string]any)
 	}
 	anyKey := func(m map[string]any) string {
 		for k := range m {
@@ -231,7 +231,7 @@ func TestKongFingerprintTextBankRejects(t *testing.T) {
 		{"instructions 不同", func(b map[string]any) { b["instructions_sha256"] = strings.Repeat("0", 64) }, "instructions"},
 		{"特征族不同", func(b map[string]any) { b["families"] = []any{"word"} }, "特征族"},
 		{"alpha 为 null", func(b map[string]any) { b["alpha"] = nil }, "alpha"},
-		{"模型重复", func(b map[string]any) { b["models"] = append(b["models"].([]any), "gpt-5.5") }, "重复"},
+		{"模型重复", func(b map[string]any) { b["models"] = append(b["models"].([]any), "gpt-5.6-luna") }, "重复"},
 		{"缺题目全文", func(b map[string]any) { b["challenge"].(map[string]any)["prompt"] = "" }, "题目"},
 		{"题与 tasks 对不上", func(b map[string]any) { b["challenge"].(map[string]any)["sections"].([]any)[0] = "x" }, "对不上"},
 		{"题名重复", func(b map[string]any) {
@@ -249,12 +249,12 @@ func TestKongFingerprintTextBankRejects(t *testing.T) {
 		{"缺 pair.m", func(b map[string]any) { delete(twoLevel(b)["pair"].(map[string]any), "m") }, "pair.m"},
 		{"pair.cap 为 null", func(b map[string]any) { twoLevel(b)["pair"].(map[string]any)["cap"] = nil }, "pair.cap"},
 		{"计数缺一个模型", func(b map[string]any) {
-			delete(b["counts"].(map[string]any)["pk-email"].(map[string]any)["word"].(map[string]any), "gpt-5.5")
+			delete(b["counts"].(map[string]any)["pk-email"].(map[string]any)["word"].(map[string]any), "gpt-5.6-luna")
 		}, "计数"},
-		{"整个模型的用词计数为 null", func(b map[string]any) { familyCounts(b, "word")["gpt-5.5"] = nil }, "缺少模型"},
-		{"整个模型的词对计数为 null", func(b map[string]any) { familyCounts(b, "bigram")["gpt-5.5"] = nil }, "缺少模型"},
+		{"整个模型的用词计数为 null", func(b map[string]any) { familyCounts(b, "word")["gpt-5.6-luna"] = nil }, "缺少模型"},
+		{"整个模型的词对计数为 null", func(b map[string]any) { familyCounts(b, "bigram")["gpt-5.6-luna"] = nil }, "缺少模型"},
 		{"计数为 null", func(b map[string]any) { c := firstCount(b); c[anyKey(c)] = nil }, "非负整数"},
-		{"计数总和溢出", func(b map[string]any) { familyCounts(b, "word")["gpt-5.5"] = map[string]any{"x": 1e308, "y": 1e308} }, "有限值"},
+		{"计数总和溢出", func(b map[string]any) { familyCounts(b, "word")["gpt-5.6-luna"] = map[string]any{"x": 1e308, "y": 1e308} }, "有限值"},
 		{"alpha 极大使分母溢出", func(b map[string]any) { b["alpha"] = 1e308 }, "有限值"},
 		{"alpha 极小使概率下溢", func(b map[string]any) { b["alpha"] = 5e-324 }, "有限值"},
 		{"计数为负", func(b map[string]any) { c := firstCount(b); c[anyKey(c)] = -1.0 }, "非负整数"},
