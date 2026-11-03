@@ -240,6 +240,7 @@ const routes: RouteRecordRaw[] = [
       descriptionKey: 'usage.description'
     }
   },
+  { path: '/key-stats', name: 'KongApiKeyProjects', component: () => import('@/features/api-key-projects/ApiKeyProjectsView.vue'), meta: { requiresAuth: true, requiresAdmin: false, title: 'API Key 项目统计' } }, // [kong] API Key 项目统计
   {
     path: '/redeem',
     name: 'Redeem',
