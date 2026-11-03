@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// 文本指纹的评分与两层判定。与 fp-lab/library.py 的 split_packed / score / decide 逐条对应，
+// 文本指纹的评分与两层判定。与 sub2api-probe-lab/fingerprint/library.py 的 split_packed / score / decide 逐条对应，
 // testdata/kong_fingerprint_text_golden.json 锁住两边算出的结果一致。
 
 // kongTextHeaderRe 是合并回答里每道题开头的 "### N" 行。题号只认 ASCII 数字。
