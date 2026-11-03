@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-// 文本指纹的 Go 实现与 fp-lab 的 Python 实现必须逐项一致：golden 资料由 fp-lab/export_golden.py 用同一份
+// 文本指纹的 Go 实现与 sub2api-probe-lab/fingerprint 的 Python 实现必须逐项一致：golden 资料由 sub2api-probe-lab/fingerprint/export_golden.py 用同一份
 // 库生成，含真实回答、边界构造的回答，以及覆盖各条判定规则的得分序列。
 
 const kongFPGoldenTolerance = 1e-9
@@ -117,7 +117,7 @@ func TestKongFingerprintTextGoldenBank(t *testing.T) {
 	golden := kongFPLoadGolden(t)
 	sum := sha256.Sum256(kongFingerprintBankJSON)
 	if got := hex.EncodeToString(sum[:]); got != golden.BankSHA256 {
-		t.Fatalf("内置库摘要 %s 与 golden 的 %s 不一致：换库后要用 fp-lab/export_golden.py 重新生成 golden", got, golden.BankSHA256)
+		t.Fatalf("内置库摘要 %s 与 golden 的 %s 不一致：换库后要用 sub2api-probe-lab/fingerprint/export_golden.py 重新生成 golden", got, golden.BankSHA256)
 	}
 	bank := kongFPTestBank(t)
 	if bank.Version()["digest"] != golden.BankSHA256 {
