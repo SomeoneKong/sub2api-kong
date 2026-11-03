@@ -16,7 +16,7 @@ import (
 )
 
 // 账号指纹测试的文本指纹库：每个模型在合并挑战每道题上的用词与词对计数，加上两层判定的参数。
-// 由工作区的 fp-lab/library.py build 生成，设计见 DESIGN-openai-fingerprint-test.md。
+// 由工作区的 sub2api-probe-lab/fingerprint/library.py build 生成，设计见 DESIGN-openai-fingerprint-test.md。
 //
 // 默认那份随二进制走，同时留一个外部覆盖路径：上游静默更新模型后要能换一份库而不必重新构建镜像。
 // 换了库，同一份回答会算出不同结论，所以每一份探测记录都带着当时用的库版本。

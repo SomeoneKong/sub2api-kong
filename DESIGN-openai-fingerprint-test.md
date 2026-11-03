@@ -1,7 +1,7 @@
 # 账号指纹测试：主动看一个 OpenAI 账号此刻被服务的模型
 
 **状态**：已实现，无配置项。仓库组织与发布流程见 `FORK-NOTES.md`；codex 票的被动观测见 `DESIGN-codex-ticket.md`。
-方法的依据和实验数据在工作区的 `fp-lab/STRATEGY.md` 与 `fp-lab/EXPERIMENTS.md`。
+方法的依据和实验数据在工作区的 `sub2api-probe-lab/fingerprint/STRATEGY.md` 与 `sub2api-probe-lab/fingerprint/EXPERIMENTS.md`。
 
 管理员在 `/admin/accounts` 上对单个账号发起，经账号自己的代理、用账号自己的凭据发 1～4 份挑战（**不带任何
 票**），用文本指纹库两层归因，并对照上游回报的模型给出结论。每一份的回答原文与整次的结论都落库长期留存，事后
@@ -39,7 +39,7 @@
 
 生产上用量最大的 gpt-6.1-sol 与 gpt-6-astra 同源、知识与解题路径相同，在随机数分布（ModelTrace 一类的数字
 指纹）、知识边界题、约束构造题上都分不开。两者的差别在后训练带来的文风：写日常短文本时的措辞与排版。文本指纹
-看的就是这个，在 fp-lab 的数据上能分开 8 个 GPT 模型，包括这一对。
+看的就是这个，在 sub2api-probe-lab/fingerprint 的数据上能分开 8 个 GPT 模型，包括这一对。
 
 ### 2.2 挑战：一个请求装 10 道题
 
@@ -59,7 +59,7 @@
 
 ### 2.3 评分与两层判定
 
-**单份评分**（`kong_fingerprint_text.go`，与 `fp-lab/library.py` 逐条对应）：
+**单份评分**（`kong_fingerprint_text.go`，与 `sub2api-probe-lab/fingerprint/library.py` 逐条对应）：
 
 1. 按 `### N` 行把回答拆成各题（CRLF 先规整为 LF；题号只认 ASCII 数字，超出范围的行只当分隔，重复题号只取第一次）。
    拆出的题少于 7 道的一份不计入归因（`invalid_reason = sections_missing`），算用掉一份。
@@ -110,7 +110,7 @@
 
 ### 2.4 请求数
 
-三批连续采集，每批每个模型 20 份。用两批建库并估计参数、模拟第三批的回答（`fp-lab/seq_sim.py --test`），
+三批连续采集，每批每个模型 20 份。用两批建库并估计参数、模拟第三批的回答（`sub2api-probe-lab/fingerprint/seq_sim.py --test`），
 三个方向的范围：
 
 | 情形 | 平均请求数 | 判对 | 判不准 | 判错 |
@@ -122,7 +122,7 @@
 | 目标是 6.1-sol，实际是 astra | 2.12–2.35 | 99.1–100% 判为不一致 | 0–0.9% | 0 |
 | 目标是 6-sol，实际是 astra；目标是 6.1-sol 或 astra，实际是 luna | 1.00 | 100% 判为不一致 | 0 | 0 |
 
-三批集中在约 45 分钟内。astra 与 6.1-sol 另外用线上跨天的真实回答回放过（`fp-lab/library/README.md`），其余模型补采跨天的批次、确认稳定后替换库文件即可，判定代码不用改。
+三批集中在约 45 分钟内。astra 与 6.1-sol 另外用线上跨天的真实回答回放过（`sub2api-probe-lab/fingerprint/library/README.md`），其余模型补采跨天的批次、确认稳定后替换库文件即可，判定代码不用改。
 
 ### 2.5 执行
 
@@ -140,7 +140,7 @@
 
 ## 3. 指纹库
 
-- **文件**：`kong_data/gpt_text_bank.json`，用 `go:embed` 打进二进制，由 `fp-lab/library.py build` 生成、原样复制。
+- **文件**：`kong_data/gpt_text_bank.json`，用 `go:embed` 打进二进制，由 `sub2api-probe-lab/fingerprint/library.py build` 生成、原样复制。
   环境变量 `KONG_FINGERPRINT_BANK` 可指向外部文件覆盖，换库不必重新构建镜像。换库步骤见 `kong_data/SOURCE.md`。
 - **内容**：模型列表；挑战的标识、题目全文与各题的名字；建库时的推理强度与 instructions 摘要；α；每个模型、
   每道题、每个特征族的计数；两层判定参数；每个模型的样本量与构建时间。
@@ -152,7 +152,7 @@
   接口返回 503，其余功能不受影响。
 - **外部覆盖只换样本**：题目、推理强度、阈值、最多份数与难分的那一对是方法的一部分，弹窗与本文按它们写成了固定
   说明。改其中任何一项是改方法，要随代码一起发布。
-- **验收**：换库前先通过交叉验证、跨时段留出检验与序贯模拟（`fp-lab/STRATEGY.md`），再用 `fp-lab/export_golden.py`
+- **验收**：换库前先通过交叉验证、跨时段留出检验与序贯模拟（`sub2api-probe-lab/fingerprint/STRATEGY.md`），再用 `sub2api-probe-lab/fingerprint/export_golden.py`
   重新生成 golden。Go 测试先核对 golden 的库摘要与内置库一致，再逐项比对 Go 与 Python 的分段、得分（误差 1e-9 以内）
   与判定。
 
@@ -210,7 +210,7 @@
 |---|---|
 | `service/kong_fingerprint_tester.go` | 校验、互斥、逐份执行、判定规则、落库 |
 | `service/kong_fingerprint_upstream.go` | 经代理发挑战、读 SSE 正文与回报的模型 |
-| `service/kong_fingerprint_text.go` | 拆题、评分、两层判定（与 fp-lab 逐条对应，由 golden 测试锁住） |
+| `service/kong_fingerprint_text.go` | 拆题、评分、两层判定（与 sub2api-probe-lab/fingerprint 逐条对应，由 golden 测试锁住） |
 | `service/kong_fingerprint_text_bank.go` | 指纹库的加载与校验 |
 | `handler/admin/kong_fingerprint_handler.go`、`server/routes/admin_kong_fingerprint.go` | 管理接口 |
 | `repository/kong_codex_ticket_repo.go` | 落库 |
