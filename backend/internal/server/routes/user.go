@@ -117,7 +117,8 @@ func RegisterUserRoutes(
 			usage.GET("/dashboard/models", h.Usage.DashboardModels)
 			usage.GET("/dashboard/snapshot-v2", h.Usage.DashboardSnapshotV2)
 			usage.POST("/dashboard/api-keys-usage", h.Usage.DashboardAPIKeysUsage)
-			usage.GET("/dashboard/kong-api-key-stats", h.Usage.KongDashboardAPIKeyStats) // [kong] 用量页 API Key 使用分布
+			usage.GET("/dashboard/kong-api-key-stats", h.Usage.KongDashboardAPIKeyStats)       // [kong] 用量页 API Key 使用分布
+			usage.GET("/dashboard/kong-api-key-projects", h.Usage.KongDashboardAPIKeyProjects) // [kong] API Key 项目统计
 		}
 
 		// 公告（用户可见）
