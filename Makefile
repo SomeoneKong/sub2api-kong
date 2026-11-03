@@ -42,7 +42,9 @@ FRONTEND_CRITICAL_VITEST := \
 	src/features/openai-session-limit/__tests__/sessionLimit.spec.ts \
 	src/features/openai-session-limit/__tests__/EditAccountModal.sessionLimit.spec.ts \
 	src/features/openai-session-limit/__tests__/AccountCapacityCell.sessionLimit.spec.ts \
-	src/features/api-key-distribution/__tests__/ApiKeyDistributionChart.spec.ts
+	src/features/api-key-distribution/__tests__/ApiKeyDistributionChart.spec.ts \
+	src/features/api-key-projects/__tests__/aggregate.spec.ts \
+	src/features/api-key-projects/__tests__/ApiKeyProjectsView.spec.ts
 
 # 一键编译前后端
 build: build-backend build-frontend
