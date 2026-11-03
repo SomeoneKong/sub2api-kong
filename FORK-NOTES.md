@@ -34,6 +34,7 @@
 - **账号选择与 credits**（计划输入生效时的定层、两轮排序、credits 层与容量视图，设计见
   `DESIGN-openai-plan-dispatch.md`）
 - **用量页的 API 密钥使用分布**（普通用户用量页按 API key 汇总的图表与它的查询端点，见下文挂点一节）
+- **API Key 项目统计页**（每个 key 的模型 × 档位分布与 token 曲线，设计见 `DESIGN-api-key-project-stats.md`）
 - **OpenAI 账号降档哨兵**（上游不认服务分组里某个账号自己刚签发的票时关掉它的调度、测指纹确认，只止损不恢复，设计见
   `DESIGN-account-downgrade-guard.md`）
 - **fork 自身必须适配的部分**（版本检查、发布标识）
@@ -445,6 +446,18 @@ handler / routes 下的同名文件，另有几处在节奏与会话组件里（
   import、一行取数声明、`applyFilters` 与 `refreshData` 各一行加载，`i18n/locales/{en,zh}/dashboard.ts` 的
   `usage` 段各一个键。**替换**：同一视图第二行图表里 `TokenUsageTrend` 换成新图表，趋势图移到下面单独占一行。管理
   员用量页不接。
+
+### API Key 项目统计页
+
+设计见 `DESIGN-api-key-project-stats.md`。
+
+- **后端只加文件**：`kong_usage_api_key_projects*.go`（handler、service、repository），查询是 `UsageService` 经接口断言取的
+  可选仓库方法。碰上游的只有 `routes/user.go` 一行。筛选条件复用 `kongUsageLogFilterConditions`，上一节的复核项覆盖这里。
+- **rebase 时复核**：`kongUsageBucketTimezone` 照抄 `timezone.ParseInUserLocation` 的回退规则，上游改那里要同步，否则日期筛选与
+  时间桶的时区对不上。查询内层的 `MATERIALIZED` 决定计划，不要删，缺了不报错、只是慢一倍。档位归类与
+  `serviceTierCostMultiplier` 一致，上游加新档位时同步查询里的 `CASE` 和前端的 `PROJECT_TIER_LABELS`。
+- **前端**（`features/api-key-projects/`，文案在 feature 内）碰上游的点全是**追加**：`router/index.ts` 一条路由、`AppSidebar.vue` 的
+  `buildSelfNavItems` 一行。`TokenUsageTrend` 原样复用，它的 props 或 `TrendDataPoint` 字段变了要同步 `aggregate.ts`。
 
 ### OpenAI 账号降档哨兵
 
