@@ -2017,6 +2017,10 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			s.handleOpenAIStreamTerminalAccountSideEffects(c, account, bareErrorPayload, failedMessage, resp.Header, mappedModel)
 			bareErrorAccountSideEffectsPending = false
 		}
+		// w is the writer captured before the keepalive wrapper was installed, so
+		// writing through it does not pause the heartbeat. Stop it first; the stop
+		// is idempotent and leaves this loop as the only writer.
+		stopKeepalive()
 		if clientDisconnected || !writePendingLines() {
 			return
 		}
