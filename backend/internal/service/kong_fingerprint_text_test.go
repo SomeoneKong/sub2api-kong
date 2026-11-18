@@ -123,7 +123,7 @@ func TestKongFingerprintTextGoldenBank(t *testing.T) {
 	if bank.Version()["digest"] != golden.BankSHA256 {
 		t.Fatalf("库版本里的摘要 = %v", bank.Version()["digest"])
 	}
-	if bank.MaxParts() != 4 || bank.Challenge.Effort != "low" || bank.Challenge.ID == "" || len(bank.Models) != 8 {
+	if bank.MaxParts() != 4 || bank.Challenge.Effort != "low" || bank.Challenge.ID == "" || len(bank.Models) != 10 {
 		t.Fatalf("库参数 = 最多 %d 份、强度 %q、挑战 %q、%d 个模型", bank.MaxParts(), bank.Challenge.Effort, bank.Challenge.ID, len(bank.Models))
 	}
 }
