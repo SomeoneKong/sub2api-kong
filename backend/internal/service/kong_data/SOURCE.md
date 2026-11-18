@@ -3,9 +3,10 @@
 `gpt_text_bank.json` 用于账号指纹测试的模型归因（设计见仓库根 `DESIGN-openai-fingerprint-test.md`）。
 它由工作区的 `sub2api-probe-lab/fingerprint/library.py build` 生成，原样复制进来，不手改。
 
-当前版本：sub2api-probe-lab/fingerprint 的 `library/gpt-text-v4.json`，`built_at` 2026-11-02T16:45:41Z。8 个 GPT 模型，
-每个模型 60 份合并挑战，取自 11-03 凌晨连续的三批，推理强度 low，instructions 为网关的默认 instructions。
-上一版 v3（`built_at` 2026-10-07T07:18:19Z）的文件保留在 sub2api-probe-lab/fingerprint 的 `library/` 下，各版本的样本、验收与替换原因见那里的 `README.md`。
+当前版本：sub2api-probe-lab/fingerprint 的 `library/gpt-text-v5.json`，`built_at` 2026-11-18T01:31:22Z。10 个 GPT 模型，
+每个模型 60 份合并挑战，取自 11-18 上午连续的三批，推理强度 low，instructions 为网关的默认 instructions。
+库文件、样本与导出脚本在 sub2api-probe-lab 的提交 `c7c2d7f`。
+之前各版本的文件保留在 sub2api-probe-lab/fingerprint 的 `library/` 下，各版本的样本、验收与替换原因见那里的 `README.md`。
 
 库里有：
 - 模型列表，也就是指纹测试可选的目标；
@@ -25,8 +26,10 @@
 
 1. 在 sub2api-probe-lab/fingerprint 补采数据并建库，先通过 `sub2api-probe-lab/fingerprint/STRATEGY.md` 里的验收（交叉验证、跨批次留出、序贯模拟）。
 2. 把新库文件原样复制为 `backend/internal/service/kong_data/gpt_text_bank.json`，再更新本说明里的版本。
-3. 重算 golden：在工作区的 `sub2api-probe-lab/fingerprint/` 下运行 `python export_golden.py --library <新库>`，它会重写
-   `testdata/kong_fingerprint_text_golden.json`（含库文件的摘要、各份回答的分段与得分、判定序列）。
+3. 重算 golden：在工作区的 `sub2api-probe-lab/fingerprint/` 下运行
+   `python export_golden.py --library library/<新库> --data data/<含全部模型的一批> --out <本仓库>/backend/internal/service/testdata/kong_fingerprint_text_golden.json`
+   （当前 golden 用的是 `--library library/gpt-text-v5.json --data data/pk8.jsonl`）。它重写 golden：库文件的摘要、各份回答的分段
+   与得分、判定序列。不给 `--out` 时写到工作区的 `sub2api-kong`。
 4. 在 `backend/` 下跑 `go test -tags=unit -run '^TestKong' ./internal/service/`：golden 测试先核对摘要与内置库一致，
    再逐项比对 Go 与 Python 的分段、得分与判定。
 5. 换题就是换库：题目全文在库里，代码不存题目。网关默认 instructions 变了也要重建库。
