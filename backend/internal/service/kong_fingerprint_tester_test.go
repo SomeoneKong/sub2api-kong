@@ -256,7 +256,7 @@ func TestKongFingerprintConfidentSinglePart(t *testing.T) {
 			if got.Decided != tc.decided || !strings.Contains(got.Detail, tc.decided) || len(got.Pair) != 0 {
 				t.Fatalf("结论指向 = %q（detail=%q，pair=%+v），期望 %s", got.Decided, got.Detail, got.Pair, tc.decided)
 			}
-			if len(got.Candidates) != 7 || got.Candidates[0].Model != tc.decided || got.Candidates[0].Probability < 0.95 {
+			if len(got.Candidates) != 9 || got.Candidates[0].Model != tc.decided || got.Candidates[0].Probability < 0.95 {
 				t.Fatalf("结论应附按概率排序的第一层分布：%+v", got.Candidates)
 			}
 			if len(up.challenges) != 1 || up.challenges[0].ID != "text-packed-v1" || up.challenges[0].Effort != "low" ||
@@ -289,7 +289,7 @@ func TestKongFingerprintConfidentSinglePart(t *testing.T) {
 			probe := store.probes[0]
 			if !probe.CountedInAverage || !probe.ParseValid || probe.PartAttribution == nil || *probe.PartAttribution != tc.decided ||
 				probe.CumProbability == nil || *probe.CumProbability < 0.95 || probe.TemperatureTier == nil || *probe.TemperatureTier != 1 ||
-				len(probe.Scores) != 8 || len(probe.SectionScores) != 10 || probe.DigitCount != 10 || probe.Digits == nil || len(probe.Digits) != 0 ||
+				len(probe.Scores) != 10 || len(probe.SectionScores) != 10 || probe.DigitCount != 10 || probe.Digits == nil || len(probe.Digits) != 0 ||
 				probe.AnswerText != kongFPGoldenText(t, tc.answer) || probe.ReportedModel != tc.reported || probe.VerifyEgress != "direct" ||
 				probe.ChallengeID != "text-packed-v1" || probe.LibraryVersion["rule_version"] != "2" || probe.LibraryVersion["digest"] == "" {
 				t.Fatalf("探测记录 = %+v", probe)
