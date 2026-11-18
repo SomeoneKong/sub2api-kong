@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -207,4 +208,72 @@ func TestPassthroughKeepaliveDisabledKeepsWriterUntouched(t *testing.T) {
 	require.Zero(t, rec.Body.Len())
 	require.False(t, StopOpenAICompactSSEKeepaliveCommitted(c))
 	_ = time.Now
+}
+
+// overlapRecorder 记录是否有两次写入同时进入 writer；写终止帧时故意停一会儿，让下一拍心跳落在写入期间。
+type overlapRecorder struct {
+	*httptest.ResponseRecorder
+	mu         sync.Mutex
+	active     atomic.Int32
+	overlapped atomic.Bool
+	beatSeen   chan struct{}
+}
+
+func (r *overlapRecorder) Write(p []byte) (int, error) {
+	if r.active.Add(1) > 1 {
+		r.overlapped.Store(true)
+	}
+	defer r.active.Add(-1)
+	if strings.Contains(string(p), "response.created") || strings.Contains(string(p), "response.failed") {
+		time.Sleep(1500 * time.Millisecond)
+	}
+	r.mu.Lock()
+	n, err := r.ResponseRecorder.Write(p)
+	r.mu.Unlock()
+	if strings.HasPrefix(string(p), ":") {
+		select {
+		case r.beatSeen <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+// 上游打过心跳后只发一个不可重试的裸 error 就 EOF：合成 response.failed 之前必须先停拍，
+// 否则心跳 goroutine 会与终止帧并发写同一个 writer。
+func TestPassthroughSynthesizedTerminalStopsKeepaliveFirst(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := &overlapRecorder{ResponseRecorder: httptest.NewRecorder(), beatSeen: make(chan struct{}, 1)}
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
+		MaxLineSize:             defaultMaxLineSize,
+		StreamKeepaliveInterval: 1,
+	}}}
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+
+	body, pw := io.Pipe()
+	t.Cleanup(func() { _ = body.Close() })
+	var noBeat atomic.Bool
+	go func() {
+		_, _ = io.WriteString(pw, "event: response.created\n"+
+			`data: {"type":"response.created","response":{"id":"resp_1"}}`+"\n\n")
+		select {
+		case <-rec.beatSeen:
+		case <-time.After(10 * time.Second):
+			noBeat.Store(true)
+		}
+		_, _ = io.WriteString(pw, "event: error\n"+
+			`data: {"type":"error","error":{"type":"invalid_request_error","code":"invalid_prompt","message":"bad request"}}`+"\n\n")
+		_ = pw.Close()
+	}()
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}
+
+	_, _ = svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
+	require.False(t, noBeat.Load(), "前提：上游报错之前心跳至少打过一拍")
+	require.Contains(t, rec.Body.String(), "response.failed", "前提：走到了合成终止帧")
+	require.False(t, rec.overlapped.Load(), "终止帧与心跳并发写了同一个 writer")
+	before := rec.Body.String()
+	time.Sleep(1200 * time.Millisecond)
+	require.Equal(t, before, rec.Body.String(), "终止帧之后不应再有心跳")
 }
